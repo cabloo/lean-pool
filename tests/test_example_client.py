@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestServer
 from fake_lean_server import lean_answer, lean_timeout
 from pool_client import ClientSettings, Outcome, PoolClient, Verdict, read_verdict
 
+from leanpool.haproxy import PoolSettings, derive_timeouts
 from leanpool.signals import (
     BACKGROUND_PRIORITY,
     PRIORITY_HEADER,
@@ -31,6 +32,7 @@ class FakePool:
 
     workers: int | None = 2  # None: a pool that says nothing about itself
     refusals: list[int] = field(default_factory=list)  # statuses answered before any 200
+    garbled: dict[str, str] = field(default_factory=dict)  # code -> a 200 body that is no result
     seconds: float = 0.02
     answers: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: list[web.Request] = field(default_factory=list)
@@ -72,6 +74,9 @@ class FakePool:
             await asyncio.sleep(self.seconds)
         finally:
             self.in_flight -= 1
+        if snippet["code"] in self.garbled:
+            body = self.garbled[snippet["code"]]
+            return web.Response(text=body, content_type="application/json")
         result = {"id": snippet["id"], **self.answers.get(snippet["code"], lean_answer())}
         return web.json_response({"results": [result]}, headers=self._size())
 
@@ -233,6 +238,22 @@ async def test_a_refusal_that_is_about_the_request_is_not_asked_again(check_file
     assert len(pool.requests) == 1
 
 
+@pytest.mark.parametrize("body", ["<html>not JSON</html>", "{}", '{"results": []}', "[1, 2]"])
+async def test_a_reply_that_is_not_a_check_result_costs_one_file_its_verdict_and_no_other(
+    check_files: Check, body: str
+) -> None:
+    garbled_code = "theorem garbled : True := trivial"
+    pool = FakePool(garbled={garbled_code: body})
+
+    verdicts, _client = await check_files(pool, {"a.lean": ACCEPTED, "b.lean": garbled_code})
+
+    assert verdicts == [
+        Verdict("a.lean", "verified", False, ""),
+        Verdict("b.lean", "no verdict", False, "the reply was not a check's result"),
+    ]
+    assert len(pool.requests) == 2  # asked once: the same reply would come again
+
+
 async def test_a_pool_that_cannot_be_reached_is_no_verdict() -> None:
     settings = ClientSettings(url="http://127.0.0.1:9", attempts=2, pause_seconds=0.0)
     async with aiohttp.ClientSession() as session:
@@ -240,6 +261,26 @@ async def test_a_pool_that_cannot_be_reached_is_no_verdict() -> None:
 
     assert verdict.outcome == "no verdict"
     assert verdict.detail.startswith("the pool could not be reached")
+
+
+# --- how long it waits ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lean_timeout", [30, 60, 120])
+def test_it_waits_as_long_as_a_pool_rendered_for_its_lean_timeout_lets_a_client(
+    lean_timeout: int,
+) -> None:
+    pool = derive_timeouts(PoolSettings(lean_timeout_seconds=lean_timeout))
+    settings = ClientSettings(url="http://pool.example:18100", lean_timeout_seconds=lean_timeout)
+
+    assert settings.http_wait_seconds == pool.cache_seconds  # also the proxy's `timeout client`
+    assert settings.http_wait_seconds >= pool.queue_seconds + pool.checker_seconds
+
+
+def test_a_wait_that_was_given_is_kept() -> None:
+    settings = ClientSettings(url="http://pool.example:18100", http_timeout_seconds=45.0)
+
+    assert settings.http_wait_seconds == 45.0
 
 
 # --- what it sends ----------------------------------------------------------------------------

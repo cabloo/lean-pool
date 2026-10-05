@@ -72,7 +72,9 @@ class ClientSettings:
     whenever it does not. ``ceiling`` is never exceeded, whatever the pool says. ``margin`` is
     how much more than the pool's workers to keep in flight, so that no worker waits for the
     client. ``http_timeout_seconds`` must cover the wait in the pool's queue and the check
-    together; the pool's generated ``haproxy.cfg`` states both in its first lines.
+    together. Left out, it is what a pool rendered for this Lean timeout with the default waits
+    allows a client (``http_wait_seconds``); the pool's generated ``haproxy.cfg`` states the
+    numbers of a pool rendered otherwise in its first lines.
     """
 
     url: str
@@ -84,7 +86,20 @@ class ClientSettings:
     margin: float = 1.25
     attempts: int = 5
     pause_seconds: float = 2.0
-    http_timeout_seconds: float = 420.0
+    http_timeout_seconds: float | None = None
+
+    @property
+    def http_wait_seconds(self) -> float:
+        """How long to wait for one answer.
+
+        A pool lets a check wait ``2 x Lean timeout + 30`` seconds in its queue and gives a Lean
+        server ``60 + 2 x Lean timeout + 30`` seconds to answer it; its own limit for a client
+        is those two and 30 seconds more. Giving up earlier would send again a check the pool
+        is still working on.
+        """
+        if self.http_timeout_seconds is not None:
+            return self.http_timeout_seconds
+        return 4.0 * self.lean_timeout_seconds + 150.0
 
 
 class RequestSlots:
@@ -186,11 +201,15 @@ class PoolClient:
                             return Verdict(
                                 name, "no verdict", False, f"HTTP {response.status}: {text}"
                             )
-                        reply = await response.json()
+                        result = (await response.json())["results"][0]
                 except (aiohttp.ClientError, TimeoutError) as error:
                     detail = f"the pool could not be reached: {error!r}"
                     continue
-                return read_verdict(name, reply["results"][0])
+                except (ValueError, LookupError, TypeError):
+                    # A 200 that is not a check's reply says nothing about the proof, and
+                    # asking again would get the same: this file has no verdict, the rest go on.
+                    return Verdict(name, "no verdict", False, "the reply was not a check's result")
+                return read_verdict(name, result)
         return Verdict(name, "no verdict", False, f"{detail}, {self._settings.attempts} times")
 
 
@@ -214,7 +233,7 @@ def new_session(settings: ClientSettings, ca_file: Path | None = None) -> aiohtt
     context = ssl.create_default_context(cafile=ca_file) if ca_file is not None else None
     return aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=0, ssl=context if context is not None else True),
-        timeout=aiohttp.ClientTimeout(total=settings.http_timeout_seconds),
+        timeout=aiohttp.ClientTimeout(total=settings.http_wait_seconds),
     )
 
 
