@@ -8,6 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Named, so that a step fails when any command of a pipeline fails (bash -eo pipefail).
+    shell: bash
+
 jobs:
   test:
     name: Lint, types and tests (Python ${{ matrix.python }})
@@ -47,40 +56,67 @@ jobs:
           sudo apt-get install -y 'haproxy=3.0.*'
           sudo systemctl stop haproxy
           haproxy -v
-      - name: Run the tests that need HAProxy
-        # -rs lists any skipped test: with HAProxy installed there must be none.
-        run: >-
-          uv run pytest -rs
-          tests/test_haproxy_live.py tests/test_haproxy_config.py
-          tests/test_tls_live.py tests/test_haproxy_tls_config.py tests/test_haproxy_box.py
+      - name: Run every test, those that need HAProxy included
+        # With HAProxy, curl and openssl installed no test may be skipped: -rs lists any that
+        # was, and the second command fails the step if there is one.
+        run: |
+          uv run pytest -rs | tee pytest.log
+          ! grep -E '^SKIPPED| skipped' pytest.log
 
-  deployment:
-    name: HAProxy accepts the generated configuration; the image builds
+  image:
+    name: The image builds, and HAProxy accepts what the image renders
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - name: Build the image and run its commands from it
+        run: |
+          docker build -f deploy/Dockerfile -t lean-pool .
+          for command in leanpool-cache leanpool-agent leanpool-haproxy-config leanpool-admit \
+                         leanpool-pki leanpool-join; do
+            docker run --rm lean-pool "$command" --help > /dev/null
+          done
       - name: Render two configurations
         # One pool given by address, and one whose names never resolve (".invalid" is reserved
         # for that): an unresolvable server must not stop the proxy from starting.
         run: |
-          printf 'lean-a 192.0.2.10:8000 4\nlean-b 192.0.2.20:8000 8 18250\n' > servers-by-address
-          printf 'lean-a lean-a.invalid:8000 4\nlean-b 192.0.2.20:8000 8\n' > servers-by-name
-          uv run leanpool-haproxy-config render --servers servers-by-address > by-address.cfg
-          uv run leanpool-haproxy-config render --servers servers-by-name \
-            --cache-address cache.invalid:18102 > by-name.cfg
-      - name: Validate both with the HAProxy image the compose example runs
+          mkdir rendered && chmod 0755 rendered
+          printf 'lean-a 192.0.2.10:8000 4\nlean-b 192.0.2.20:8000 8 18250\n' > rendered/by-address
+          printf 'lean-a lean-a.invalid:8000 4\nlean-b 192.0.2.20:8000 8\n' > rendered/by-name
+          render() { docker run --rm -v "$PWD/rendered:/rendered:ro" lean-pool leanpool-haproxy-config render "$@"; }
+          render --servers /rendered/by-address > rendered/by-address.cfg
+          render --servers /rendered/by-name --cache-address cache.invalid:18102 > rendered/by-name.cfg
+      - name: Validate both with the HAProxy image the compose files run
+        # The demo's committed configuration is validated with them.
         run: |
-          for config in by-address.cfg by-name.cfg; do
-            docker run --rm \
-              -v "$PWD/$config:/usr/local/etc/haproxy/haproxy.cfg:ro" \
-              haproxy:3.0 haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+          cp examples/demo/haproxy.cfg rendered/demo.cfg
+          for config in by-address.cfg by-name.cfg demo.cfg; do
+            docker run --rm --network none -v "$PWD/rendered:/cfg:ro" \
+              haproxy:3.0 haproxy -c -f "/cfg/$config"
           done
-      - name: Build the image and run its commands from it
+
+  demo:
+    name: The demo in Docker, and its walkthrough
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker validates every compose file
         run: |
-          docker build -f deploy/Dockerfile -t lean-pool .
-          docker run --rm lean-pool leanpool-cache --help
-          docker run --rm lean-pool leanpool-agent --help
-          docker run --rm lean-pool leanpool-pki --help
-          docker run --rm lean-pool leanpool-join --help
-          docker run --rm lean-pool leanpool-haproxy-config --help
+          docker compose -f examples/demo/compose.yaml config --quiet
+          cd deploy/pool
+          touch api-key.txt
+          LEANPOOL_CACHE_PIN=ci docker compose -f compose.yaml config --quiet
+          LEANPOOL_CACHE_PIN=ci docker compose -f compose.yaml -f compose.tls.yaml config --quiet
+          cd ../lean-server
+          export LEAN_SERVER_API_KEY=ci LEAN_SERVER_MAX_REPLS=2
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.tls.yaml config --quiet
+      - name: Start the demo
+        run: docker compose -f examples/demo/compose.yaml up --build -d
+      - name: Walk through it
+        run: examples/demo/walkthrough.sh
+      - name: What the demo's containers logged
+        if: always()
+        run: docker compose -f examples/demo/compose.yaml logs --no-color --tail 200
+      - name: Stop the demo
+        if: always()
+        run: docker compose -f examples/demo/compose.yaml down -v

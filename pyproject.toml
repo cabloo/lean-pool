@@ -5,27 +5,37 @@ build-backend = "hatchling.build"
 [project]
 name = "lean-pool"
 version = "0.1.0"
-description = "One endpoint for a pool of Kimina Lean servers: HAProxy routing, a shared result cache and usage-aware weights"
+description = "One address for a pool of Lean 4 proof checkers: HAProxy routing, a shared result cache and headroom-aware balancing for Kimina Lean Servers"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-authors = [{ name = "The lean-pool contributors" }]
-keywords = ["lean", "lean4", "kimina", "haproxy", "cache", "theorem-proving"]
+authors = [{ name = "Zane Hooper" }]
+keywords = ["lean", "lean4", "kimina", "haproxy", "load-balancing", "cache", "theorem-proving"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: System :: Networking",
     "Typing :: Typed",
 ]
 # The usage agent (leanpool.agent) and the HAProxy tooling (leanpool.haproxy) use the standard
 # library only; aiohttp serves the cache, the admission test and the join service; cryptography
 # makes the pool's certificates (leanpool.pki).
 dependencies = ["aiohttp>=3.11,<4", "cryptography>=42"]
+
+[project.urls]
+Homepage = "https://github.com/cabloo/lean-pool"
+Documentation = "https://github.com/cabloo/lean-pool/tree/main/docs"
+Issues = "https://github.com/cabloo/lean-pool/issues"
+Changelog = "https://github.com/cabloo/lean-pool/blob/main/CHANGELOG.md"
 
 [project.scripts]
 leanpool-cache = "leanpool.cache.cli:main"
