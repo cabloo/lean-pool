@@ -8,10 +8,20 @@ build/
 dist/
 *.egg-info/
 
-# The cache's database and a deployment's own files never belong in the repository.
+# The cache's database never belongs in the repository.
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
-deploy/haproxy.cfg
-deploy/servers
-deploy/api-key.txt
+
+# Neither do a deployment's own files: its keys, its certificates, its server list and what
+# was rendered from them.
+.env
+api-key.txt
+deploy/pool/servers
+deploy/pool/haproxy/
+deploy/pool/pki/
+deploy/lean-server/front/
+deploy/lean-server/tls/
+*.key
+*.pem
+*.csr

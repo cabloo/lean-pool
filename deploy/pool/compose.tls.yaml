@@ -1,0 +1,26 @@
+# TLS for the pool box: used on top of compose.yaml,
+#
+#   docker compose -f compose.yaml -f compose.tls.yaml up -d
+#
+# with haproxy/haproxy.cfg rendered in TLS mode (docs/tls.md):
+#
+#   leanpool-haproxy-config render --servers servers \
+#       --tls-front-door-pem /etc/leanpool/tls/front.pem \
+#       --tls-ca-file /etc/leanpool/tls/ca.crt \
+#       --tls-client-pem /etc/leanpool/tls/proxy-client.pem > haproxy/haproxy.cfg
+#
+# ./pki/proxy is where docs/tls.md has leanpool-pki write front.pem (the front door's certificate
+# and key), proxy-client.pem (what the proxy shows every Lean server) and ca.crt. The two .pem
+# files hold private keys: make the directory and both files readable by the group HAProxy's
+# image runs as, and by nobody else:
+#
+#   gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
+#   sudo chown -R root:"$gid" pki/proxy
+#   sudo chmod 0750 pki/proxy && sudo chmod 0640 pki/proxy/*.pem
+#
+# The authority's own key is in ./pki/ca, which no container mounts.
+
+services:
+  haproxy:
+    volumes:
+      - ./pki/proxy:/etc/leanpool/tls:ro

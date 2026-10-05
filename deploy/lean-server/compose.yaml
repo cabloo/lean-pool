@@ -1,0 +1,52 @@
+# One Lean server box: a Kimina Lean Server and the lean-pool usage agent beside it.
+#
+#   printf 'LEAN_SERVER_API_KEY=%s\nLEAN_SERVER_MAX_REPLS=%s\n' 'the-pool-api-key' 8 > .env
+#   docker compose up -d --build
+#
+# LEAN_SERVER_MAX_REPLS is how many checks this box runs at once: the WORKERS number of its
+# line in the pool's server list.
+#
+# Kimina is not part of lean-pool. This runs the image its own compose.yaml runs; use the image
+# that carries YOUR Lean and Mathlib versions (KIMINA_IMAGE, see Kimina's README), and the same
+# one on every box of a pool. The admission test (docs/admission.md) checks that before a box
+# is added.
+#
+# This file is plain HTTP. With TLS use compose.tls.yaml instead.
+
+name: lean-server
+
+services:
+  kimina:
+    image: "${KIMINA_IMAGE:-projectnumina/kimina-lean-server:2.0.0}"
+    restart: unless-stopped
+    environment:
+      LEAN_SERVER_API_KEY: "${LEAN_SERVER_API_KEY:?set LEAN_SERVER_API_KEY in .env to the pool's API key}"
+      LEAN_SERVER_MAX_REPLS: "${LEAN_SERVER_MAX_REPLS:?set LEAN_SERVER_MAX_REPLS in .env to this box's worker count}"
+      # How long a check waits for a free worker before Kimina answers 429. The pool proxy is
+      # rendered for this value (--server-wait, 60 by default).
+      LEAN_SERVER_MAX_WAIT: "${LEAN_SERVER_MAX_WAIT:-60}"
+    ports:
+      - "8000:8000" # the HOST:PORT of this box's line in the pool's server list
+
+  agent:
+    image: lean-pool
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    command: ["leanpool-agent"]
+    ports:
+      - "18200:18200" # HAProxy asks here, every 5 seconds, how much headroom this box has
+    # /proc/stat and /proc/meminfo are the host's inside a container, so the agent needs no
+    # privilege, no host mount and no access to Docker.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

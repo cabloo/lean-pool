@@ -1,15 +1,18 @@
-# The proxy and the cache of one lean-pool, on one box. The Lean servers (and a usage agent on
-# each of their boxes) run elsewhere and are named in the server list.
+# The pool box: HAProxy (the one address clients know) and the result cache behind it.
+# The Lean servers run on their own boxes (../lean-server) and are named in ./servers.
 #
-# From this directory:
+# Once, from this directory (docs/deployment.md walks through it):
 #
 #   cp servers.example servers                       # then edit: your Lean servers
 #   printf '%s\n' 'the-pool-api-key' > api-key.txt   # the key your Lean servers require
-#   chmod 0644 api-key.txt                           # must be readable by uid 10001 (the cache)
-#   uv run leanpool-haproxy-config render --servers servers > haproxy.cfg
-#   docker compose -f compose.example.yaml up -d
+#   chmod 0644 api-key.txt                           # or 0640 with group 10001 (the cache)
+#   echo 'LEANPOOL_CACHE_PIN=lean4.27.0-mathlib4.27.0' > .env    # YOUR versions
+#   mkdir -p haproxy
+#   leanpool-haproxy-config render --servers servers > haproxy/haproxy.cfg
+#   docker compose up -d --build
 #
 # Clients then send every check to http://<this box>:18100/api/check.
+# For TLS add the second file: docker compose -f compose.yaml -f compose.tls.yaml up -d
 
 name: lean-pool
 
@@ -20,11 +23,31 @@ services:
     ports:
       - "18100:18100" # the one address clients know
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      # The directory, not the file: a new haproxy.cfg can then be moved into place and HAProxy
+      # told to reload from inside the container,
+      #     docker compose exec haproxy sh -c 'kill -HUP 1'
+      # Do not reload with `docker compose kill -s HUP`: Docker counts a container it has
+      # signalled as stopped by hand, and `restart: unless-stopped` then no longer brings it
+      # back after a crash or a reboot.
+      - ./haproxy:/usr/local/etc/haproxy:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   cache:
+    image: lean-pool
     build:
-      context: ..
+      context: ../..
       dockerfile: deploy/Dockerfile
     restart: unless-stopped
     command: ["leanpool-cache"]
@@ -35,18 +58,27 @@ services:
     depends_on:
       - haproxy
     environment:
-      # Name the Lean and Mathlib versions of the pool's servers. It is part of every cache key:
-      # change it whenever the servers' image changes, and old entries stop matching.
-      LEANPOOL_CACHE_PIN: "lean-v4.27.0_mathlib-CHANGE-ME"
+      # Names the Lean and Mathlib versions of the pool's servers. It is part of every cache
+      # key: change it whenever the servers' image changes, and old entries stop matching.
+      LEANPOOL_CACHE_PIN: "${LEANPOOL_CACHE_PIN:?set LEANPOOL_CACHE_PIN in .env to name your Lean and Mathlib versions}"
       LEANPOOL_CACHE_API_KEY_FILE: /run/secrets/pool_api_key
-      LEANPOOL_CACHE_MAX_BYTES: "4294967296"
+      LEANPOOL_CACHE_MAX_BYTES: "${LEANPOOL_CACHE_MAX_BYTES:-4294967296}"
     secrets:
       - pool_api_key
     volumes:
       - cache-data:/var/lib/leanpool
     read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   cache-data:
