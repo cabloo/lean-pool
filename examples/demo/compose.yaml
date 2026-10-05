@@ -1,0 +1,85 @@
+# lean-pool in a minute, without Lean: the pool (HAProxy and the cache) in front of two stand-in
+# Lean servers, each with its usage agent beside it.
+#
+# From the repository root:
+#
+#   docker compose -f examples/demo/compose.yaml up --build -d
+#   examples/demo/walkthrough.sh
+#   docker compose -f examples/demo/compose.yaml down -v
+#
+# The stand-ins speak Kimina's interface and do not run Lean (standin_lean_server.py). Everything
+# else is what a real pool runs: the generated haproxy.cfg, the cache and the usage agents.
+# The key is the fixed word "demo-key" and the pool listens on this machine's loopback only.
+
+name: lean-pool-demo
+
+# One image for the cache, the usage agents and (here) the stand-ins.
+x-lean-pool: &lean-pool
+  image: lean-pool:demo
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+
+services:
+  haproxy:
+    image: haproxy:3.0
+    ports:
+      - "127.0.0.1:18100:18100" # the one address a client knows
+    volumes:
+      # Rendered from ./servers by `leanpool-haproxy-config render`; a test keeps the two in step.
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - lean-a
+      - lean-b
+
+  cache:
+    <<: *lean-pool
+    command: ["leanpool-cache"]
+    # The cache shares the proxy's network namespace: the proxy reaches it on 127.0.0.1:18102 and
+    # it reaches the proxy's loopback-only door to the Lean servers on 127.0.0.1:18101.
+    network_mode: "service:haproxy"
+    depends_on:
+      - haproxy
+    environment:
+      LEANPOOL_CACHE_PIN: "demo-stand-in"
+      LEANPOOL_CACHE_API_KEY: "demo-key"
+    volumes:
+      - cache-data:/var/lib/leanpool
+
+  lean-a:
+    <<: *lean-pool
+    command: ["python", "/demo/standin_lean_server.py"]
+    environment:
+      STANDIN_NAME: lean-a
+      STANDIN_WORKERS: "2"
+      STANDIN_API_KEY: "demo-key"
+    volumes:
+      - ./standin_lean_server.py:/demo/standin_lean_server.py:ro
+
+  agent-a:
+    <<: *lean-pool
+    command: ["leanpool-agent"]
+    # Beside its Lean server, at the same address: HAProxy asks <server address>:18200.
+    network_mode: "service:lean-a"
+    depends_on:
+      - lean-a
+
+  lean-b:
+    <<: *lean-pool
+    command: ["python", "/demo/standin_lean_server.py"]
+    environment:
+      STANDIN_NAME: lean-b
+      STANDIN_WORKERS: "4"
+      STANDIN_API_KEY: "demo-key"
+    volumes:
+      - ./standin_lean_server.py:/demo/standin_lean_server.py:ro
+
+  agent-b:
+    <<: *lean-pool
+    command: ["leanpool-agent"]
+    network_mode: "service:lean-b"
+    depends_on:
+      - lean-b
+
+volumes:
+  cache-data:

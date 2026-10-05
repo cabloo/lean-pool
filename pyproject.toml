@@ -40,7 +40,9 @@ dev = [
     "mypy>=1.11",
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "pyyaml>=6",
     "ruff>=0.6",
+    "types-pyyaml>=6",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -48,7 +50,7 @@ packages = ["leanpool"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["tests"]
+pythonpath = ["tests", "examples", "examples/demo"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
@@ -86,7 +88,12 @@ ignore = [
 strict = true
 warn_unreachable = true
 python_version = "3.11"
-files = ["leanpool", "tests"]
-# Module names are computed from these two roots, wherever mypy is started from.
+files = ["leanpool", "tests", "examples"]
+# Module names are computed from these roots, wherever mypy is started from.
 explicit_package_bases = true
-mypy_path = ["$MYPY_CONFIG_FILE_DIR", "$MYPY_CONFIG_FILE_DIR/tests"]
+mypy_path = [
+    "$MYPY_CONFIG_FILE_DIR",
+    "$MYPY_CONFIG_FILE_DIR/tests",
+    "$MYPY_CONFIG_FILE_DIR/examples",
+    "$MYPY_CONFIG_FILE_DIR/examples/demo",
+]

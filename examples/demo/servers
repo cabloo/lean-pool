@@ -1,0 +1,6 @@
+# The demo's two stand-in Lean servers, by their compose service names:
+#
+#   NAME  HOST:PORT  WORKERS  [AGENT_PORT]
+
+lean-a    lean-a:8000    2
+lean-b    lean-b:8000    4
