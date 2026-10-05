@@ -8,6 +8,13 @@ item follows from a rule described on another page.
   deployment the project was written for are specific to it and are not shipped.
 * The pool speaks Kimina's interface and nothing else. It does not run Lean, and it does not
   build or manage the Lean servers.
+* The pool box is a single point of failure: while it is down the pool is down, although each
+  Lean server still answers a client that calls it directly.
+* On machines of different speeds, whether a check close to its time limit finishes depends on
+  which box ran it. The pool does not hide that and does not add to it: a timeout is passed on
+  once, never retried and never stored, so the same check sent again may land on another box
+  and finish. Likewise a check that crashes a worker on a small box (out of memory, say) is
+  tried on another server, which may be a larger one.
 * The cache trusts the pin. If the Lean servers' image changes and the pin does not, old answers
   are served. Change the pin with the image.
 * Resource exhaustion is recognised by message text. A nondeterministic failure that Lean reports

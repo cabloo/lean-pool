@@ -7,7 +7,8 @@ establishes.
 ## The test suite
 
 Two kinds of tests, neither of which needs Docker, the network or a Lean server. Lean servers
-are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1,200 of them.
+are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1,200 test
+cases.
 
 ### Tests that always run
 
@@ -37,7 +38,7 @@ are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1
   a Python TLS server that requires a client certificate refuses a server certificate;
 * the TLS configurations, line by line, every refusal, and the property that with TLS no
   listener off loopback and no line to a Lean server or agent is plain;
-* the join service: each of its five requests, 404 for everything without the token, the
+* the join service: each of its requests, 404 for everything without the token, the
   one-box-per-window rule (from a second loopback address where the machine has one), every
   malformed request, the 16 KiB limit, what is written to the spool and when, and that neither
   the token nor the API key is ever logged. As a real process: it serves HTTPS only and refuses
@@ -47,7 +48,10 @@ are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1
 * the documentation: every flag and environment variable a command accepts is in the
   [configuration reference](configuration.md) and none is named there that does not exist; the
   directives, timeouts and messages these pages quote are the ones the code produces; every
-  link between the pages leads somewhere;
+  link between the pages leads somewhere; and the [TLS](tls.md) page's recipe is followed
+  command by command, in one directory for the pool box and one for a Lean server box, up to
+  the certificates and configurations the compose files mount (what needs Docker, root or a
+  Lean server is not run);
 * the examples: the [demo](../examples/demo)'s stand-in Lean server, and what the real cache
   stores of its answers; that the demo's committed `haproxy.cfg` is what `render` writes for
   its server list; that every compose file builds this project, publishes no port that must
@@ -119,7 +123,8 @@ These have been run against HAProxy 3.0.29, the binary of the official `haproxy:
 
 ### Continuous integration
 
-On every push the [workflow](../.github/workflows/ci.yml) runs the lint, the type check and
+On every push to `main` and every pull request the [workflow](../.github/workflows/ci.yml)
+runs the lint, the type check and
 the tests on Python 3.11, 3.12 and 3.13; runs the HAProxy tests with HAProxy 3.0 installed, where
 none may be skipped; builds the image; has Docker validate every compose file; and starts the
 demo in Docker and runs its walkthrough against it. The badge on the front page shows the last
@@ -182,9 +187,9 @@ flight, a Lean limit of 120 s, 68 minutes:
 start were 403,933 hits, 22,011 checks that joined an identical one in flight and 556,669
 misses, with 781,151 results stored in 853 MB and none evicted.
 
-Also run once, by hand, against a pool of the demo's stand-in servers: Kimina's own Python
-client (`kimina-client` 0.2.1), unchanged but for the address. Its single and its batched
-requests were answered, and repeats came from the cache.
+Not part of that deployment, and run once by hand against the demo's pool, whose Lean servers
+are stand-ins: Kimina's own Python client (`kimina-client` 0.2.1), unchanged but for the
+address. Its single and its batched requests were answered, and repeats came from the cache.
 
 ## What none of this establishes
 

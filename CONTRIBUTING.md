@@ -41,7 +41,7 @@ network or a Lean server.
 
 These are the properties a review looks for first:
 
-* **The pool never changes what a client measures.** Nothing is stored, retried or reordered in
+* **The pool never replaces a verdict Lean gave.** Nothing is stored, retried or reordered in
   a way that could turn one Lean verdict into another.
 * **Every doubt is resolved towards the check being run again.** Not storing costs a recheck;
   storing a wrong answer is permanent.

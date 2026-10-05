@@ -27,3 +27,22 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 
 * [What is tested, and what is not verified](verification.md)
 * [Limitations](limitations.md)
+
+## The words used here
+
+| Word | Meaning |
+|---|---|
+| **check** | One piece of Lean code sent to be checked: a snippet of a `POST /api/check`. |
+| **verdict** | Lean's judgement of a check: accepted, or rejected with errors or a `sorry`. Also called a definitive answer. The only thing the cache stores. |
+| **timeout** | Lean ran out of the time the client allowed. It is a reply, and no verdict: passed on once, never retried, never stored. |
+| **no reply** | The check got nothing from Lean: a lost connection, a crashed worker, a gateway error. Only this is sent to another server. |
+| **Lean server** | One Kimina Lean Server. |
+| **workers** | The checks a Lean server runs at once (Kimina's `LEAN_SERVER_MAX_REPLS`). |
+| **Lean server box**, or **box** | A machine that runs a Lean server and its usage agent. |
+| **pool box**, or **the pool's host** | The machine that runs the proxy and the cache. |
+| **proxy** | The HAProxy on the pool box. |
+| **the cache's pin** | The string that names the pool's Lean and Mathlib versions; part of every cache key. |
+| **front door** | The proxy's public port, and with TLS its certificate (`front.pem`). |
+| **TLS front** | With TLS, the HAProxy in front of the Lean server and the agent on a Lean server box. Not the front door. |
+| **checkers** | The Lean servers as the proxy's configuration names them; the **checkers door** is the proxy's loopback listener through which the cache reaches them. |
+| **a certificate's pin** | The fingerprint of a public key that a joining box checks with `curl --pinnedpubkey`. Unrelated to the cache's pin. |

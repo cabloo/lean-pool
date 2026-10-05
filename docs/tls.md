@@ -55,70 +55,122 @@ The authority's certificate (`ca.crt`) is public: every client needs it, and so 
 
 ## Setting it up
 
-On the pool's host, make the authority, the front door's certificate (with every name and
-address clients use for the pool) and the proxy's client certificate:
+This starts from a pool that works in plain HTTP, set up as in
+[Deploying a pool](deployment.md): `deploy/pool` on the pool box, `deploy/lean-server` on each
+Lean server box, and [the commands](deployment.md#getting-the-commands) available on both. Here
+the pool is reached as `pool.example` at 192.0.2.1 and has one Lean server, `lean-a`, at
+192.0.2.10.
+
+Do it in one sitting. From the moment a Lean server box moves behind its TLS front (step 4)
+until the proxy has moved too (step 6), the proxy cannot reach that box. Checks go to the boxes
+that have not moved yet, and are answered 503 once none is left.
+
+### 1. On the pool box: the authority and the proxy's certificates
+
+In `deploy/pool`. Give the front door every name and address clients use for the pool:
 
 ```sh
-leanpool-pki init --ca-dir pki/ca
-leanpool-pki issue-server --ca-dir pki/ca --out-dir pki/proxy --file-stem front \
+uv run leanpool-pki init --ca-dir pki/ca
+uv run leanpool-pki issue-server --ca-dir pki/ca --out-dir pki/proxy --file-stem front \
     --name pool.example --ip 192.0.2.1
-leanpool-pki issue-client --ca-dir pki/ca --out-dir pki/proxy --file-stem proxy-client \
+uv run leanpool-pki issue-client --ca-dir pki/ca --out-dir pki/proxy --file-stem proxy-client \
     --name lean-pool-proxy
-cp pki/ca/ca.crt pki/proxy/
+cp pki/ca/ca.crt pki/proxy/ca.crt
 ```
 
 `pki/proxy` now holds what the proxy needs: `front.pem`, `proxy-client.pem` and `ca.crt`. The
-authority's key, `pki/ca/ca.key`, is needed again only to sign another certificate; no
+authority's key, `pki/ca/ca.key`, is needed again only to sign another certificate. No
 container ever mounts it.
 
-Mount `pki/proxy` read-only in the proxy's container, say at `/etc/leanpool/tls`, readable by
-the user HAProxy runs as, and render with the paths as that container sees them. In
-`deploy/pool`, [`compose.tls.yaml`](../deploy/pool/compose.tls.yaml) adds exactly that mount and
-says how to set the files' group; the rendered file goes to `haproxy/haproxy.cfg` there, and the
-pool is started with both compose files.
+### 2. On the Lean server box: its key and a signing request
+
+In `deploy/lean-server`. The name is the one the server has in the pool's server list:
 
 ```sh
-leanpool-haproxy-config render --servers servers \
-    --tls-front-door-pem /etc/leanpool/tls/front.pem \
-    --tls-ca-file /etc/leanpool/tls/ca.crt \
-    --tls-client-pem /etc/leanpool/tls/proxy-client.pem > haproxy.cfg
+uv run leanpool-pki csr --out-dir tls --name lean-a
 ```
 
-On each Lean server box, make the box's key and a signing request for the name the server will
-have in the server list (`lean-a` here). The request goes to the pool's host; the key stays:
+That writes `tls/lean-a.key`, which never leaves the box, and `tls/lean-a.csr`, which is not
+secret. Take the `.csr` file to the pool box, into `deploy/pool`.
+
+### 3. On the pool box: sign the request
+
+In `deploy/pool`, for exactly the name this box may have:
 
 ```sh
-leanpool-pki csr --out-dir tls --name lean-a             # on the box
-leanpool-pki sign-csr --ca-dir pki/ca --csr lean-a.csr --out lean-a.crt \
-    --allow-dns lean-a                                   # on the pool's host
-cat lean-a.crt tls/lean-a.key > tls/box.pem              # on the box again, with umask 077
+uv run leanpool-pki sign-csr --ca-dir pki/ca --csr lean-a.csr --out lean-a.crt \
+    --allow-dns lean-a
 ```
 
-Then put the TLS front where the Lean server and the agent used to be published. It is the same
-HAProxy image as the proxy, given `box.pem` and a copy of the authority's `ca.crt`; the Lean
-server and the agent sit behind it on a network that does not leave the box.
-[`deploy/lean-server/compose.tls.yaml`](../deploy/lean-server/compose.tls.yaml) is that
-arrangement; it reads `tls/box.pem`, `tls/ca.crt` and the front's configuration as
-`front/haproxy.cfg`:
+Take `lean-a.crt` and a copy of `pki/ca/ca.crt` back to the box, into `deploy/lean-server/tls`.
+Both are public.
+
+### 4. On the Lean server box: the TLS front
+
+In `deploy/lean-server`. Join the certificate and the key into the one file HAProxy takes, and
+render the front's configuration:
 
 ```sh
-leanpool-haproxy-config render-box \
+(umask 077 && cat tls/lean-a.crt tls/lean-a.key > tls/box.pem)
+mkdir -p front
+uv run leanpool-haproxy-config render-box \
     --tls-server-pem /etc/leanpool/tls/box.pem --tls-ca-file /etc/leanpool/tls/ca.crt \
     --proxy-client-name lean-pool-proxy \
-    --lean-upstream kimina:8000 --agent-upstream agent:18200 > box-haproxy.cfg
+    --lean-upstream kimina:8000 --agent-upstream agent:18200 > front/haproxy.cfg
 ```
 
-Before the box is added to the server list, test its Lean server alone through the front, from
-the pool's host, as the proxy will reach it (see
-[Through a box's TLS front](admission.md#through-a-boxs-tls-front)):
+The front is the same HAProxy image as the proxy and runs as that image's own unprivileged user.
+Let its group, and nobody else, read the key; then start the box again from
+[`compose.tls.yaml`](../deploy/lean-server/compose.tls.yaml), in which the Lean server and the
+agent publish nothing and only the front does:
 
 ```sh
-leanpool-admit --server https://192.0.2.10:8000 --api-key-file api-key.txt --cases cases/ \
+gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
+sudo chgrp "$gid" tls tls/box.pem && chmod 0750 tls && chmod 0640 tls/box.pem
+docker compose -f compose.tls.yaml up -d --build
+```
+
+### 5. On the pool box: test the box through its front
+
+In `deploy/pool`. Before the proxy is moved, test the Lean server alone, as the proxy will reach
+it ([Through a box's TLS front](admission.md#through-a-boxs-tls-front)):
+
+```sh
+uv run leanpool-admit --server https://192.0.2.10:8000 --api-key-file api-key.txt \
+    --cases ../../examples/admission-cases \
     --tls-ca-file pki/ca/ca.crt --tls-client-pem pki/proxy/proxy-client.pem \
     --tls-server-name lean-a
 ```
 
-Clients keep their API key and get the authority's certificate beside it:
+Repeat steps 2 to 5 for every server in the list.
+
+### 6. On the pool box: move the proxy
+
+In `deploy/pool`. Render with the three certificate files, as the proxy's container sees them,
+and let HAProxy validate the result with the certificates in place:
+
+```sh
+uv run leanpool-haproxy-config render --servers servers \
+    --tls-front-door-pem /etc/leanpool/tls/front.pem \
+    --tls-ca-file /etc/leanpool/tls/ca.crt \
+    --tls-client-pem /etc/leanpool/tls/proxy-client.pem > haproxy/haproxy.cfg.new
+```
+
+```sh
+gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
+sudo chgrp "$gid" pki/proxy pki/proxy/*.pem && chmod 0750 pki/proxy && chmod 0640 pki/proxy/*.pem
+docker run --rm --network none -v "$PWD/haproxy":/cfg:ro \
+    -v "$PWD/pki/proxy":/etc/leanpool/tls:ro haproxy:3.0 haproxy -c -f /cfg/haproxy.cfg.new
+mv haproxy/haproxy.cfg.new haproxy/haproxy.cfg
+docker compose -f compose.yaml -f compose.tls.yaml up -d
+```
+
+[`compose.tls.yaml`](../deploy/pool/compose.tls.yaml) adds one thing to the pool's compose
+file: `pki/proxy`, mounted read-only where the configuration expects the certificates.
+
+### 7. Clients
+
+Clients keep their API key and get the authority's certificate, `pki/ca/ca.crt`, beside it:
 
 ```sh
 curl --cacert ca.crt https://pool.example:18100/health
@@ -126,3 +178,20 @@ curl --cacert ca.crt https://pool.example:18100/health
 
 In Python, `ssl.create_default_context(cafile="ca.crt")` is all a client needs, with host name
 checking on and under the strict X.509 rules that are the default from Python 3.13.
+
+## Changing a pool that uses TLS
+
+Everything in [Operating a pool](deployment.md#operating-a-pool) holds, with three differences:
+
+* **Always render with the three `--tls-...` options**, or set `LEANPOOL_HAPROXY_TLS_FRONT_DOOR_PEM`,
+  `LEANPOOL_HAPROXY_TLS_CA_FILE` and `LEANPOOL_HAPROXY_TLS_CLIENT_PEM` once in the shell you render
+  from. A configuration rendered without them is plain HTTP, and says so in its first line.
+* **Validate with the certificates mounted**, as in step 6: HAProxy reads them when it checks a
+  configuration.
+* **A new server needs steps 2 to 5 first**, and its name in the server list must be the name
+  its certificate was signed for. [Joining over the network](joining.md) carries the signing
+  request and the certificate for a box that can reach the pool box.
+
+`leanpool-pki expiry CERTIFICATE` prints the days a certificate has left. To replace one, issue
+or sign it again with `--replace`, put the new `.pem` in place and reload the HAProxy that
+reads it.

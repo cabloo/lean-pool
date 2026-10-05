@@ -1,13 +1,14 @@
 # One Lean server box: a Kimina Lean Server and the lean-pool usage agent beside it.
+# docs/deployment.md walks through it (step 2). This file expects, beside it, a file .env:
 #
-#   printf 'LEAN_SERVER_API_KEY=%s\nLEAN_SERVER_MAX_REPLS=%s\n' 'the-pool-api-key' 8 > .env
-#   docker compose up -d --build
+#   LEAN_SERVER_API_KEY=<the pool's API key>
+#   LEAN_SERVER_MAX_REPLS=<how many checks this box runs at once>
 #
-# LEAN_SERVER_MAX_REPLS is how many checks this box runs at once: the WORKERS number of its
-# line in the pool's server list.
+# The second is the WORKERS number of this box's line in the pool's server list. Then
+# `docker compose up -d --build`.
 #
 # Kimina is not part of lean-pool. This runs the image its own compose.yaml runs; use the image
-# that carries YOUR Lean and Mathlib versions (KIMINA_IMAGE, see Kimina's README), and the same
+# that carries YOUR Lean and Mathlib (KIMINA_IMAGE in .env, see Kimina's README), and the same
 # one on every box of a pool. The admission test (docs/admission.md) checks that before a box
 # is added.
 #
@@ -27,6 +28,15 @@ services:
       LEAN_SERVER_MAX_WAIT: "${LEAN_SERVER_MAX_WAIT:-60}"
     ports:
       - "8000:8000" # the HOST:PORT of this box's line in the pool's server list
+    # Checking Lean code runs it. Give the Lean server no more than it needs: no capabilities,
+    # no way to gain privileges, a bound on its processes. Add a memory limit that fits the box
+    # (mem_limit), and block new outbound connections from this container in your firewall:
+    # Lean needs no network while it checks.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    pids_limit: 4096
 
   agent:
     image: lean-pool

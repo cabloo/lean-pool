@@ -46,9 +46,10 @@ back in the same window.
 
 ### The command a new box runs
 
-The command a new box runs is one line. The box does not have the pool's authority yet, so it
-cannot check the certificate's chain (`-k`); it checks the front door's public key instead,
-which `leanpool-pki pin` prints on the pool's host:
+It is one line. The box does not have the pool's authority yet, so it cannot check the
+certificate's chain (`-k`). It checks the front door's public key instead, against a pin that
+`leanpool-pki pin` prints on the pool's host. (This pin is a fingerprint of a key. It has
+nothing to do with the cache's pin, which names Lean and Mathlib versions.)
 
 ```sh
 curl -fsSk --pinnedpubkey 'sha256//...' https://pool.example:18110/j/<token> | sudo bash
@@ -63,7 +64,7 @@ holds the front door's key, and to no other.
 
 * **HTTPS only**, TLS 1.3 or later, with the front door's certificate. There is no plain mode.
 * **Without the token, nothing.** A request whose path does not carry the token is answered 404,
-  as is a request for anything but the five above, so someone without the token cannot tell
+  as is a request for anything but those above, so someone without the token cannot tell
   whether a window is open. The token is compared in constant time. It is 22 to 128 letters,
   digits, `-` and `_`: 128 random bits are 22 characters in URL-safe base64, 32 in hexadecimal.
 * **One box per window.** Once a signing request has arrived, every request from another
@@ -95,7 +96,7 @@ request of the box is `curl -fsSk --pinnedpubkey "$PIN"`.
 
 | | On the pool's host | On the new box |
 |---|---|---|
-| 1 | Make a token (`openssl rand -hex 16`) and an empty spool directory. Start `leanpool-join` with the join script, the front door's `front.pem`, the spool and the pool's API key. Print the pin: `leanpool-pki pin pki/proxy/front.crt`. | |
+| 1 | Make a token and an empty spool directory, start `leanpool-join`, and print the front door's pin ([the commands](#opening-a-window)). | |
 | 2 | | Run the one-line command. The script it fetches does the rest. |
 | 3 | | Make the box's key and signing request, `leanpool-pki csr --out-dir tls --name NAME`, and `POST URL/csr` with `{name, lean_port, agent_port, workers, csr}`. The key never leaves the box. |
 | 4 | `requests/csr.json` appears. Decide whether this box may join under this name. Sign: `leanpool-pki sign-csr --ca-dir pki/ca --csr ... --out ... --allow-dns NAME`. Write `responses/certificate.json` with `{certificate, ca}`, or `{reason}` to refuse. | |
@@ -105,3 +106,20 @@ request of the box is `curl -fsSk --pinnedpubkey "$PIN"`.
 
 A failure at any step leaves the pool as it was: nothing is added before step 6 has passed, and
 a box that was refused holds a certificate that proves only its own name.
+
+### Opening a window
+
+Step 1, on the pool's host, in the directory that holds `pki/` and `api-key.txt`
+(`deploy/pool`, if you followed [TLS](tls.md)), with your join script as `join.sh`:
+
+```sh
+mkdir -m 0700 spool
+openssl rand -hex 16 > token.txt
+leanpool-pki pin pki/proxy/front.crt
+leanpool-join --script join.sh --token-file token.txt --tls-pem pki/proxy/front.pem \
+    --spool spool --api-key-file api-key.txt
+```
+
+The second-to-last command prints the pin for the new box's `curl`; the last one serves the
+window on port 18110 until it is stopped. The token is the last part of the window's address,
+`https://pool.example:18110/j/<token>`.

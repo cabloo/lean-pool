@@ -15,7 +15,7 @@ deployment examples written for publication.
 
 - `leanpool-haproxy-config`: the server list and the generator of a pool proxy's `haproxy.cfg`
   (cache-first routing, least-connections balancing capped at each server's workers, failover
-  that never retries a Lean timeout, lossless loss of the cache, run-time name resolution), and
+  that never retries a Lean timeout, no check lost when the cache is, run-time name resolution), and
   of a Lean server box's TLS front.
 - `leanpool-cache`: the shared result cache, with single flight for identical checks, a size
   cap with least-recently-used eviction, and a `no_cache` bypass.

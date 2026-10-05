@@ -1,7 +1,8 @@
 # Configuration reference
 
 Every command is configured the same way: a flag wins, then its environment variable, then the
-default. `--help` on any command prints this reference.
+default. `--help` on a command, or on one of its subcommands, prints its part of this
+reference.
 
 ## `leanpool-cache`
 

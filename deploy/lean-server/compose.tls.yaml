@@ -1,22 +1,24 @@
 # One Lean server box with TLS: the Kimina Lean Server and the usage agent publish nothing
 # themselves. A TLS front (HAProxy in TCP mode, the same image as the pool's proxy) stands on
 # their two ports, lets in only the pool proxy's client certificate, and passes what it accepts
-# to them unchanged. docs/tls.md walks through the certificates.
+# to them unchanged. docs/tls.md walks through it (steps 2 to 4). This file expects, beside it:
 #
-#   printf 'LEAN_SERVER_API_KEY=%s\nLEAN_SERVER_MAX_REPLS=%s\n' 'the-pool-api-key' 8 > .env
-#   mkdir -p front
+#   .env                  as for compose.yaml
+#   tls/box.pem           this box's certificate followed by its private key
+#   tls/ca.crt            the pool authority's certificate
+#   front/haproxy.cfg     the front's configuration:
+#
 #   leanpool-haproxy-config render-box \
 #       --tls-server-pem /etc/leanpool/tls/box.pem --tls-ca-file /etc/leanpool/tls/ca.crt \
 #       --proxy-client-name lean-pool-proxy \
 #       --lean-upstream kimina:8000 --agent-upstream agent:18200 > front/haproxy.cfg
-#   docker compose -f compose.tls.yaml up -d --build
 #
-# ./tls holds box.pem (this box's certificate followed by its private key) and ca.crt (the pool
-# authority's certificate). box.pem holds a private key: make the directory and the file
-# readable by the group HAProxy's image runs as, and by nobody else:
+# box.pem holds a private key: let the group HAProxy's image runs as read it, and nobody else:
 #
 #   gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
-#   sudo chown -R root:"$gid" tls && sudo chmod 0750 tls && sudo chmod 0640 tls/box.pem
+#   sudo chgrp "$gid" tls tls/box.pem && chmod 0750 tls && chmod 0640 tls/box.pem
+#
+# Then `docker compose -f compose.tls.yaml up -d --build`.
 
 name: lean-server
 
@@ -57,6 +59,11 @@ services:
       LEAN_SERVER_MAX_WAIT: "${LEAN_SERVER_MAX_WAIT:-60}"
     # No ports: between the front and the Lean server checks are plain, so that hop stays on
     # this compose project's own network.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    pids_limit: 4096
 
   agent:
     image: lean-pool

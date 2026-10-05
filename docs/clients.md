@@ -38,13 +38,15 @@ stored.
 
 ## From Python
 
-Kimina's own client works unchanged (`kimina-client` 0.2.1 was run against a pool this way):
+Kimina's own client works unchanged, pointed at the pool (`kimina-client` 0.2.1 was run this
+way against the [demo](../examples/demo)'s pool):
 
 ```python
 from kimina_client import KiminaClient
 
-client = KiminaClient(api_url="http://pool.example:18100", api_key="the-pool-api-key")
-reply = client.check(["theorem two : 1 + 1 = 2 := by rfl"], timeout=60, batch_size=1)
+client = KiminaClient(api_url="http://pool.example:18100", api_key="...")
+client.check("theorem two : 1 + 1 = 2 := by rfl")
+client.check(many_proofs, timeout=60, batch_size=1)  # one snippet per request: see below
 ```
 
 [`examples/pool_client.py`](../examples/pool_client.py) is a small asynchronous client written
@@ -72,8 +74,8 @@ are in [`tests/test_example_client.py`](../tests/test_example_client.py). Copy w
 
 | Reply | Meaning | What to do |
 |---|---|---|
-| 200, the result has a `response` | Lean's answer: the code was accepted, or rejected with error `messages` or a `sorry`. | Record it. |
-| 200, the result has an `error` | No answer from Lean. Usually a Lean timeout, which Kimina reports this way. The pool neither retries nor stores it. | Record "no answer", not a failed proof. |
+| 200, the result has a `response` | Lean's verdict: the code was accepted, or rejected with error `messages` or a `sorry`. | Record it. |
+| 200, the result has an `error` | No verdict. Usually a Lean timeout, which Kimina reports this way. The pool passes it on as it is: it neither retries nor stores it. | Record "no verdict", not a failed proof. |
 | 401 | The API key is missing or wrong. | Fix the client. |
 | 422 | The request is malformed. | Fix the client. |
 | 429 | A Lean server had no free worker within its own wait. The pool passes it on. | Pause and ask again. |
