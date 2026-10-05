@@ -256,6 +256,16 @@ def test_every_step_of_the_walkthrough_behaves_as_it_says(native_demo: NativeDem
 
 
 @needs_a_real_pool
+def test_the_walkthrough_can_be_run_again_against_the_same_pool(native_demo: NativeDemo) -> None:
+    first = run_walkthrough(native_demo)
+    time.sleep(1.1)  # a run is told from the last one by the second it started in
+    again = run_walkthrough(native_demo)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert again.returncode == 0, again.stdout + again.stderr
+
+
+@needs_a_real_pool
 def test_the_walkthrough_stops_at_the_first_step_that_does_not_behave(
     native_demo: NativeDemo,
 ) -> None:

@@ -13,9 +13,9 @@ shows what a client can do because it is talking to a pool:
   pool says nothing.
 * It can mark its work as background (``--background``): such checks wait behind every normal
   check for a worker.
-* It tells an answer from no answer. A check the pool did not take (HTTP 502, 503 or 504, a lost
-  connection) is asked again after a pause. A Lean timeout is passed on as "no answer" and is
-  never counted as a failed proof.
+* It tells a verdict from no verdict. A check the pool did not take (HTTP 429, 502, 503 or 504,
+  a lost connection) is asked again after a pause. A Lean timeout is reported as "no verdict"
+  and is never counted as a failed proof.
 
 It prints one JSON line per file. Copy what is useful: the header names and their readers are in
 ``leanpool.signals``, and ``leanpool.kimina`` reads one result.
@@ -46,10 +46,12 @@ from leanpool.signals import (
     capacity_from_health,
 )
 
-Outcome = Literal["verified", "rejected", "no answer"]
+Outcome = Literal["verified", "rejected", "no verdict"]
 
-# The statuses that mean "the pool did not take this check": ask again, record nothing.
-NOT_TAKEN_STATUSES = frozenset({502, 503, 504})
+# The statuses that mean "the pool did not take this check": ask again, record nothing. 429 is a
+# Lean server that had no free worker within its own wait; the others are the proxy's and the
+# cache's words for no Lean server having taken the check.
+NOT_TAKEN_STATUSES = frozenset({429, 502, 503, 504})
 
 
 @dataclass(frozen=True)
@@ -182,23 +184,23 @@ class PoolClient:
                         if response.status != 200:
                             text = (await response.text())[:200]
                             return Verdict(
-                                name, "no answer", False, f"HTTP {response.status}: {text}"
+                                name, "no verdict", False, f"HTTP {response.status}: {text}"
                             )
                         reply = await response.json()
                 except (aiohttp.ClientError, TimeoutError) as error:
                     detail = f"the pool could not be reached: {error!r}"
                     continue
                 return read_verdict(name, reply["results"][0])
-        return Verdict(name, "no answer", False, f"{detail}, {self._settings.attempts} times")
+        return Verdict(name, "no verdict", False, f"{detail}, {self._settings.attempts} times")
 
 
 def read_verdict(name: str, result: Mapping[str, Any]) -> Verdict:
-    """Read one result: Lean accepted the file, Lean rejected it, or there is no answer."""
+    """Read one result: Lean accepted the file, Lean rejected it, or it gave no verdict."""
     cached = result.get("cached") is True
     try:
         answer = read_lean_answer(result)
     except IndefiniteResultError as error:
-        return Verdict(name, "no answer", cached, str(error))
+        return Verdict(name, "no verdict", cached, str(error))
     if answer.has_errors:
         first_error = next(m.text for m in answer.messages if m.severity == "error")
         return Verdict(name, "rejected", cached, first_error.splitlines()[0][:200])
@@ -242,11 +244,11 @@ async def _run(options: argparse.Namespace) -> int:
         verdicts = await PoolClient(session, settings).check_all(files)
     for verdict in verdicts:
         print(json.dumps(asdict(verdict)))
-    return 0 if all(verdict.outcome != "no answer" for verdict in verdicts) else 1
+    return 0 if all(verdict.outcome != "no verdict" for verdict in verdicts) else 1
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    """Check the files named on the command line; exit 1 if any got no answer."""
+    """Check the files named on the command line; exit 1 if any got no verdict."""
     return asyncio.run(_run(_parse_arguments(sys.argv[1:] if arguments is None else arguments)))
 
 

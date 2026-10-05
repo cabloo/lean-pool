@@ -1,4 +1,4 @@
-"""The example client: it follows the pool's stated size and tells an answer from no answer."""
+"""The example client: it follows the pool's stated size and tells a verdict from no verdict."""
 
 from __future__ import annotations
 
@@ -111,12 +111,12 @@ def many(count: int) -> dict[str, str]:
         (lean_answer(sorries=1), "rejected", "the proof uses sorry"),
         (
             lean_timeout(60),
-            "no answer",
+            "no verdict",
             "the server reported an error: Lean REPL command timed out in 60 seconds",
         ),
     ],
 )
-def test_a_result_is_verified_rejected_or_no_answer(
+def test_a_result_is_verified_rejected_or_no_verdict(
     result: dict[str, Any], outcome: Outcome, detail: str
 ) -> None:
     assert read_verdict("a.lean", {"id": "a.lean", **result}) == Verdict(
@@ -201,7 +201,7 @@ async def test_a_pool_with_no_server_up_leaves_the_configured_number(check_files
 # --- a check the pool did not take ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", [502, 503, 504])
+@pytest.mark.parametrize("status", [429, 502, 503, 504])
 async def test_a_check_the_pool_did_not_take_is_asked_again(
     check_files: Check, status: int
 ) -> None:
@@ -213,14 +213,14 @@ async def test_a_check_the_pool_did_not_take_is_asked_again(
     assert len(pool.requests) == 3
 
 
-async def test_a_pool_that_keeps_refusing_is_no_answer_and_never_a_failed_proof(
+async def test_a_pool_that_keeps_refusing_is_no_verdict_and_never_a_failed_proof(
     check_files: Check,
 ) -> None:
     pool = FakePool(refusals=[503] * 10)
 
     (verdict,), _client = await check_files(pool, {"a.lean": ACCEPTED}, attempts=3)
 
-    assert verdict == Verdict("a.lean", "no answer", False, "the pool answered HTTP 503, 3 times")
+    assert verdict == Verdict("a.lean", "no verdict", False, "the pool answered HTTP 503, 3 times")
     assert len(pool.requests) == 3
 
 
@@ -229,16 +229,16 @@ async def test_a_refusal_that_is_about_the_request_is_not_asked_again(check_file
 
     (verdict,), _client = await check_files(pool, {"a.lean": ACCEPTED})
 
-    assert (verdict.outcome, verdict.detail) == ("no answer", "HTTP 401: refused")
+    assert (verdict.outcome, verdict.detail) == ("no verdict", "HTTP 401: refused")
     assert len(pool.requests) == 1
 
 
-async def test_a_pool_that_cannot_be_reached_is_no_answer() -> None:
+async def test_a_pool_that_cannot_be_reached_is_no_verdict() -> None:
     settings = ClientSettings(url="http://127.0.0.1:9", attempts=2, pause_seconds=0.0)
     async with aiohttp.ClientSession() as session:
         (verdict,) = await PoolClient(session, settings).check_all({"a.lean": ACCEPTED})
 
-    assert verdict.outcome == "no answer"
+    assert verdict.outcome == "no verdict"
     assert verdict.detail.startswith("the pool could not be reached")
 
 

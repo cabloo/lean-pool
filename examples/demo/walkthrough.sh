@@ -7,7 +7,8 @@
 #
 # Every step prints what it sent and what came back. The script stops with a non-zero status at
 # the first step that did not behave as described, and the project's CI runs it for that reason.
-# It needs bash, curl and awk.
+# It needs bash, curl and awk, and can be run again against the same pool: every run puts a
+# line of its own into the code it sends, so nothing an earlier run stored is in its way.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -60,7 +61,11 @@ wait_for() {
   fail "GET $1 did not show $2 within $3 s (last answer: ${body:-none})"
 }
 
-TWO="theorem two : 1 + 1 = 2 := by rfl"
+# One comment line that no earlier run sent ("\n" is a line break once it is inside JSON).
+RUN="-- walkthrough $(date +%s)-$$\n"
+TWO="${RUN}theorem two : 1 + 1 = 2 := by rfl"
+WRONG="${RUN}theorem hard : 2 + 2 = 5 := by sorry"
+SLOW="${RUN}-- standin: timeout\ntheorem slow : True := by trivial"
 
 step "1. The pool is up: one address, two Lean servers, six workers"
 wait_for /health '"workers":6' 120
@@ -85,23 +90,24 @@ expect_in_body '"id": "attempt-2"'
 expect_in_body '"cached": true'
 expect_faster_than 1.0
 
-step "4. A proof Lean does not accept is an answer too, and is stored like one"
-check wrong-1 "theorem hard : 2 + 2 = 5 := by sorry"
+step "4. A proof Lean rejects is a verdict too, and is stored like one"
+check wrong-1 "$WRONG"
 expect_in_body "declaration uses 'sorry'"
-check wrong-2 "theorem hard : 2 + 2 = 5 := by sorry"
+expect_not_in_body '"cached"'
+check wrong-2 "$WRONG"
 expect_in_body '"cached": true'
 
-step "5. A Lean timeout is not an answer: it is passed on and never stored"
-check slow-1 "-- standin: timeout\ntheorem slow : True := by trivial"
+step "5. A Lean timeout is no verdict: it is passed on as it is, and never stored"
+check slow-1 "$SLOW"
 expect_status 200
 expect_in_body "timed out"
-check slow-2 "-- standin: timeout\ntheorem slow : True := by trivial"
+check slow-2 "$SLOW"
 expect_in_body "timed out"
 expect_not_in_body '"cached"'
 
 step "6. A Lean server goes away. The check that meets it is sent to the other one"
 "${COMPOSE[@]}" stop agent-b lean-b
-check after-loss "theorem three : 1 + 2 = 3 := by rfl"
+check after-loss "${RUN}theorem three : 1 + 2 = 3 := by rfl"
 expect_status 200
 expect_in_body "stand-in lean-a"
 wait_for /health '"servers":1' 60

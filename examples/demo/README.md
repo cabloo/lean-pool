@@ -2,7 +2,7 @@
 
 A whole pool on one machine in about a minute, with no Lean or Mathlib image to build: HAProxy
 on the generated configuration, the cache, and two stand-in Lean servers with a usage agent
-each. You need Docker with compose, `bash` and `curl`.
+each. You need Docker with compose, and `bash`, `curl` and `awk` for the walkthrough.
 
 From the repository root:
 
@@ -21,15 +21,16 @@ The pool listens on `http://127.0.0.1:18100` and its API key is `demo-key`.
 | 1 | `GET /health` says the pool's size: two servers, six workers. |
 | 2 | A check. Nothing is stored yet, so a Lean server works on it for 2 seconds. |
 | 3 | The same proof as another attempt comes back in milliseconds, under its own id, marked `"cached": true`. |
-| 4 | A proof Lean does not accept is an answer too, and is stored like one. |
-| 5 | A Lean timeout is not an answer: it is passed on, and never stored. |
+| 4 | A proof Lean rejects is a verdict too, and is stored like one. |
+| 5 | A Lean timeout is no verdict: it is passed on as it is, and never stored. |
 | 6 | A Lean server is stopped. The check that meets it is answered by the other one. |
 | 7 | The cache is stopped. Checks keep flowing, straight to a Lean server. |
 | 8 | Both come back. The cache kept its store, and the pool its size. |
 | 9 | The cache's counters. |
 
 The script prints what it sent and what came back, and stops with a non-zero status at the
-first step that does not behave as described.
+first step that does not behave as described. It can be run again against the same pool: each
+run sends code of its own.
 
 ## What is real here, and what is not
 
