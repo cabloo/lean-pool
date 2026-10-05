@@ -5,7 +5,8 @@ then takes it only when no normal check is waiting. Anything but the one value i
 an old client and a mistyped value behave as they always did.
 
 *Capacity.* Every answer that leaves the pool's front door carries three response headers: the
-workers on servers that are up, the checks waiting for a worker, and the servers that are up.
+workers on servers that are up, the checks waiting for a worker, and the servers taking checks
+(up, and not drained by their usage agent).
 ``GET /health`` carries the same numbers in its body. They are advisory: nothing in the pool reads
 them back, and a client that cannot read them keeps the number it was configured with.
 """

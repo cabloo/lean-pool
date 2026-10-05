@@ -181,8 +181,14 @@ checking on and under the strict X.509 rules that are the default from Python 3.
 
 ## Changing a pool that uses TLS
 
-Everything in [Operating a pool](deployment.md#operating-a-pool) holds, with three differences:
+Everything in [Operating a pool](deployment.md#operating-a-pool) holds, with four differences:
 
+* **Name the TLS compose files in every `docker compose` command**:
+  `-f compose.yaml -f compose.tls.yaml` on the pool box, `-f compose.tls.yaml` on a Lean server
+  box. A bare `docker compose up -d` there would start the plain arrangement again: the proxy
+  without its certificates, or a box's Lean server on the port its TLS front holds. Setting
+  `COMPOSE_FILE=compose.yaml:compose.tls.yaml` (on a box, `COMPOSE_FILE=compose.tls.yaml`) in the
+  shell spares the typing.
 * **Always render with the three `--tls-...` options**, or set `LEANPOOL_HAPROXY_TLS_FRONT_DOOR_PEM`,
   `LEANPOOL_HAPROXY_TLS_CA_FILE` and `LEANPOOL_HAPROXY_TLS_CLIENT_PEM` once in the shell you render
   from. A configuration rendered without them is plain HTTP, and says so in its first line.
@@ -192,6 +198,13 @@ Everything in [Operating a pool](deployment.md#operating-a-pool) holds, with thr
   its certificate was signed for. [Joining over the network](joining.md) carries the signing
   request and the certificate for a box that can reach the pool box.
 
-`leanpool-pki expiry CERTIFICATE` prints the days a certificate has left. To replace one, issue
-or sign it again with `--replace`, put the new `.pem` in place and reload the HAProxy that
-reads it.
+`leanpool-pki expiry CERTIFICATE` prints the days a certificate has left. To replace one:
+
+* A box's certificate: sign the box's request again with `--replace` (the box keeps its key),
+  join the new certificate and the key into `box.pem` as in step 4, and reload the front.
+* The front door's or the proxy's own: issue it again with `--replace`. That makes a new key
+  and writes new files, for you alone to read, so give HAProxy's group its access again as in
+  step 6 before you reload the proxy. A new front door key also has a new pin: a
+  [join window](joining.md) opened afterwards prints it.
+
+Reload with `kill -HUP 1` inside the container, as for a new configuration.

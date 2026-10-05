@@ -35,7 +35,7 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 | **check** | One piece of Lean code sent to be checked: a snippet of a `POST /api/check`. |
 | **verdict** | Lean's judgement of a check: accepted, or rejected with errors or a `sorry`. Also called a definitive answer. The only thing the cache stores. |
 | **timeout** | Lean ran out of the time the client allowed. It is a reply, and no verdict: passed on once, never retried, never stored. |
-| **no reply** | The check got nothing from Lean: a lost connection, a crashed worker, a gateway error. Only this is sent to another server. |
+| **no answer from Lean** | The check got nothing Lean said: a lost connection, a crashed worker (HTTP 500), a gateway error (502, 503, 504). Only this is sent to another server. |
 | **Lean server** | One Kimina Lean Server. |
 | **workers** | The checks a Lean server runs at once (Kimina's `LEAN_SERVER_MAX_REPLS`). |
 | **Lean server box**, or **box** | A machine that runs a Lean server and its usage agent. |

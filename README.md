@@ -14,8 +14,8 @@ lean-pool generates its configuration and adds what a load balancer does not do 
 * a **shared result cache** that knows which of Lean's answers are safe to give again;
 * **load balancing by real headroom**: every machine reports its idle CPU and available
   memory, and receives checks in proportion;
-* **failover that leaves Lean's verdicts alone**: a check goes to another server only when the
-  first one did not reply at all;
+* **failover that leaves Lean's verdicts alone**: a check goes to another server only when it
+  got no answer from Lean (a lost connection, a crashed worker, a gateway error);
 * an **admission test** that keeps a server with the wrong Lean or Mathlib out of the pool;
 * optionally, **TLS on every hop** from the pool's own certificate authority.
 
@@ -57,7 +57,7 @@ workstation, two desktops and a laptop, each also used for other work.
 |---|---|
 | **The same proof is checked again and again.** Provers resubmit the same proof of the same statement across samples, epochs and reruns. Kimina has no cache between servers, and an ordinary HTTP cache cannot be one: a check is a `POST` identified by its body, every attempt carries its own id, and a Lean timeout comes back as HTTP 200. | The [cache](docs/cache.md) answers a repeat from its store, under the caller's own id, and lets identical checks in flight share one worker. It stores only a verdict Lean would give again: a timeout, a crashed worker or an out-of-memory failure is passed on and never stored. |
 | **Machines differ, and are busy with other things.** A balancer that knows nothing sends a 4-core laptop as much as a 32-core workstation, and keeps sending to a box that has started to swap. | Each server gets [at most as many checks as it has workers](docs/haproxy.md), and the rest wait in one queue instead of timing out on a busy box. A small [usage agent](docs/usage-agent.md) on each box reports idle CPU and available memory, and HAProxy scales that box's share by it, down to draining a box that runs out of memory. |
-| **Retries can change what you measure.** A balancer that retries a slow check elsewhere turns "timed out" into "passed on a faster box". | A Lean timeout is passed on as it is and [never retried](docs/haproxy.md#failover-among-the-lean-servers). Only a check that got no reply (a lost connection, a crashed worker, a gateway error) goes to another server, at most twice. |
+| **Retries can change what you measure.** A balancer that retries a slow check elsewhere turns "timed out" into "passed on a faster box". | A Lean timeout is passed on as it is and [never retried](docs/haproxy.md#failover-among-the-lean-servers). Only a check that got no answer from Lean (a lost connection, a crashed worker, a gateway error) goes to another server, at most twice. |
 | **A server on the wrong version answers confidently and wrongly**, and behind a balancer its answers look like everyone else's. | A server is [tested alone](docs/admission.md) against proofs that must verify and near misses that must not, before it is added. |
 
 The pool is also built to lose parts without losing checks. The cache is optional at run time:
@@ -104,8 +104,9 @@ examples/demo/walkthrough.sh
 
 The walkthrough sends checks and shows what the pool does with each: a first check takes the
 stand-in's 2 seconds, the same proof again comes back in milliseconds marked `"cached": true`,
-a Lean timeout is passed on and never stored, and stopping a Lean server or the cache costs no
-check. It stops at the first step that does not behave as described.
+a Lean timeout is passed on and never stored, and the pool goes on answering while a Lean
+server, and then the cache, is stopped. It stops at the first step that does not behave as
+described.
 
 ```
 == 3. The same proof as another attempt: answered from the cache, under the new id

@@ -41,7 +41,8 @@ a Lean server: it never waits for an identical check in flight. A request with a
 `infotree` is bypassed too, because the key does not cover that option.
 
 **Single flight:** identical checks in flight at the same time wait for one upstream answer.
-Each caller gets it under its own `id`. These answers are not marked `cached`.
+Each caller gets it under its own `id`. An answer that came from a Lean server this way is not
+marked `cached`.
 
 **Several snippets in one request** are split: each is looked up, forwarded and stored on its
 own, and the results come back in request order. Like Kimina, the cache answers a whole request

@@ -81,7 +81,9 @@ cache and fake Lean servers on loopback, and show what HAProxy does with it:
 * a server whose name does not resolve does not stop the proxy, and a server given by address
   beside it is unaffected; a server whose address changes is followed;
 * HAProxy applies the usage agent's replies: 50% halves the weight, 1% leaves the server in
-  rotation, `drain` drains it, and the next normal reply restores it.
+  rotation, `drain` drains it, and the next normal reply restores it;
+* a drained server stays in the workers the pool reports and leaves its servers, and takes no
+  check; with every server drained `/health` and a check are both answered 503.
 
 With TLS (`tests/test_tls_live.py`), the pool proxy and each box's TLS front are real HAProxy
 processes on the generated configurations, with throwaway certificates made by `leanpool.pki`:

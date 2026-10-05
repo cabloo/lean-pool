@@ -10,15 +10,17 @@ read one beside this page: [the demo's](../examples/demo/haproxy.cfg) is a compl
 * `resolvers pool_dns`: how server names are looked up while the proxy runs (see
   [Server names](#server-names)).
 * `frontend lean_pool` on the public port. `GET /health` is answered by HAProxy itself from
-  `nbsrv(checkers)`: 200 if at least one Lean server is up, 503 otherwise, so a health probe
+  `nbsrv(checkers)`: 200 if at least one Lean server is taking checks, 503 otherwise, so a health probe
   never queues behind proofs and does not depend on the cache. `default_backend cache`;
   `use_backend checkers` when the cache server is down, when the request carries the loop-guard
   header, and for every path other than `/api/check` (so the rest of Kimina's interface still
   works, uncached). `/status` is the cache's, and is answered 503 by HAProxy while the cache is
   down. The body of `/health` and three response headers on every answer carry the workers on
-  servers that are up, the checks queued and the servers up: the first is summed per listed
-  server (`srv_is_up(checkers/NAME)` times its worker count), the others are `queue(checkers)`
-  and `nbsrv(checkers)`.
+  servers that are up, the checks queued and the servers taking checks: the first is summed per
+  listed server (`srv_is_up(checkers/NAME)` times its worker count), the others are
+  `queue(checkers)` and `nbsrv(checkers)`. HAProxy's `nbsrv` leaves out a server that is drained
+  or at weight 0, and `srv_is_up` does not, so a server its usage agent has drained stays in
+  the workers and leaves the servers.
 * `frontend checkers_door` on `127.0.0.1` only: sets the loop-guard header, uses `checkers`.
 * `backend cache`: the cache server, health-checked every second and marked down on its first
   failed connection, with no connection cap; and the checkers door as its `backup` server (see

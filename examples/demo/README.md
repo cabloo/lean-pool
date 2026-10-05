@@ -23,7 +23,7 @@ The pool listens on `http://127.0.0.1:18100` and its API key is `demo-key`.
 | 3 | The same proof as another attempt comes back in milliseconds, under its own id, marked `"cached": true`. |
 | 4 | A proof Lean rejects is a verdict too, and is stored like one. |
 | 5 | A Lean timeout is no verdict: it is passed on as it is, and never stored. |
-| 6 | A Lean server is stopped. The check that meets it is answered by the other one. |
+| 6 | A Lean server is stopped. The pool goes on answering, with the one that is left. |
 | 7 | The cache is stopped. Checks keep flowing, straight to a Lean server. |
 | 8 | Both come back. The cache kept its store, and the pool its size. |
 | 9 | The cache's counters. |

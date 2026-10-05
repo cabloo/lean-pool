@@ -114,7 +114,7 @@ Step 1, on the pool's host, in the directory that holds `pki/` and `api-key.txt`
 
 ```sh
 mkdir -m 0700 spool
-openssl rand -hex 16 > token.txt
+(umask 077 && openssl rand -hex 16 > token.txt)
 leanpool-pki pin pki/proxy/front.crt
 leanpool-join --script join.sh --token-file token.txt --tls-pem pki/proxy/front.pem \
     --spool spool --api-key-file api-key.txt

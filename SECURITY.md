@@ -31,8 +31,10 @@ Private keys are stored unencrypted and protected by file permissions.
 **The cache trusts its pin.** A result is given again to any check with the same code, timeout
 and pin. If the Lean servers change and the pin does not, old answers are served.
 
-**The join service** hands a new box the pool's API key and a signed certificate, once, to the
-first address that presents the window's token. It executes nothing itself; what acts on a
+**The join service** hands the pool's API key and a signed certificate to one address per
+window: the first that sent a signing request under the window's token, and only after the
+operator's side has answered that request. That address can fetch them again while the window
+is open; no other address gets anything. The service executes nothing itself: what acts on a
 request is the operator's.
 
 [Limitations](docs/limitations.md) lists the rest.

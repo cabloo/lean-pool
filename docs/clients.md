@@ -9,7 +9,7 @@ is a pool. This page is what a client *can* know.
 | Request | Answered by | What it does |
 |---|---|---|
 | `POST /api/check` | the cache, or a Lean server | Checks Lean code. Kimina's request and reply, unchanged, with two additions below. |
-| `GET /health` | HAProxy itself | 200 while at least one Lean server is up, 503 otherwise, with the [pool's size](#the-pools-size) in the body. Needs no key and never waits behind checks. |
+| `GET /health` | HAProxy itself | 200 while at least one Lean server is taking checks, 503 otherwise, with the [pool's size](#the-pools-size) in the body. Needs no key and never waits behind checks. |
 | `GET /status` | the cache | The cache's [counters](cache.md). Needs the key. 503 while the cache is down. |
 | anything else | a Lean server | The rest of Kimina's interface passes through, uncached. |
 
@@ -23,8 +23,10 @@ curl -s http://pool.example:18100/api/check \
 {"results": [{"id": "attempt-1", "time": 0.410432, "response": {"env": 0}}]}
 ```
 
-That is Lean accepting the proof: a `response` with no error among its `messages` (here, with
-no messages at all) and no `sorries`.
+That is Lean accepting the proof: a `response` that holds Lean's own output, with no error among
+its `messages` (here, with no messages at all) and no `sorries`. A `response` that is nothing
+but `{"message": "..."}` is something else: the REPL refused the command before Lean judged the
+code, which is no verdict.
 
 The two additions, both optional:
 
@@ -74,13 +76,14 @@ are in [`tests/test_example_client.py`](../tests/test_example_client.py). Copy w
 
 | Reply | Meaning | What to do |
 |---|---|---|
-| 200, the result has a `response` | Lean's verdict: the code was accepted, or rejected with error `messages` or a `sorry`. | Record it. |
+| 200, the result has a `response` with Lean's output (`env`, `messages`, `sorries`) | Lean's verdict: the code was accepted, or rejected with error `messages` or a `sorry`. | Record it. |
+| 200, the `response` is a bare `{"message": "..."}` | No verdict: the REPL refused the command before Lean judged the code. The pool does not store it. | Record "no verdict"; look at the request. |
 | 200, the result has an `error` | No verdict. Usually a Lean timeout, which Kimina reports this way. The pool passes it on as it is: it neither retries nor stores it. | Record "no verdict", not a failed proof. |
 | 401 | The API key is missing or wrong. | Fix the client. |
 | 422 | The request is malformed. | Fix the client. |
 | 429 | A Lean server had no free worker within its own wait. The pool passes it on. | Pause and ask again. |
 | 500 | A Lean worker crashed on this check, on up to three servers in turn. | Do not ask again at once: the check itself is the likely cause. |
-| 502, 503, 504 | The pool did not take the check: no Lean server is up, the check waited the queue's limit, or the Lean servers could not be reached. | Pause and ask again; record nothing. |
+| 502, 503, 504 | No verdict came back: no Lean server is taking checks, the check waited the queue's limit, or the Lean servers could not be reached or did not answer in time. | Pause and ask again; record nothing. |
 
 A pool that loses a Lean server or its cache does not show it in these replies: the check is
 sent elsewhere ([failover](haproxy.md#failover-among-the-lean-servers),
@@ -118,9 +121,9 @@ computed by HAProxy as the answer leaves:
 
 | Header | What it counts |
 |---|---|
-| `X-Lean-Pool-Workers` | workers on the Lean servers that are up now |
+| `X-Lean-Pool-Workers` | workers on the Lean servers that are up now, including a server its usage agent has drained |
 | `X-Lean-Pool-Queued` | checks waiting in the queue for a worker, of both priorities |
-| `X-Lean-Pool-Servers` | Lean servers that are up now |
+| `X-Lean-Pool-Servers` | Lean servers that are taking checks now: up, and not drained by their usage agent |
 
 `GET /health` carries the same numbers in its body, with the status codes it always had:
 
@@ -137,6 +140,9 @@ server's limit and the cache are what they are without them. A client must carry
 configured number when a header is missing, empty or not a whole number (a pool that runs an
 older configuration sends none), and should never exceed a ceiling of its own, whatever the pool
 says. `leanpool.signals` holds the names and two small readers (`capacity_from_headers`,
-`capacity_from_health`) that return `None` for anything they cannot read. A server that its usage
-agent has drained still counts while it is up: the number is the pool's size, not a promise of an
-idle worker.
+`capacity_from_health`) that return `None` for anything they cannot read.
+
+A server that its usage agent has drained stays in the workers while it is up, and leaves the
+servers: the workers are the pool's size, not a promise of an idle worker. While every server
+is drained the pool takes nothing, and says so: `GET /health` and every check are answered 503,
+with the workers still counted and `"servers":0`.

@@ -68,7 +68,7 @@ WRONG="${RUN}theorem hard : 2 + 2 = 5 := by sorry"
 SLOW="${RUN}-- standin: timeout\ntheorem slow : True := by trivial"
 
 step "1. The pool is up: one address, two Lean servers, six workers"
-wait_for /health '"workers":6' 120
+wait_for /health '"workers":6,"queued":0,"servers":2' 120
 # The proxy uses the cache once it has seen it healthy, a second or two after both started.
 # Until then checks are answered all the same, uncached (step 7 shows that on purpose).
 wait_for /status '"stored_entries"' 60
@@ -105,7 +105,7 @@ check slow-2 "$SLOW"
 expect_in_body "timed out"
 expect_not_in_body '"cached"'
 
-step "6. A Lean server goes away. The check that meets it is sent to the other one"
+step "6. A Lean server goes away. The pool goes on answering, with the one that is left"
 "${COMPOSE[@]}" stop agent-b lean-b
 check after-loss "${RUN}theorem three : 1 + 2 = 3 := by rfl"
 expect_status 200
@@ -123,7 +123,7 @@ wait_for /status "the cache is down" 30
 step "8. Both come back. The cache kept its store, and the pool its size"
 "${COMPOSE[@]}" start lean-b
 "${COMPOSE[@]}" start agent-b cache
-wait_for /health '"workers":6' 120
+wait_for /health '"servers":2' 120
 wait_for /status '"stored_entries"' 60
 check after-return "$TWO"
 expect_in_body '"cached": true'

@@ -99,7 +99,12 @@ async def test_health_is_answered_by_haproxy_from_the_lean_servers_that_are_up(
     await lean.close()
 
     async def reports_no_server() -> bool:
-        down = {"status": "no Lean server is up", "workers": 0, "queued": 0, "servers": 0}
+        down = {
+            "status": "no Lean server is taking checks",
+            "workers": 0,
+            "queued": 0,
+            "servers": 0,
+        }
         return await health() == (503, down)
 
     await eventually(reports_no_server)
@@ -429,6 +434,85 @@ async def test_haproxy_applies_what_the_usage_agent_reports(
         assert (unreached["status"], unreached["weight"]) == ("UP", str(FULL_WEIGHT))
     finally:
         await agent.close()
+
+
+async def test_a_drained_server_keeps_its_workers_in_the_count_and_takes_no_checks(
+    start_lean_server: StartLeanServer,
+    start_pool: StartPool,
+    session: aiohttp.ClientSession,
+    tmp_path: Path,
+) -> None:
+    """What the pool says about itself while usage agents drain its servers.
+
+    ``workers`` counts the servers that are up, drained or not. ``servers`` and the status of
+    ``/health`` count the servers that take checks. With every server drained the pool is up
+    and takes nothing: ``/health`` and a check are both answered 503.
+    """
+    lean_a, lean_b = await start_lean_server(), await start_lean_server()
+    pool = await start_pool(lean_a, lean_b, started=False)
+    boxes = [tmp_path / "first", tmp_path / "second"]
+    agent_ports = [free_port(), free_port()]
+    agents = []
+    for box, agent_port in zip(boxes, agent_ports, strict=True):
+        box.mkdir()
+        write_box(box, busy_ticks=0, idle_ticks=1000, available_bytes=64 * GIBIBYTE)
+        settings = dataclasses.replace(
+            AgentSettings(),
+            host="127.0.0.1",
+            port=agent_port,
+            stat_path=box / "stat",
+            meminfo_path=box / "meminfo",
+        )
+        agents.append(UsageAgent(settings))
+    servers = [
+        LeanServer("first", "127.0.0.1", lean_a.port, WORKERS, agent_ports[0]),
+        LeanServer("second", "127.0.0.1", lean_b.port, WORKERS, agent_ports[1]),
+    ]
+
+    async def set_memory(number: int, available_bytes: int, status: str) -> None:
+        write_box(boxes[number], busy_ticks=10, idle_ticks=2000, available_bytes=available_bytes)
+        agents[number].sampler.sample()
+
+        async def reached() -> bool:
+            name = servers[number].name
+            return (await pool.server_state("checkers", name))["status"] == status
+
+        await eventually(reached)
+
+    async def health() -> tuple[int, Any]:
+        status, body, _capacity = await pool.health(session)
+        return status, body
+
+    def size(status: str, servers_taking_checks: int) -> dict[str, Any]:
+        return {
+            "status": status,
+            "workers": 2 * WORKERS,
+            "queued": 0,
+            "servers": servers_taking_checks,
+        }
+
+    try:
+        for agent in agents:
+            await agent.start()
+        await pool.start_cache()
+        await pool.start_haproxy(pool.render(servers))
+        assert await health() == (200, size("ok", 2))
+
+        await set_memory(0, 1 * GIBIBYTE, "DRAIN (agent)")
+        assert await health() == (200, size("ok", 1))
+        assert (await pool.check(session, "theorem one_drained : True := trivial")).status == 200
+        assert len(lean_a.requests) == 0
+
+        await set_memory(1, 1 * GIBIBYTE, "DRAIN (agent)")
+        assert await health() == (503, size("no Lean server is taking checks", 0))
+        assert (await pool.check(session, "theorem all_drained : True := trivial")).status == 503
+
+        await set_memory(0, 64 * GIBIBYTE, "UP")
+        assert await health() == (200, size("ok", 1))
+        assert (await pool.check(session, "theorem recovered : True := trivial")).status == 200
+    finally:
+        for agent in agents:
+            await agent.close()
 
 
 # --- priority, and the pool's size on every answer --------------------------------------------

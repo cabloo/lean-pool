@@ -15,6 +15,10 @@ item follows from a rule described on another page.
   once, never retried and never stored, so the same check sent again may land on another box
   and finish. Likewise a check that crashes a worker on a small box (out of memory, say) is
   tried on another server, which may be a larger one.
+* While every Lean server is drained by its usage agent (each is below its memory floor),
+  the pool answers `GET /health` and every check with 503 although the servers are up.
+* The cache shares the proxy's network namespace. If the proxy's container is restarted, the
+  cache must be restarted after it, and until then the pool runs uncached.
 * The cache trusts the pin. If the Lean servers' image changes and the pin does not, old answers
   are served. Change the pin with the image.
 * Resource exhaustion is recognised by message text. A nondeterministic failure that Lean reports

@@ -6,7 +6,8 @@ The generated configuration (HAProxy 3.0 syntax) has these parts:
 * frontend ``lean_pool`` on the public port, the one address clients know. It answers
   ``GET /health`` itself, sends checks to the cache first, and sends them straight to the Lean
   servers when the cache is down. Every answer that leaves it says how big the pool is (the
-  workers on servers that are up, the checks queued, the servers up); nothing reads that back.
+  workers on servers that are up, the checks queued, the servers taking checks); nothing reads
+  that back.
 * frontend ``checkers_door`` on loopback, where the cache sends what it could not answer.
 * backend ``cache``: the cache service, with the checkers door as its backup.
 * backend ``checkers``: the Lean servers, least connections first, never more concurrent checks
@@ -516,14 +517,15 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             "# The cache server itself: nbsrv(cache) would also count its backup.",
             "acl cache_up srv_is_up(cache/cache)",
             "# What the pool says about itself, for clients that size themselves by it: the",
-            "# workers on servers that are up, the checks waiting for a worker, the servers up.",
+            "# workers on servers that are up, the checks waiting for a worker, and the servers",
+            "# taking checks (up, and not drained by their usage agent).",
             "# Advisory: nothing here or behind reads these numbers back.",
             *workers_up_rules("http-request", _REQUEST_WORKERS, servers),
             "# Answered here, so a health probe never queues behind proofs or needs the cache.",
             health.format(status=200)
             + f" {_capacity_body('ok')} if METH_GET is_health checkers_up",
             health.format(status=503)
-            + f" {_capacity_body('no Lean server is up')} if METH_GET is_health",
+            + f" {_capacity_body('no Lean server is taking checks')} if METH_GET is_health",
             "# The same three numbers on every answer that leaves this door, summed again as the",
             "# answer leaves: a check may have waited minutes since its request was read.",
             *workers_up_rules("http-after-response", _RESPONSE_WORKERS, servers),

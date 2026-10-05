@@ -204,6 +204,10 @@ while the old ones finish the checks they hold. Two details matter:
   by moving a new one over it is a new file, which a container that mounted the old one never
   sees.
 
+A reload is not a restart. If the proxy's container itself is restarted, restart the cache
+after it (`docker compose restart cache`): the cache lives in the proxy's network namespace, and
+a container keeps the namespace it was started in. Until then checks flow all the same, uncached.
+
 ### Watching it
 
 | What | How |

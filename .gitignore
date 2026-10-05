@@ -20,8 +20,12 @@ api-key.txt
 deploy/pool/servers
 deploy/pool/haproxy/
 deploy/pool/pki/
+deploy/pool/spool/
+deploy/pool/join.sh
+token.txt
 deploy/lean-server/front/
 deploy/lean-server/tls/
 *.key
 *.pem
 *.csr
+*.crt

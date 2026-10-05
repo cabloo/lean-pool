@@ -35,9 +35,10 @@ reply         = "drain"           if MemAvailable < floor
   reading says nothing about now; until the second reading the agent reports no percentage and
   HAProxy leaves the weight as it is.
 * The smallest share decides, because a check needs every resource at once.
-* The percentage never drops below 1. Taking a server out of rotation is reserved for memory:
-  below the floor the agent answers `drain`, and the box gets no new checks until memory
-  recovers (the next normal reply starts with `ready`, which cancels the drain).
+* The percentage never drops below 1: the agent takes a box out of rotation for one reason
+  only, memory. Below the floor it answers `drain`, and the box gets no new checks until memory
+  recovers (the next normal reply starts with `ready`, which cancels the drain). A percentage
+  can still take a small server of an uneven pool out, through rounding (below).
 * If the agent cannot be reached, HAProxy keeps the server's last weight.
 
 HAProxy sets the server's weight to `configured weight x N / 100` in whole numbers, and a weight
@@ -46,4 +47,7 @@ the worker count itself as the weight: it scales all weights by one common facto
 largest server gets as close to 256 (HAProxy's maximum) as possible. A 4-worker and an 8-worker
 server get weights 128 and 256, not 4 and 8. The ratios between servers, which is all that
 least-connections balancing reads, are the worker counts' ratios; the scaling only keeps a low
-percentage from rounding down to zero.
+percentage from rounding down to zero. It can guarantee that for the largest server only. A
+server with less than about 40% of the largest server's workers has a configured weight below
+100, and reaches weight 0 when its agent reports less than `100 / weight` percent: beside a
+32-worker server, a 4-worker one (weight 32) is out of rotation at 1 to 3 percent.
