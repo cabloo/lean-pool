@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lean-pool"
+version = "0.1.0"
+description = "One endpoint for a pool of Kimina Lean servers: HAProxy routing, a shared result cache and usage-aware weights"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "The lean-pool contributors" }]
+keywords = ["lean", "lean4", "kimina", "haproxy", "cache", "theorem-proving"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+# The usage agent (leanpool.agent) and the HAProxy tooling (leanpool.haproxy) use the standard
+# library only; aiohttp serves the cache, the admission test and the join service; cryptography
+# makes the pool's certificates (leanpool.pki).
+dependencies = ["aiohttp>=3.11,<4", "cryptography>=42"]
+
+[project.scripts]
+leanpool-cache = "leanpool.cache.cli:main"
+leanpool-agent = "leanpool.agent.cli:main"
+leanpool-haproxy-config = "leanpool.haproxy.cli:main"
+leanpool-admit = "leanpool.admit.cli:main"
+leanpool-pki = "leanpool.pki.cli:main"
+leanpool-join = "leanpool.join.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["leanpool"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "A",    # no shadowed builtins
+    "ARG",  # no unused arguments
+    "B",    # likely bugs
+    "C4",   # comprehensions
+    "D1",   # public modules, classes and functions are documented
+    "E",
+    "F",
+    "I",    # import order
+    "N",    # naming
+    "PT",   # pytest style
+    "RET",  # return statements
+    "RUF",
+    "SIM",  # simplifications
+    "UP",   # modern syntax
+    "W",
+]
+ignore = [
+    "D105",  # a magic method's meaning is its protocol
+    "D107",  # the class docstring documents construction
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]  # a test's name states what it shows
+
+[tool.mypy]
+strict = true
+warn_unreachable = true
+python_version = "3.11"
+files = ["leanpool", "tests"]
+# Module names are computed from these two roots, wherever mypy is started from.
+explicit_package_bases = true
+mypy_path = ["$MYPY_CONFIG_FILE_DIR", "$MYPY_CONFIG_FILE_DIR/tests"]

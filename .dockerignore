@@ -1,0 +1,7 @@
+# The image is built from pyproject.toml, README.md, LICENSE and leanpool/ only.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!leanpool
+**/__pycache__

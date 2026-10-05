@@ -1,0 +1,17 @@
+# The Lean servers of one pool, one per line:
+#
+#   NAME  HOST:PORT  WORKERS  [AGENT_PORT]
+#
+# NAME        unique; letters, digits, '_', '.' and '-'
+# HOST:PORT   where the Kimina Lean Server listens (a host name or an IPv4 address)
+# WORKERS     how many checks it runs at once (its LEAN_SERVER_MAX_REPLS); 1 to 256
+# AGENT_PORT  where leanpool-agent listens on that box; 18200 when left out
+#
+# Edit by hand, or with:
+#
+#   leanpool-haproxy-config add    --servers servers NAME HOST:PORT WORKERS [--agent-port PORT]
+#   leanpool-haproxy-config remove --servers servers NAME
+#   leanpool-haproxy-config list   --servers servers
+
+lean-a    lean-a.example:8000    4     18200
+lean-b    lean-b.example:8000    8     18200

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, types and tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the project and its development tools
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check .
+      - name: Formatting
+        run: uv run ruff format --check .
+      - name: Types
+        run: uv run mypy
+      - name: Tests
+        run: uv run pytest
+
+  live:
+    name: The generated configuration on a running HAProxy 3.0
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install HAProxy 3.0
+        # The distribution's own package is an older branch; this is HAProxy's Debian and
+        # Ubuntu packaging of 3.0. The service it starts is not needed.
+        run: |
+          sudo add-apt-repository -y ppa:vbernat/haproxy-3.0
+          sudo apt-get update
+          sudo apt-get install -y 'haproxy=3.0.*'
+          sudo systemctl stop haproxy
+          haproxy -v
+      - name: Run the tests that need HAProxy
+        # -rs lists any skipped test: with HAProxy installed there must be none.
+        run: >-
+          uv run pytest -rs
+          tests/test_haproxy_live.py tests/test_haproxy_config.py
+          tests/test_tls_live.py tests/test_haproxy_tls_config.py tests/test_haproxy_box.py
+
+  deployment:
+    name: HAProxy accepts the generated configuration; the image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Render two configurations
+        # One pool given by address, and one whose names never resolve (".invalid" is reserved
+        # for that): an unresolvable server must not stop the proxy from starting.
+        run: |
+          printf 'lean-a 192.0.2.10:8000 4\nlean-b 192.0.2.20:8000 8 18250\n' > servers-by-address
+          printf 'lean-a lean-a.invalid:8000 4\nlean-b 192.0.2.20:8000 8\n' > servers-by-name
+          uv run leanpool-haproxy-config render --servers servers-by-address > by-address.cfg
+          uv run leanpool-haproxy-config render --servers servers-by-name \
+            --cache-address cache.invalid:18102 > by-name.cfg
+      - name: Validate both with the HAProxy image the compose example runs
+        run: |
+          for config in by-address.cfg by-name.cfg; do
+            docker run --rm \
+              -v "$PWD/$config:/usr/local/etc/haproxy/haproxy.cfg:ro" \
+              haproxy:3.0 haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+          done
+      - name: Build the image and run its commands from it
+        run: |
+          docker build -f deploy/Dockerfile -t lean-pool .
+          docker run --rm lean-pool leanpool-cache --help
+          docker run --rm lean-pool leanpool-agent --help
+          docker run --rm lean-pool leanpool-pki --help
+          docker run --rm lean-pool leanpool-join --help
+          docker run --rm lean-pool leanpool-haproxy-config --help

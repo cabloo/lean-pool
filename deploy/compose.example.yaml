@@ -1,0 +1,56 @@
+# The proxy and the cache of one lean-pool, on one box. The Lean servers (and a usage agent on
+# each of their boxes) run elsewhere and are named in the server list.
+#
+# From this directory:
+#
+#   cp servers.example servers                       # then edit: your Lean servers
+#   printf '%s\n' 'the-pool-api-key' > api-key.txt   # the key your Lean servers require
+#   chmod 0644 api-key.txt                           # must be readable by uid 10001 (the cache)
+#   uv run leanpool-haproxy-config render --servers servers > haproxy.cfg
+#   docker compose -f compose.example.yaml up -d
+#
+# Clients then send every check to http://<this box>:18100/api/check.
+
+name: lean-pool
+
+services:
+  haproxy:
+    image: haproxy:3.0
+    restart: unless-stopped
+    ports:
+      - "18100:18100" # the one address clients know
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  cache:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    command: ["leanpool-cache"]
+    # The cache shares the proxy's network namespace. The proxy reaches it on 127.0.0.1:18102,
+    # and it reaches the proxy's loopback-only listener on 127.0.0.1:18101; neither port is
+    # reachable from outside.
+    network_mode: "service:haproxy"
+    depends_on:
+      - haproxy
+    environment:
+      # Name the Lean and Mathlib versions of the pool's servers. It is part of every cache key:
+      # change it whenever the servers' image changes, and old entries stop matching.
+      LEANPOOL_CACHE_PIN: "lean-v4.27.0_mathlib-CHANGE-ME"
+      LEANPOOL_CACHE_API_KEY_FILE: /run/secrets/pool_api_key
+      LEANPOOL_CACHE_MAX_BYTES: "4294967296"
+    secrets:
+      - pool_api_key
+    volumes:
+      - cache-data:/var/lib/leanpool
+    read_only: true
+    cap_drop:
+      - ALL
+
+volumes:
+  cache-data:
+
+secrets:
+  pool_api_key:
+    file: ./api-key.txt
