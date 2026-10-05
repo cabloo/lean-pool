@@ -32,13 +32,6 @@ _SERVICES_FILE = "services.json"
 _STOP_SECONDS = 10.0
 
 
-def _free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port: int = listener.getsockname()[1]
-    return port
-
-
 def _accepts_connections(port: int) -> bool:
     with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", port), timeout=1):
         return True
@@ -62,20 +55,20 @@ class NativeDemo:
     def create(cls, directory: Path, haproxy: str, seconds: float = 0.4) -> NativeDemo:
         """Write the pool's configuration and the description of every service."""
         # Imported here: as the walkthrough's `docker compose` this file needs none of it.
-        from live_pool import on_loopback
+        from live_pool import free_port, on_loopback
 
         from leanpool.haproxy import PoolSettings, parse_server_list, render_haproxy_config
 
         demo_servers = parse_server_list((DEMO / "servers").read_text())
         names = [server.name for server in demo_servers]
         workers = {server.name: server.workers for server in demo_servers}
-        lean_ports = {name: _free_port() for name in names}
-        agent_ports = {name: _free_port() for name in names}
+        lean_ports = {name: free_port() for name in names}
+        agent_ports = {name: free_port() for name in names}
         settings = PoolSettings(
-            public_port=_free_port(),
-            checkers_port=_free_port(),
-            cache_address=f"127.0.0.1:{_free_port()}",
-            stats_port=_free_port(),
+            public_port=free_port(),
+            checkers_port=free_port(),
+            cache_address=f"127.0.0.1:{free_port()}",
+            stats_port=free_port(),
         )
         server_list = "".join(
             f"{name} 127.0.0.1:{lean_ports[name]} {workers[name]} {agent_ports[name]}\n"

@@ -19,13 +19,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import socket
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
-from live_pool import WORKERS, LivePool, RunningHaproxy, free_port
+from live_pool import WORKERS, LivePool, RunningHaproxy, free_port, free_port_run
 from tls_support import ThrowawayAuthority, strict_client_context
 
 from leanpool.haproxy import BoxSettings, LeanServer, PoolSettings, TlsSettings, render_box_config
@@ -33,20 +32,6 @@ from leanpool.haproxy import BoxSettings, LeanServer, PoolSettings, TlsSettings,
 PROXY_CLIENT_NAME = "lean-pool-proxy"
 FRONT_DOOR_NAME = "pool.test"
 _EXCHANGE_SECONDS = 10.0
-
-
-def free_port_run(count: int) -> int:
-    """Return the first of ``count`` consecutive ports that were free a moment ago."""
-    while True:
-        first = free_port()
-        with contextlib.ExitStack() as held:
-            try:
-                for port in range(first, first + count):
-                    listener = held.enter_context(socket.socket())
-                    listener.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return first
 
 
 @dataclass

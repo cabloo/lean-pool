@@ -35,12 +35,38 @@ _STARTUP_SECONDS = 30.0
 _WILDCARD_BIND = re.compile(r"^(\s*bind) :(\d+)", re.MULTILINE)
 
 
+# Every port a test was given, so that no two tests and no two listeners of one test get the
+# same one: a port is released before it is returned, and the system may well hand it out again.
+_HANDED_OUT: set[int] = set()
+
+
 def free_port() -> int:
-    """Return a port that was free a moment ago."""
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port: int = listener.getsockname()[1]
-    return port
+    """Return a port that was free a moment ago, and that no test was given before."""
+    while True:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port: int = listener.getsockname()[1]
+        if port not in _HANDED_OUT:
+            _HANDED_OUT.add(port)
+            return port
+
+
+def free_port_run(count: int) -> int:
+    """Return the first of ``count`` consecutive ports, free a moment ago and given to no test."""
+    while True:
+        first = free_port()
+        run = range(first, first + count)
+        if _HANDED_OUT.intersection(run[1:]):
+            continue
+        with contextlib.ExitStack() as held:
+            try:
+                for port in run:
+                    listener = held.enter_context(socket.socket())
+                    listener.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        _HANDED_OUT.update(run)
+        return first
 
 
 async def eventually(condition: Callable[[], Awaitable[bool]], seconds: float = 30.0) -> None:

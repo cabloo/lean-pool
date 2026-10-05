@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TypeVar
 
 import pytest
+from live_pool import free_port
 
 Value = TypeVar("Value")
 
@@ -31,13 +32,6 @@ COMMANDS = {
     "leanpool-pki",
     "leanpool-join",
 }
-
-
-def free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port: int = listener.getsockname()[1]
-    return port
 
 
 def eventually(attempt: Callable[[], Value | None], process: subprocess.Popen[str]) -> Value:
