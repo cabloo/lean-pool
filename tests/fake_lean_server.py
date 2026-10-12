@@ -89,13 +89,18 @@ class RecordedRequest:
 @dataclass
 class FakeLeanServer:
     """A fake Lean server. ``requests`` records every check request that passed the key check,
-    and ``health_checks`` counts the ``GET /health`` requests answered.
+    and ``health_checks`` counts the ``GET /health`` requests answered. ``asked`` is every
+    request that reached it at all but its health checks, as ``METHOD /path``: also one for a
+    path it does not serve, which it answers 404 as Kimina does.
     """
 
     behaviour: Behaviour = field(default_factory=lambda: always(lean_answer()))
     api_key: str | None = None
     requests: list[RecordedRequest] = field(default_factory=list)
+    asked: list[str] = field(default_factory=list)
     health_checks: int = 0
+    # How long ``GET /health`` takes to answer: a busy server on a shared box is slow, not dead.
+    health_seconds: float = 0.0
     in_flight: int = 0
     peak_in_flight: int = 0
     _server: TestServer | None = None
@@ -107,7 +112,9 @@ class FakeLeanServer:
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         """Listen on ``host``, on ``port`` or on any free port; over TLS when given a context."""
-        application = web.Application(client_max_size=_LARGEST_REQUEST_BYTES)
+        application = web.Application(
+            client_max_size=_LARGEST_REQUEST_BYTES, middlewares=[self._record]
+        )
         application.router.add_post("/api/check", self._handle_check)
         application.router.add_get("/health", self._handle_health)
         self._server = TestServer(application, host=host, port=port)
@@ -136,8 +143,18 @@ class FakeLeanServer:
             snippet["code"] for request in self.requests for snippet in request.body["snippets"]
         ]
 
+    @web.middleware
+    async def _record(
+        self, request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
+    ) -> web.StreamResponse:
+        if (request.method, request.path) != ("GET", "/health"):
+            self.asked.append(f"{request.method} {request.path_qs}")
+        return await handler(request)
+
     async def _handle_health(self, _request: web.Request) -> web.Response:
         self.health_checks += 1
+        if self.health_seconds:
+            await asyncio.sleep(self.health_seconds)
         return web.json_response({"status": "ok"})
 
     async def _handle_check(self, request: web.Request) -> web.Response:

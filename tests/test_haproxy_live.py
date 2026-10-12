@@ -13,7 +13,7 @@ import dataclasses
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +22,12 @@ import pytest
 from fake_dns import FakeDns
 from fake_lean_server import FakeLeanServer, SnippetReply, always, failing_with, lean_answer
 from fake_lean_server import lean_timeout as lean_timeout_reply
-from live_pool import HAPROXY, WORKERS, LivePool, eventually, free_port
+from live_pool import HAPROXY, WORKERS, CheckReply, LivePool, eventually, free_port
 from support import API_KEY, AUTHORIZED, PIN, StartLeanServer
 
-from leanpool.agent import AgentSettings, UsageAgent
+from leanpool.agent import AgentSettings, UsageAgent, UsageSampler
 from leanpool.haproxy import LeanServer
+from leanpool.haproxy.config import AGENT_INTERVAL_SECONDS
 from leanpool.signals import PoolCapacity
 
 pytestmark = pytest.mark.skipif(HAPROXY is None, reason="HAProxy is not installed")
@@ -442,11 +443,12 @@ async def test_a_drained_server_keeps_its_workers_in_the_count_and_takes_no_chec
     session: aiohttp.ClientSession,
     tmp_path: Path,
 ) -> None:
-    """What the pool says about itself while usage agents drain its servers.
+    """What the pool says about itself while usage agents that state no slots drain its servers.
 
-    ``workers`` counts the servers that are up, drained or not. ``servers`` and the status of
-    ``/health`` count the servers that take checks. With every server drained the pool is up
-    and takes nothing: ``/health`` and a check are both answered 503.
+    ``workers`` keeps a server drained by a bare ``drain``: it is up, and its weight is not 0.
+    ``servers`` and the status of ``/health`` count the servers that take checks. With every
+    server drained the pool is up and takes nothing: ``/health`` and a check are both
+    answered 503.
     """
     lean_a, lean_b = await start_lean_server(), await start_lean_server()
     pool = await start_pool(lean_a, lean_b, started=False)
@@ -566,6 +568,30 @@ def holding(gates: dict[str, asyncio.Event], arrived: list[str]) -> Any:
     return behaviour
 
 
+async def held_one_at_a_time(
+    pool: LivePool, session: aiohttp.ClientSession, codes: Iterable[str], arrived: Callable[[], int]
+) -> list[asyncio.Task[CheckReply]]:
+    """Send checks that a Lean server will hold, each once the one before has reached a worker.
+
+    Checks sent at once to SEVERAL servers are placed by several of HAProxy's threads at once, and
+    on 3.0.29 that is not exact: of 450 lots of eight sent to two servers of four workers, seven
+    ended with one server holding five, or with the eighth check waiting in a full server's own
+    queue while the other server had a worker free. Either mends itself when a check on that
+    server ends, which a held check never does; so a test that counts who holds what sends its
+    held checks one at a time. ``arrived`` counts the checks that have reached a Lean server.
+    """
+    tasks = []
+    for code in codes:
+        before = arrived()
+        tasks.append(asyncio.create_task(pool.check(session, code)))
+
+        async def reached(before: int = before) -> bool:
+            return arrived() > before
+
+        await eventually(reached)
+    return tasks
+
+
 @pytest.mark.parametrize("through_cache", [True, False], ids=["through-the-cache", "cache-stopped"])
 async def test_a_waiting_background_check_is_overtaken_by_normal_checks_that_arrive_after_it(
     start_lean_server: StartLeanServer,
@@ -640,3 +666,350 @@ async def test_background_checks_are_served_when_nothing_else_is_waiting(
     assert {reply.status for reply in replies} == {200}
     # The Lean server is told too, in the one spelling, on the second hop.
     assert {request.headers.get("X-Lean-Priority") for request in lean.requests} == {"background"}
+
+
+# --- a paused server is listed and sent nothing ---------------------------------------------------
+
+
+def size_said(reply: CheckReply) -> tuple[int, int]:
+    """The workers and the servers an answer states. The checks queued depend on the moment."""
+    assert reply.capacity is not None
+    return reply.capacity.workers, reply.capacity.servers
+
+
+async def test_a_paused_server_stays_out_though_its_agent_says_ready(
+    start_lean_server: StartLeanServer,
+    start_pool: StartPool,
+    session: aiohttp.ClientSession,
+    tmp_path: Path,
+) -> None:
+    """The usage agent answers ``ready`` with every normal reply, and HAProxy takes ``ready`` from
+    an agent as the end of a maintenance: a paused server is therefore declared with no agent
+    check. Here its agent is up and says ``ready up 100%`` to whoever asks, all the while."""
+    lean_a, lean_b = await start_lean_server(), await start_lean_server()
+    pool = await start_pool(lean_a, lean_b, started=False)
+    agent_port = free_port()
+    write_box(tmp_path, busy_ticks=0, idle_ticks=0, available_bytes=64 * GIBIBYTE)
+    agent = UsageAgent(
+        dataclasses.replace(
+            AgentSettings(),
+            host="127.0.0.1",
+            port=agent_port,
+            stat_path=tmp_path / "stat",
+            meminfo_path=tmp_path / "meminfo",
+        )
+    )
+    await agent.start()
+    write_box(tmp_path, busy_ticks=0, idle_ticks=1000, available_bytes=64 * GIBIBYTE)
+    agent.sampler.sample()
+    assert agent.sampler.reply() == "ready up 100%\n"
+    servers = [
+        LeanServer("taking-checks", "127.0.0.1", lean_a.port, WORKERS, free_port()),
+        LeanServer("paused", "127.0.0.1", lean_b.port, WORKERS, agent_port, paused=True),
+    ]
+    one = PoolCapacity(workers=WORKERS, queued=0, servers=1)
+    try:
+        await pool.start_cache()
+        await pool.start_haproxy(pool.render(servers))
+
+        async def the_other_server_is_up() -> bool:
+            return (await pool.server_state("checkers", "taking-checks"))["status"] == "UP"
+
+        await eventually(the_other_server_is_up)
+        # Longer than the agent's interval and the health check's: a `ready` would have landed.
+        await asyncio.sleep(AGENT_INTERVAL_SECONDS + 2)
+
+        assert (await pool.server_state("checkers", "paused"))["status"] == "MAINT"
+        body = {"status": "ok", "workers": WORKERS, "queued": 0, "servers": 1}
+        assert await pool.health(session) == (200, body, one)
+        replies = await asyncio.gather(
+            *(pool.check(session, proof(f"while paused {number}")) for number in range(3 * WORKERS))
+        )
+        assert {reply.status for reply in replies} == {200}
+        assert {size_said(reply) for reply in replies} == {(WORKERS, 1)}
+        assert len(lean_a.requests) == 3 * WORKERS
+        assert lean_b.requests == []  # no check
+        assert lean_b.health_checks == 0  # and no health check
+    finally:
+        await agent.close()
+
+
+async def test_a_pause_by_reload_loses_no_check_and_a_resume_brings_the_server_back(
+    start_lean_server: StartLeanServer, start_pool: StartPool, session: aiohttp.ClientSession
+) -> None:
+    """A pause reaches a running proxy as a new configuration and a reload: HAProxy's old
+    process finishes the checks it holds, those on the paused server included, and the new one
+    sends that server nothing."""
+    gates = {proof(f"held {number}"): asyncio.Event() for number in range(2 * WORKERS)}
+    arrived_a: list[str] = []
+    arrived_b: list[str] = []
+    lean_a = await start_lean_server(holding(gates, arrived_a))
+    lean_b = await start_lean_server(holding(gates, arrived_b))
+    pool = await start_pool(lean_a, lean_b, started=False)
+    listed = pool.servers
+    paused = [listed[0], dataclasses.replace(listed[1], paused=True)]
+    both = PoolCapacity(workers=2 * WORKERS, queued=0, servers=2)
+    one = PoolCapacity(workers=WORKERS, queued=0, servers=1)
+
+    async def the_pool_says(capacity: PoolCapacity) -> None:
+        async def said() -> bool:
+            with contextlib.suppress(aiohttp.ClientError):
+                return (await pool.health(session))[2] == capacity
+            return False  # the old process closed the connection it was asked on
+
+        await eventually(said)
+
+    await pool.start_cache()
+    await pool.start_haproxy(pool.render(listed))
+    await the_pool_says(both)
+
+    def arrived() -> int:
+        return len(arrived_a) + len(arrived_b)
+
+    held = await held_one_at_a_time(pool, session, list(gates), arrived)
+    assert (len(arrived_a), len(arrived_b)) == (WORKERS, WORKERS)  # every worker holds a check
+
+    pool.reload_haproxy(pool.render(paused))
+    await the_pool_says(one)
+    assert (await pool.server_state("checkers", "lean-1"))["status"] == "MAINT"
+    after = await asyncio.gather(
+        *(pool.check(session, proof(f"after the pause {number}")) for number in range(3 * WORKERS))
+    )
+    assert {reply.status for reply in after} == {200}
+    assert {size_said(reply) for reply in after} == {(WORKERS, 1)}
+    assert len(arrived_a) == WORKERS + 3 * WORKERS
+    assert len(arrived_b) == WORKERS  # nothing new reached the paused server
+
+    for gate in gates.values():
+        gate.set()
+    finished = await asyncio.gather(*held)
+    assert [reply.status for reply in finished] == [200] * (2 * WORKERS)  # no check was lost
+
+    pool.reload_haproxy(pool.render(listed))
+    await the_pool_says(both)
+    again = {proof(f"held again {number}"): asyncio.Event() for number in range(2 * WORKERS)}
+    gates.update(again)
+    resumed = await held_one_at_a_time(pool, session, list(again), arrived)
+    assert len(arrived_b) == 2 * WORKERS  # the resumed server has its share
+    for gate in again.values():
+        gate.set()
+    assert {reply.status for reply in await asyncio.gather(*resumed)} == {200}
+
+
+# --- open slots, and a health check that waits for a slow answer ----------------------------------
+
+
+class SharedBoxFiles:
+    """The ``/proc/stat`` and the Lean server's ``cpu.stat`` of a 16-CPU box that also runs other
+    work, written five seconds of that work at a time. The Lean server itself is idle throughout:
+    what its own use does to the slots is the agent's own tests' matter."""
+
+    CORES = 16
+    TICKS_PER_SECOND = 100
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self._busy = self._idle = 0
+        (directory / "meminfo").write_text(f"MemAvailable: {64 * GIBIBYTE // 1024} kB\n")
+        (directory / "cpu.stat").write_text("usage_usec 0\n")
+        self._write()
+
+    def settings(self, port: int) -> AgentSettings:
+        return dataclasses.replace(
+            AgentSettings(),
+            host="127.0.0.1",
+            port=port,
+            stat_path=self.directory / "stat",
+            meminfo_path=self.directory / "meminfo",
+            workers=WORKERS,
+            lean_cpu_stat_path=self.directory / "cpu.stat",
+            cpu_topology_path=self.directory / "no-topology",  # one thread a core
+            clock_ticks_per_second=self.TICKS_PER_SECOND,
+        )
+
+    def run(self, agent: UsageAgent, others: float, seconds: float = 5.0) -> str:
+        """Let ``seconds`` pass with other work on ``others`` CPUs; return the agent's new reply."""
+        busy = round(others * self.TICKS_PER_SECOND * seconds)
+        self._busy += busy
+        self._idle += round(self.CORES * self.TICKS_PER_SECOND * seconds) - busy
+        self._write()
+        agent.sampler.sample()
+        return agent.sampler.reply()
+
+    def _write(self) -> None:
+        cores = "".join(f"cpu{core} 0 0 0 0 0 0 0 0 0 0\n" for core in range(self.CORES))
+        (self.directory / "stat").write_text(
+            f"cpu  {self._busy} 0 0 {self._idle} 0 0 0 0 0 0\n{cores}"
+        )
+
+
+async def test_a_server_holds_no_more_checks_than_the_open_slots_its_agent_states(
+    start_lean_server: StartLeanServer,
+    start_pool: StartPool,
+    session: aiohttp.ClientSession,
+    tmp_path: Path,
+) -> None:
+    """Two servers of four workers; one is on a box that also runs other work, and its usage
+    agent says how many checks fit beside that work. With a queue standing all the while (the
+    case in which a weight changes nothing), HAProxy holds that server to the slots stated:
+    two, then four, then none. The pool's three numbers follow."""
+    gates = {proof(f"hold {number}"): asyncio.Event() for number in range(2 * WORKERS)}
+    on_shared: list[str] = []
+    on_free: list[str] = []
+    lean_shared = await start_lean_server(holding(gates, on_shared))
+    lean_free = await start_lean_server(holding(gates, on_free))
+    pool = await start_pool(lean_shared, lean_free, started=False)
+    box = SharedBoxFiles(tmp_path)
+    agent_port = free_port()
+    agent = UsageAgent(box.settings(agent_port))
+    await agent.start()
+    servers = [
+        LeanServer("shared", "127.0.0.1", lean_shared.port, WORKERS, agent_port),
+        LeanServer("free", "127.0.0.1", lean_free.port, WORKERS, free_port()),
+    ]
+
+    async def shared_is(status: str, limit: int) -> None:
+        async def reached() -> bool:
+            state = await pool.server_state("checkers", "shared")
+            return (state["status"], state["slim"]) == (status, str(limit))
+
+        await eventually(reached)
+
+    async def pool_says(workers: int, servers_up: int, queued: int = 0) -> None:
+        said = PoolCapacity(workers=workers, queued=queued, servers=servers_up)
+
+        async def reached() -> bool:
+            return (await pool.health(session))[2] == said
+
+        await eventually(reached)
+
+    try:
+        await pool.start_cache()
+        await pool.start_haproxy(pool.render(servers))
+
+        # Other work on 13 of the box's 16 CPUs: with one CPU kept free, two checks fit.
+        assert box.run(agent, others=13.0) == "ready up 19% maxconn:2\n"
+        await shared_is("UP", 2)
+        await pool_says(workers=2 + WORKERS, servers_up=2)
+        first = await pool.check(session, proof("size"))
+        hit = await pool.check(session, proof("size"))
+        assert hit.result["cached"] is True
+        assert size_said(first) == size_said(hit) == (2 + WORKERS, 2)
+        on_shared.clear()
+        on_free.clear()
+
+        # Eight checks that are held: six have a worker, two wait, though the shared server has
+        # two workers of its own doing nothing.
+        codes = list(gates)
+        held = await held_one_at_a_time(
+            pool, session, codes[: 2 + WORKERS], lambda: len(on_shared) + len(on_free)
+        )
+        held += [asyncio.create_task(pool.check(session, code)) for code in codes[2 + WORKERS :]]
+        await pool_says(workers=2 + WORKERS, servers_up=2, queued=2)
+        assert (len(on_shared), len(on_free)) == (2, WORKERS)
+        await asyncio.sleep(1.0)
+        assert (len(on_shared), lean_shared.peak_in_flight) == (2, 2)
+
+        # The other work goes away. The slots come back one reading at a time, and the two
+        # checks that waited are taken as they do.
+        assert box.run(agent, others=0.0) == "ready up 100% maxconn:3\n"
+        assert box.run(agent, others=0.0) == "ready up 100% maxconn:4\n"
+        await shared_is("UP", WORKERS)
+        await pool_says(workers=2 * WORKERS, servers_up=2)
+
+        async def every_worker_holds_a_check() -> bool:
+            # A check has left the queue a moment before it reaches its server.
+            return (len(on_shared), len(on_free)) == (WORKERS, WORKERS)
+
+        await eventually(every_worker_holds_a_check)
+
+        # No room for a check at all: the server is drained. It is up, it finishes the four
+        # checks it holds, and the pool's size is the other server's.
+        assert box.run(agent, others=15.5) == "drain 0%\n"
+        await shared_is("DRAIN (agent)", WORKERS)
+        await pool_says(workers=WORKERS, servers_up=1)
+        for gate in gates.values():
+            gate.set()
+        assert {reply.status for reply in await asyncio.gather(*held)} == {200}
+        on_shared.clear()
+        on_free.clear()
+        drained = await asyncio.gather(
+            *(pool.check(session, proof(f"while drained {number}")) for number in range(6))
+        )
+        assert {reply.status for reply in drained} == {200}
+        assert (len(on_shared), len(on_free)) == (0, 6)
+        assert {size_said(reply) for reply in drained} == {(WORKERS, 1)}
+
+        # Room again: "ready" ends the drain, and the server is back with one slot.
+        assert box.run(agent, others=0.0) == "ready up 100% maxconn:1\n"
+        await shared_is("UP", 1)
+        await pool_says(workers=1 + WORKERS, servers_up=2)
+    finally:
+        for gate in gates.values():
+            gate.set()
+        await agent.close()
+
+
+async def test_a_limit_of_zero_would_mean_no_limit_which_is_why_the_agent_never_states_it(
+    start_lean_server: StartLeanServer, start_pool: StartPool, tmp_path: Path
+) -> None:
+    """What the agent's rule rests on, shown on the HAProxy under test: ``maxconn:0`` lifts a
+    server's limit altogether, and a limit once stated stays until another is stated."""
+
+    class Stated(UsageSampler):
+        """A sampler that answers whatever line it was last given."""
+
+        line = "ready up 100% maxconn:2\n"
+
+        def sample(self) -> None:
+            return None
+
+        def reply(self) -> str:
+            return self.line
+
+    lean = await start_lean_server()
+    pool = await start_pool(lean, started=False)
+    agent_port = free_port()
+    agent = UsageAgent(dataclasses.replace(AgentSettings(), host="127.0.0.1", port=agent_port))
+    stated = Stated(dataclasses.replace(AgentSettings(), stat_path=tmp_path / "unused"))
+    agent.sampler = stated
+    await agent.start()
+
+    async def limit_is(limit: str) -> None:
+        async def reached() -> bool:
+            return (await pool.server_state("checkers", "lean"))["slim"] == limit
+
+        await eventually(reached)
+
+    try:
+        await pool.start_cache()
+        await pool.start_haproxy(
+            pool.render([LeanServer("lean", "127.0.0.1", lean.port, WORKERS, agent_port)])
+        )
+        await limit_is("2")
+        stated.line = "ready up 100%\n"
+        await asyncio.sleep(2 * AGENT_INTERVAL_SECONDS + 1)
+        assert (await pool.server_state("checkers", "lean"))["slim"] == "2"  # it stays
+        stated.line = "ready up 100% maxconn:0\n"
+        await limit_is("")  # no limit at all
+        stated.line = f"ready up 100% maxconn:{WORKERS}\n"
+        await limit_is(str(WORKERS))
+    finally:
+        await agent.close()
+
+
+async def test_a_lean_server_that_answers_health_slowly_stays_up(
+    start_lean_server: StartLeanServer, start_pool: StartPool, session: aiohttp.ClientSession
+) -> None:
+    """A health answer that takes three seconds was three misses in a row to the
+    check this pool had before (two seconds to answer), and the server went down."""
+    slow, quick = await start_lean_server(), await start_lean_server()
+    slow.health_seconds = 3.0
+    pool = await start_pool(slow, quick)
+    watched_until = asyncio.get_running_loop().time() + 20.0
+    while asyncio.get_running_loop().time() < watched_until:
+        assert (await pool.server_state("checkers", "lean-0"))["status"].startswith("UP")
+        await asyncio.sleep(0.5)
+    assert slow.health_checks >= 2
+    capacity = (await pool.health(session))[2]
+    assert capacity == PoolCapacity(workers=2 * WORKERS, queued=0, servers=2)

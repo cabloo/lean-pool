@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 _AGGREGATE_CPU_LABEL = "cpu"
@@ -67,6 +69,60 @@ def idle_share(previous: CpuTimes, current: CpuTimes) -> float | None:
         return None
     idle_ticks = current.idle_ticks - previous.idle_ticks
     return min(1.0, max(0.0, idle_ticks / elapsed_ticks))
+
+
+def busy_cpus(previous: CpuTimes, current: CpuTimes) -> float | None:
+    """Return how many CPUs' worth of work the whole box did between two readings.
+
+    The box's busy share of the interval times its CPU count: 9.6 means that, on average, 9.6 of
+    its CPUs were running something. None where ``idle_share`` is None (no interval).
+    """
+    idle = idle_share(previous, current)
+    if idle is None:
+        return None
+    return (1.0 - idle) * current.cores
+
+
+def elapsed_seconds(previous: CpuTimes, current: CpuTimes, ticks_per_second: int) -> float | None:
+    """Return the wall-clock time between two readings, from the readings themselves.
+
+    Every CPU adds ``ticks_per_second`` ticks to the total each second, whatever it is doing, so
+    the total grows by CPUs x ticks per second x seconds. Taking the time from the same counters
+    as the busy share keeps the two on one clock. None when no time passed.
+    """
+    elapsed_ticks = current.total_ticks - previous.total_ticks
+    if elapsed_ticks <= 0:
+        return None
+    return elapsed_ticks / (current.cores * ticks_per_second)
+
+
+def threads_of_each_core(sibling_lists: Iterable[str]) -> tuple[int, ...]:
+    """Return how many threads each physical core of a box has, the cores with most threads first.
+
+    The input is each logical CPU's list of the CPUs that share its core. Linux gives every
+    logical CPU that list (``topology/core_cpus_list``, earlier ``thread_siblings_list``): two
+    hyperthreads of one core hold the same text (``3,15`` or ``0-1``), a core with one thread
+    holds its own number. The distinct lists are the cores, and a core has as many threads as
+    there are CPUs that hold its list. A desktop with fast cores of two threads and slow cores of
+    one gives ``(2, 2, ..., 1, 1)``.
+    """
+    counted = Counter(text.strip() for text in sibling_lists if text.strip())
+    return tuple(sorted(counted.values(), reverse=True))
+
+
+def parse_cpu_usage_microseconds(cpu_stat_text: str) -> int:
+    """Read ``usage_usec`` from a control group's ``cpu.stat`` (cgroup v2).
+
+    It is the CPU time everything in that group has used since the group was made, in
+    microseconds: like ``/proc/stat``, a counter that only says something as a difference.
+    """
+    for line in cpu_stat_text.splitlines():
+        label, _, value = line.partition(" ")
+        if label == "usage_usec":
+            if not value.isascii() or not value.isdigit():
+                raise ReadingError(f"cannot read the usage_usec value {value!r}")
+            return int(value)
+    raise ReadingError("no 'usage_usec' line in the cpu.stat file")
 
 
 def parse_available_memory_bytes(meminfo_text: str) -> int:

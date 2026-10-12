@@ -19,9 +19,11 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 **How it works**
 
 * [Cache semantics](cache.md): the key, what is stored and what never is, bypass, single flight.
-* [The usage agent](usage-agent.md): the weight formula, and what HAProxy does with it.
-* [The generated HAProxy configuration](haproxy.md): failover, buffers, name resolution,
-  timeouts, losing the cache, and the TLS variants.
+* [The usage agent](usage-agent.md): the weight formula, what HAProxy does with it, and the
+  open slots of a box that also does other work.
+* [The generated HAProxy configuration](haproxy.md): pausing a server, the health check,
+  failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus, and
+  the TLS variants.
 
 **How far to trust it**
 
@@ -38,6 +40,8 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 | **no answer from Lean** | The check got nothing Lean said: a lost connection, a crashed worker (HTTP 500), a gateway error (502, 503, 504). Only this is sent to another server. |
 | **Lean server** | One Kimina Lean Server. |
 | **workers** | The checks a Lean server runs at once (Kimina's `LEAN_SERVER_MAX_REPLS`). |
+| **open slots** | The checks a Lean server is sent at once right now: its workers, or the lower number its usage agent states while the box does other work. |
+| **paused** | Said of a server that stays in the list and is sent nothing, until it is resumed. |
 | **Lean server box**, or **box** | A machine that runs a Lean server and its usage agent. |
 | **pool box**, or **the pool's host** | The machine that runs the proxy and the cache. |
 | **proxy** | The HAProxy on the pool box. |

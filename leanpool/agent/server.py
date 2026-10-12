@@ -11,19 +11,34 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from leanpool.agent.headroom import BoxState, agent_reply
+from leanpool.agent.headroom import BoxState, agent_reply, fitting_slots, next_slots
 from leanpool.agent.readings import (
     CpuTimes,
+    ReadingError,
+    busy_cpus,
+    elapsed_seconds,
     idle_share,
     parse_available_memory_bytes,
     parse_cpu_times,
+    parse_cpu_usage_microseconds,
     parse_one_minute_load,
+    threads_of_each_core,
 )
 
 _LINGER_SECONDS = 2.0
+_MICROSECONDS_PER_SECOND = 1_000_000
+
+
+def _clock_ticks_per_second() -> int:
+    """The unit of ``/proc/stat``'s counters on this machine (100 on every common Linux)."""
+    try:
+        return int(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, OSError, ValueError):
+        return 100
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,15 @@ class AgentSettings:
 
     The three paths exist so tests can point the agent at fixture files; on a real box they stay
     at their ``/proc`` defaults.
+
+    The agent states open slots only when it is given BOTH ``workers`` (the Lean server's worker
+    count, the most it ever states) and ``lean_cpu_stat_path`` (the ``cpu.stat`` file of the
+    control group the Lean server runs in, from which its own CPU use is read). With either
+    missing its replies are what they were before slots existed. ``cpu_reserve`` is how many
+    cores are left free beside the box's other work before a check is counted as fitting, and
+    ``cpu_topology_path`` is where the kernel says which logical CPUs share a core.
+    ``slots_beside_other_work`` is the box's measured limit on checks while it also runs other
+    work (None: no such limit).
     """
 
     host: str = "0.0.0.0"
@@ -42,6 +66,58 @@ class AgentSettings:
     stat_path: Path = Path("/proc/stat")
     meminfo_path: Path = Path("/proc/meminfo")
     loadavg_path: Path = Path("/proc/loadavg")
+    workers: int | None = None
+    cpu_reserve: float = 1.0
+    lean_cpu_stat_path: Path | None = None
+    cpu_topology_path: Path = Path("/sys/devices/system/cpu")
+    slots_beside_other_work: int | None = None
+    clock_ticks_per_second: int = _clock_ticks_per_second()
+
+    @property
+    def states_slots(self) -> bool:
+        """Whether this agent was told how to measure open slots."""
+        return self.workers is not None and self.lean_cpu_stat_path is not None
+
+
+@dataclass(frozen=True)
+class CpuTopology:
+    """The physical cores the kernel describes, as each one's number of threads (most first)."""
+
+    threads_of_each_core: tuple[int, ...]
+
+    @property
+    def threads(self) -> int:
+        """The logical CPUs described."""
+        return sum(self.threads_of_each_core)
+
+    @property
+    def cores(self) -> int:
+        """The physical cores described."""
+        return len(self.threads_of_each_core)
+
+
+def cpu_topology_of(topology_path: Path) -> CpuTopology | None:
+    """Return the box's cores as the kernel describes them, or None where it does not.
+
+    Each ``cpu<N>/topology`` under ``topology_path`` names the logical CPUs that share N's core.
+    None (which the slots then read as one thread a core) when nothing can be read there: an
+    older kernel, a box whose ``/sys`` is not the host's. A CPU that is offline has no such file
+    and is not counted.
+    """
+    lists = []
+    try:
+        directories = sorted(topology_path.glob("cpu[0-9]*"))
+    except OSError:
+        return None
+    for directory in directories:
+        for name in ("core_cpus_list", "thread_siblings_list"):
+            try:
+                lists.append((directory / "topology" / name).read_text())
+                break
+            except OSError:
+                continue
+    counted = threads_of_each_core(lists)
+    return CpuTopology(counted) if counted else None
 
 
 class UsageSampler:
@@ -50,7 +126,10 @@ class UsageSampler:
     def __init__(self, settings: AgentSettings) -> None:
         self._settings = settings
         self._previous_cpu_times: CpuTimes | None = None
+        self._previous_lean_usage: int | None = None
+        self._slots: int | None = None
         self._state: BoxState | None = None
+        self._topology = cpu_topology_of(settings.cpu_topology_path)
 
     def sample(self) -> None:
         """Read the ``/proc`` files once and replace the current state.
@@ -64,6 +143,8 @@ class UsageSampler:
             if self._previous_cpu_times is None
             else idle_share(self._previous_cpu_times, cpu_times)
         )
+        if self._settings.states_slots:
+            self._slots = self._sampled_slots(cpu_times)
         self._previous_cpu_times = cpu_times
         self._state = BoxState(
             cpu_idle_share=cpu_idle_share,
@@ -71,6 +152,7 @@ class UsageSampler:
                 self._settings.meminfo_path.read_text()
             ),
             load_per_core=self._load_per_core(cpu_times.cores),
+            open_slots=self._slots,
         )
 
     def reply(self) -> str:
@@ -78,6 +160,55 @@ class UsageSampler:
         if self._state is None:
             raise RuntimeError("sample() must run before reply()")
         return agent_reply(self._state, self._settings.memory_floor_bytes)
+
+    def _sampled_slots(self, cpu_times: CpuTimes) -> int | None:
+        """Return the slots to state after this reading. Called before the reading is kept.
+
+        Three cases leave the measurement out, and none of them stops the agent:
+
+        * the Lean server's ``cpu.stat`` cannot be read (its container is being made again, or
+          this box gives the agent no such file): the agent states the server's whole worker
+          count. HAProxy keeps the last limit it was told, so saying nothing would leave an
+          earlier, lower limit standing on a server nobody is measuring;
+        * there is no interval yet (the first reading, or the first after the file came back);
+        * a counter went backwards (the control group was made again, the box's counters were
+          restored): the slots stated before stand until the next whole interval.
+        """
+        workers = self._settings.workers
+        path = self._settings.lean_cpu_stat_path
+        assert workers is not None
+        assert path is not None
+        try:
+            lean_usage = parse_cpu_usage_microseconds(path.read_text())
+        except (OSError, ReadingError):
+            self._previous_lean_usage = None
+            return workers
+        previous_cpu_times, previous_lean_usage = (
+            self._previous_cpu_times,
+            self._previous_lean_usage,
+        )
+        self._previous_lean_usage = lean_usage
+        if previous_cpu_times is None or previous_lean_usage is None:
+            return self._slots
+        busy = busy_cpus(previous_cpu_times, cpu_times)
+        seconds = elapsed_seconds(
+            previous_cpu_times, cpu_times, self._settings.clock_ticks_per_second
+        )
+        if busy is None or seconds is None or lean_usage < previous_lean_usage:
+            return self._slots
+        lean_cpus = (lean_usage - previous_lean_usage) / _MICROSECONDS_PER_SECOND / seconds
+        # A topology counts only when it describes the very CPUs /proc/stat counts: where the two
+        # disagree (a /sys that is not the host's) fitting_slots takes every thread for a core.
+        fits = fitting_slots(
+            cpu_times.cores,
+            self._settings.cpu_reserve,
+            busy,
+            lean_cpus,
+            workers,
+            None if self._topology is None else self._topology.threads_of_each_core,
+            self._settings.slots_beside_other_work,
+        )
+        return next_slots(self._slots, fits)
 
     def _load_per_core(self, cores: int) -> float | None:
         if not self._settings.use_load_average:

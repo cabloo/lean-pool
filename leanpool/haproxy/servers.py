@@ -5,8 +5,11 @@ The list is a plain text file, one server per line, that a person can read and e
     # name    host:port              workers  agent-port
     lean-a    lean-a.example:8000    4        18200
     lean-b    192.0.2.20:8000        8          # agent port left out: the default, 18200
+    lean-c    lean-c.example:8000    8        18200   paused
 
-``#`` starts a comment and blank lines are ignored. Every field ends up inside ``haproxy.cfg``,
+``#`` starts a comment and blank lines are ignored. The word ``paused`` as a line's last field
+keeps the server in the list while the pool sends it nothing. Every field ends up inside
+``haproxy.cfg``,
 so each is validated strictly here: a name or host containing a space, a ``#`` or a line break
 would otherwise let one bad entry rewrite the proxy's configuration.
 
@@ -17,8 +20,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 
 from leanpool.environment import MAXIMUM_PORT, parse_whole_number
 from leanpool.names import is_dns_name, looks_numeric
@@ -28,8 +31,14 @@ DEFAULT_AGENT_PORT = 18200
 # server with more workers than this could not be weighted correctly.
 MAXIMUM_WORKERS = 256
 
+# The last field of a paused server's line. It is a word, so it is never read as an agent port.
+PAUSED_MARK = "paused"
+
 _NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 _COMMENT_MARKER = "#"
+_PAUSED_FIELD = re.compile(rf"\s+{PAUSED_MARK}(?=\s*$)")
+# A line's third field, after its name and address: group 1 is everything before it.
+_WORKERS_FIELD = re.compile(r"\A(\s*\S+\s+\S+\s+)\S+")
 _FIELDS_WITHOUT_AGENT_PORT = 3
 _FIELDS_WITH_AGENT_PORT = 4
 
@@ -44,7 +53,8 @@ class LeanServer:
 
     ``workers`` is how many checks the server runs at once (Kimina's ``LEAN_SERVER_MAX_REPLS``).
     The proxy never sends it more concurrent checks than that. ``agent_port`` is where the usage
-    agent on the same box answers.
+    agent on the same box answers. A ``paused`` server stays in the list and is sent nothing: no
+    check, no health check and no agent check.
     """
 
     name: str
@@ -52,6 +62,7 @@ class LeanServer:
     port: int
     workers: int
     agent_port: int = DEFAULT_AGENT_PORT
+    paused: bool = False
 
     def __post_init__(self) -> None:
         validate_name(self.name)
@@ -147,7 +158,8 @@ def refuse_duplicate(servers: Sequence[LeanServer], candidate: LeanServer) -> No
 
 def format_server_line(server: LeanServer) -> str:
     """Write one server as a line of the list, with every field explicit."""
-    return f"{server.name} {server.address} {server.workers} {server.agent_port}"
+    line = f"{server.name} {server.address} {server.workers} {server.agent_port}"
+    return f"{line} {PAUSED_MARK}" if server.paused else line
 
 
 def add_server(text: str, server: LeanServer) -> str:
@@ -169,9 +181,81 @@ def remove_server(text: str, name: str) -> str:
     return "".join(kept_lines)
 
 
+def pause_server(text: str, name: str) -> str:
+    """Return the list with the server called ``name`` paused, every other character as it was.
+
+    Refused when that would leave no server taking checks: a pool whose every server is paused
+    answers nothing, exactly as an empty one does.
+    """
+    servers = parse_server_list(text)
+    if _listed(servers, name).paused:
+        raise ServerListError(f"{name!r} is already paused")
+    if all(server.paused for server in servers if server.name != name):
+        raise ServerListError(
+            f"pausing {name!r} would leave no server taking checks: a pool keeps at least one"
+        )
+    return _edit_line(text, name, _with_the_mark)
+
+
+def resume_server(text: str, name: str) -> str:
+    """Return the list with the server called ``name`` no longer paused, the rest as it was."""
+    if not _listed(parse_server_list(text), name).paused:
+        raise ServerListError(f"{name!r} is not paused")
+    return _edit_line(text, name, _without_the_mark)
+
+
+def set_server_workers(text: str, name: str, workers: int) -> str:
+    """Return the list with ``name`` listed at ``workers``, every other character as it was.
+
+    The count in the list is the pool's record of what the box runs; the box itself is changed
+    there (Kimina's ``LEAN_SERVER_MAX_REPLS``). Refused when the server already has that count: a
+    command that would change nothing is most likely aimed at the wrong server.
+    """
+    _validate_workers(workers)
+    if _listed(parse_server_list(text), name).workers == workers:
+        raise ServerListError(f"{name!r} is already listed with {workers} workers")
+    return _edit_line(text, name, lambda fields: _WORKERS_FIELD.sub(rf"\g<1>{workers}", fields))
+
+
+def servers_taking_checks(servers: Sequence[LeanServer]) -> tuple[LeanServer, ...]:
+    """The servers that are not paused, in the order of the list."""
+    return tuple(server for server in servers if not server.paused)
+
+
 def total_workers(servers: Sequence[LeanServer]) -> int:
-    """How many checks the pool runs at once: what a client should size its concurrency to."""
-    return sum(server.workers for server in servers)
+    """How many checks the pool runs at once: what a client should size its concurrency to.
+
+    A paused server runs none, so its workers are not counted.
+    """
+    return sum(server.workers for server in servers_taking_checks(servers))
+
+
+def _listed(servers: Sequence[LeanServer], name: str) -> LeanServer:
+    for server in servers:
+        if server.name == name:
+            return server
+    raise ServerListError(f"no server is named {name!r}")
+
+
+def _edit_line(text: str, name: str, edit: Callable[[str], str]) -> str:
+    """Apply ``edit`` to the fields of the one line that lists ``name``; its comment is kept."""
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if _fields(line)[:1] == [name]:
+            ending = line[len(line.rstrip("\r\n")) :]
+            fields, marker, comment = line.rstrip("\r\n").partition(_COMMENT_MARKER)
+            lines[index] = f"{edit(fields)}{marker}{comment}{ending}"
+    return "".join(lines)
+
+
+def _with_the_mark(fields: str) -> str:
+    """Put the mark after the last field, before whatever spacing led to a comment."""
+    written = fields.rstrip()
+    return f"{written} {PAUSED_MARK}{fields[len(written) :]}"
+
+
+def _without_the_mark(fields: str) -> str:
+    return _PAUSED_FIELD.sub("", fields, count=1)
 
 
 def _fields(line: str) -> list[str]:
@@ -180,11 +264,18 @@ def _fields(line: str) -> list[str]:
 
 
 def _server_from_fields(fields: list[str]) -> LeanServer:
-    if len(fields) == _FIELDS_WITHOUT_AGENT_PORT:
-        return parse_server(fields[0], fields[1], fields[2])
-    if len(fields) == _FIELDS_WITH_AGENT_PORT:
-        return parse_server(fields[0], fields[1], fields[2], fields[3])
-    raise ServerListError(f"expected NAME HOST:PORT WORKERS [AGENT_PORT], got {len(fields)} fields")
+    paused = len(fields) > _FIELDS_WITHOUT_AGENT_PORT and fields[-1] == PAUSED_MARK
+    own = fields[:-1] if paused else fields
+    if len(own) == _FIELDS_WITHOUT_AGENT_PORT:
+        server = parse_server(own[0], own[1], own[2])
+    elif len(own) == _FIELDS_WITH_AGENT_PORT:
+        server = parse_server(own[0], own[1], own[2], own[3])
+    else:
+        raise ServerListError(
+            f"expected NAME HOST:PORT WORKERS [AGENT_PORT] [{PAUSED_MARK}], "
+            f"got {len(fields)} fields"
+        )
+    return replace(server, paused=paused)
 
 
 def _parse_number(text: str, what: str) -> int:

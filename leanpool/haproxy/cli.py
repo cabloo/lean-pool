@@ -1,7 +1,10 @@
 """``leanpool-haproxy-config``: edit a pool's server list and render its ``haproxy.cfg``.
 
-``render`` writes the pool proxy's configuration and ``render-box`` the configuration of a Lean
-server box's TLS front; both print to standard output.
+``add``, ``remove``, ``pause``, ``resume`` and ``set-workers`` edit the list and nothing else: the
+proxy follows once the list is rendered again and the proxy reloaded. ``render`` writes the pool
+proxy's configuration and ``render-box`` the configuration of a Lean server box's TLS front; both
+print to standard output. With ``--pool-metrics FILE``, ``render`` also writes the pool's facts for
+a Prometheus scraper to that file, which the configuration then names.
 
 Exit status: 0 on success, 1 when the input was refused (nothing is written), 2 on a usage
 error.
@@ -28,8 +31,19 @@ from leanpool.haproxy.box import (
     BoxSettingsError,
     render_box_config,
 )
-from leanpool.haproxy.config import PoolSettings, PoolSettingsError, render_haproxy_config
+from leanpool.haproxy.config import (
+    PoolSettings,
+    PoolSettingsError,
+    maximum_pool_metrics_bytes,
+    render_haproxy_config,
+)
 from leanpool.haproxy.files import edit_server_file, read_server_file
+from leanpool.haproxy.metrics import (
+    CertificateDates,
+    read_certificate_dates,
+    render_pool_metrics,
+    write_pool_metrics,
+)
 from leanpool.haproxy.servers import (
     DEFAULT_AGENT_PORT,
     ServerListError,
@@ -37,10 +51,14 @@ from leanpool.haproxy.servers import (
     format_server_line,
     parse_server,
     parse_server_list,
+    pause_server,
     remove_server,
+    resume_server,
+    set_server_workers,
     total_workers,
 )
 from leanpool.haproxy.tls import DEFAULT_AGENT_TUNNEL_PORT, TlsSettings
+from leanpool.metrics import POOL_METRICS_PATH
 
 if TYPE_CHECKING:
     # Subscriptable only for the type checker; at run time it is used in annotations alone.
@@ -53,6 +71,9 @@ _REQUIRED = {
     "render": _SERVERS_REQUIRED,
     "add": _SERVERS_REQUIRED,
     "remove": _SERVERS_REQUIRED,
+    "pause": _SERVERS_REQUIRED,
+    "resume": _SERVERS_REQUIRED,
+    "set-workers": _SERVERS_REQUIRED,
     "list": _SERVERS_REQUIRED,
     "render-box": {
         "tls_server_pem": "--tls-server-pem (or LEANPOOL_HAPROXY_BOX_TLS_SERVER_PEM)",
@@ -82,7 +103,7 @@ def main(
 
 
 def build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
-    """Build the parser for the five subcommands."""
+    """Build the parser for the eight subcommands."""
     parser = argparse.ArgumentParser(
         prog="leanpool-haproxy-config",
         description="Edit a lean-pool server list and render the pool's haproxy.cfg.",
@@ -93,6 +114,9 @@ def build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
     _add_render_box_command(commands, environment)
     _add_add_command(commands, environment)
     _add_remove_command(commands, environment)
+    _add_pause_command(commands, environment)
+    _add_resume_command(commands, environment)
+    _add_set_workers_command(commands, environment)
     _add_list_command(commands, environment)
     return parser
 
@@ -233,6 +257,25 @@ def _add_render_command(commands: Subparsers, environment: Mapping[str, str]) ->
         "with TLS, the first of the loopback ports the usage agents are asked through: one "
         "per server, counting up",
     )
+    settings.add(
+        "--pool-metrics",
+        "LEANPOOL_HAPROXY_POOL_METRICS",
+        Path,
+        None,
+        f"write the pool's facts for a Prometheus scraper to this file (each server's listed "
+        f"workers and whether it is paused) and have HAProxy answer GET {POOL_METRICS_PATH} with "
+        "it; install it beside haproxy.cfg, under the same name",
+        optional=True,
+    )
+    settings.add(
+        "--certificates",
+        "LEANPOOL_HAPROXY_CERTIFICATES",
+        Path,
+        None,
+        "with --pool-metrics, a directory of public certificates: the end of validity of every "
+        "*.crt file under it is written to the pool's facts, by the file's path there",
+        optional=True,
+    )
 
 
 def _add_render_box_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
@@ -322,13 +365,52 @@ def _add_remove_command(commands: Subparsers, environment: Mapping[str, str]) ->
     parser.add_argument("name", metavar="NAME", help="the server to remove")
 
 
+def _add_pause_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
+    parser = commands.add_parser(
+        "pause", help="keep a Lean server in the list but send it nothing", allow_abbrev=False
+    )
+    _add_servers_option(parser, environment)
+    parser.add_argument("name", metavar="NAME", help="the server to pause")
+
+
+def _add_resume_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
+    parser = commands.add_parser(
+        "resume", help="send a paused Lean server checks again", allow_abbrev=False
+    )
+    _add_servers_option(parser, environment)
+    parser.add_argument("name", metavar="NAME", help="the paused server to resume")
+
+
+def _add_set_workers_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
+    parser = commands.add_parser(
+        "set-workers",
+        help="change how many workers a Lean server is listed with",
+        allow_abbrev=False,
+    )
+    _add_servers_option(parser, environment)
+    parser.add_argument("name", metavar="NAME", help="the server whose count changes")
+    parser.add_argument("workers", metavar="WORKERS", help="how many checks it runs at once")
+
+
 def _add_list_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
     parser = commands.add_parser("list", help="print the validated server list", allow_abbrev=False)
     _add_servers_option(parser, environment)
 
 
 def _render(options: argparse.Namespace) -> None:
+    """Print the pool's configuration; with ``--pool-metrics``, write the pool's facts first.
+
+    The configuration is rendered before anything is written, so a refused server list or
+    setting leaves no file behind. The facts are then written whole, and only then is the
+    configuration printed: a caller that got a configuration has the file it names.
+    """
     servers = parse_server_list(read_server_file(options.servers))
+    if options.certificates is not None and options.pool_metrics is None:
+        raise PoolSettingsError(
+            "--certificates gives the certificates of --pool-metrics, which is missing. "
+            "Nothing was rendered"
+        )
+    pool_metrics: Path | None = options.pool_metrics
     settings = PoolSettings(
         public_port=options.public_port,
         checkers_port=options.checkers_port,
@@ -342,8 +424,26 @@ def _render(options: argparse.Namespace) -> None:
         maximum_request_bytes=options.max_request_bytes,
         maximum_connections=options.maximum_connections,
         tls=_tls_settings(options),
+        pool_metrics_file=None if pool_metrics is None else pool_metrics.name,
     )
-    sys.stdout.write(render_haproxy_config(servers, settings))
+    config = render_haproxy_config(servers, settings)
+    if pool_metrics is not None:
+        certificates = (
+            CertificateDates()
+            if options.certificates is None
+            else read_certificate_dates(options.certificates)
+        )
+        for name, reason in certificates.unreadable.items():
+            print(
+                f"warning: certificate {name} has no sample in {POOL_METRICS_PATH}: {reason}",
+                file=sys.stderr,
+            )
+        write_pool_metrics(
+            pool_metrics,
+            render_pool_metrics(servers, certificates.not_after),
+            maximum_pool_metrics_bytes(settings),
+        )
+    sys.stdout.write(config)
 
 
 def _tls_settings(options: argparse.Namespace) -> TlsSettings | None:
@@ -399,11 +499,33 @@ def _remove(options: argparse.Namespace) -> None:
     edit_server_file(options.servers, lambda text: remove_server(text, options.name))
 
 
+def _pause(options: argparse.Namespace) -> None:
+    edit_server_file(options.servers, lambda text: pause_server(text, options.name))
+
+
+def _resume(options: argparse.Namespace) -> None:
+    edit_server_file(options.servers, lambda text: resume_server(text, options.name))
+
+
+def _set_workers(options: argparse.Namespace) -> None:
+    workers = _whole_number(options.workers, "workers")
+    edit_server_file(options.servers, lambda text: set_server_workers(text, options.name, workers))
+
+
+def _whole_number(text: str, what: str) -> int:
+    try:
+        return parse_whole_number(text)
+    except ValueError as error:
+        raise ServerListError(f"{what}: {error}") from error
+
+
 def _list(options: argparse.Namespace) -> None:
     servers = parse_server_list(read_server_file(options.servers))
     for server in servers:
         print(format_server_line(server))
-    print(f"# {len(servers)} servers, {total_workers(servers)} workers")
+    paused = sum(server.paused for server in servers)
+    summary = f"# {len(servers) - paused} servers, {total_workers(servers)} workers"
+    print(f"{summary}; {paused} paused" if paused else summary)
 
 
 _COMMANDS = {
@@ -411,5 +533,8 @@ _COMMANDS = {
     "render-box": _render_box,
     "add": _add,
     "remove": _remove,
+    "pause": _pause,
+    "resume": _resume,
+    "set-workers": _set_workers,
     "list": _list,
 }

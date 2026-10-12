@@ -15,24 +15,80 @@ read one beside this page: [the demo's](../examples/demo/haproxy.cfg) is a compl
   `use_backend checkers` when the cache server is down, when the request carries the loop-guard
   header, and for every path other than `/api/check` (so the rest of Kimina's interface still
   works, uncached). `/status` is the cache's, and is answered 503 by HAProxy while the cache is
-  down. The body of `/health` and three response headers on every answer carry the workers on
-  servers that are up, the checks queued and the servers taking checks: the first is summed per
-  listed server (`srv_is_up(checkers/NAME)` times its worker count), the others are
-  `queue(checkers)` and `nbsrv(checkers)`. HAProxy's `nbsrv` leaves out a server that is drained
-  or at weight 0, and `srv_is_up` does not, so a server its usage agent has drained stays in
-  the workers and leaves the servers.
+  down. The body of `/health` and three response headers on every answer carry the open slots
+  on servers taking checks, the checks queued and the servers taking checks. The first is
+  summed per listed server: the checks it holds plus the room under its limit (`srv_conn` and
+  `srv_conn_free`; HAProxy has no fetch for the limit itself), counted when the server is up
+  and its weight is not 0 (`srv_is_up`, `srv_weight`). The others are `queue(checkers)` and
+  `nbsrv(checkers)`. HAProxy's `nbsrv` leaves out a server that is drained or at weight 0, and
+  `srv_is_up` does not: a server drained by an agent that states
+  [open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work) (`drain 0%`) leaves
+  both numbers, and one drained by a bare `drain` leaves the servers and stays in the first.
+  A `GET` of `/metrics`, `/metrics/cache` and `/metrics/pool` is answered for a Prometheus
+  scraper, without the key (see [Metrics for Prometheus](#metrics-for-prometheus)).
 * `frontend checkers_door` on `127.0.0.1` only: sets the loop-guard header, uses `checkers`.
 * `backend cache`: the cache server, health-checked every second and marked down on its first
   failed connection, with no connection cap; and the checkers door as its `backup` server (see
   [Losing the cache](#losing-the-cache)).
+* `backend cache_metrics`: the cache server alone, for `GET /metrics/cache`. No backup and no
+  retry; `track cache/cache` gives it the cache server's state without a second health check.
 * `backend checkers`: `balance leastconn`; per server `check`, `maxconn <workers>`,
   `weight <workers x factor>` and `agent-check agent-port <port> agent-inter 5s`;
-  `option httpchk GET /health`; `retries 2`,
+  `option httpchk GET /health` with `timeout check 15s` and
+  `default-server inter 5s fall 4 rise 1` (see [The health check](#the-health-check)); `retries 2`,
   `retry-on conn-failure empty-response 500 502 503 504` and `option redispatch 1` (see
   [Failover](#failover-among-the-lean-servers)); and
   `http-request set-priority-class int(100)` for a check that carries
   `X-Lean-Priority: background`, which puts it behind every normal check in this backend's queue.
 * `listen stats` on `127.0.0.1` only.
+
+## A paused server
+
+`leanpool-haproxy-config pause --servers FILE NAME` keeps a server in the list and stops the
+pool sending it anything; `resume` undoes it. Like `add` and `remove`, both edit the list alone:
+render again, validate, and reload HAProxy. A paused server:
+
+* is declared `disabled` in `backend checkers`, with **no** `agent-check`, and with TLS it has
+  no agent tunnel. It is sent no check, no health check and no agent check, and HAProxy's
+  statistics show it as `MAINT`;
+* is not up, so it adds nothing to the workers and servers the pool reports
+  ([the pool's size](clients.md#the-pools-size)): a client that follows the pool's size shrinks
+  with it;
+* stays paused across a reload and a restart, because the pause is in the list and not in the
+  running proxy;
+* changes nothing about the other servers: their lines in the list and in the configuration
+  are what they were (weights are scaled by the largest *listed* server, and every agent tunnel
+  keeps its port).
+
+A reload does not drop a check: HAProxy's old process finishes the checks it holds, including
+those running on the paused server and those already waiting in its queue, and takes no new
+one. The last server taking checks cannot be paused, and a list of paused servers only is
+refused: a pool with no server answers nothing.
+
+The agent check is left out on purpose. The usage agent says `ready` with every normal reply,
+because only an agent can undo its own earlier `drain`, and HAProxy takes `ready` from an agent
+as the end of a maintenance. On HAProxy 3.0.29 a `disabled` server that keeps its agent check is
+back in rotation within one agent interval. For the same reason, do not pause a server with
+HAProxy's runtime `set server ... state maint`: the agent undoes that too, and a reload
+forgets it.
+
+Before resuming a server that was paused because it misbehaved, run the
+[admission test](admission.md) against it alone.
+
+## The health check
+
+Every Lean server is asked `GET /health` every 5 seconds, has 15 seconds to answer, is called
+down after 4 misses in a row and up again after 1 answer. That is patient on purpose. A Lean
+server that shares its box with other work answers `/health` slowly while it is busy, and taking
+it out for that helps nobody: the checks it holds go on running, and when it comes back it is
+handed a full burst. How many checks a busy box is sent is the usage agent's matter
+([open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work)), not the health
+check's.
+
+The price is a slower notice of a server that has really stopped: about 20 seconds when its port
+refuses connections, up to about 100 when it accepts them and says nothing. No check is lost to
+that. One sent meanwhile to a port that refuses goes to another server (next section), and one
+sent to a server that hangs ends as the proxy's own gateway error, which a client asks again.
 
 ## Failover among the Lean servers
 
@@ -150,6 +206,79 @@ proxy's network namespace in the [compose example](../deploy/pool/compose.yaml),
 docker compose exec cache \
     python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:18103/;csv').read().decode())"
 ```
+
+## Metrics for Prometheus
+
+A scraper on another machine has neither the pool's key nor a place on the proxy's loopback. So
+the public port answers three more paths, read-only and **without the key**, as it answers
+`GET /health`. All three are `text/plain; version=0.0.4`.
+
+| Path | Answered by | What it holds |
+|---|---|---|
+| `GET /metrics` | HAProxy's own Prometheus exporter, in the frontend | What each server, backend and frontend is doing, and the process: `haproxy_server_status{proxy,server,state}`, `haproxy_server_current_sessions`, `haproxy_server_limit_sessions`, `haproxy_backend_current_queue` and the rest of the exporter's names. |
+| `GET /metrics/cache` | the cache service, through `backend cache_metrics` | The cache's counters and sizes ([Cache semantics](cache.md)). |
+| `GET /metrics/pool` | HAProxy, from a file beside the configuration | What the server list and the certificates said when the configuration was rendered: `leanpool_server_listed_workers{server}`, `leanpool_server_paused{server}` (1 or 0) and `leanpool_certificate_not_after_seconds{certificate}` (seconds since 1970). |
+
+```sh
+curl --cacert ca.crt https://pool.example:18100/metrics
+```
+
+**None of them queues or reaches a Lean server.** `/metrics` and `/metrics/pool` end in the
+frontend. `/metrics/cache` goes to the cache server and to nothing else: `backend cache` has a
+backup that leads to the Lean servers, which is right for a check and wrong for the cache's
+counters, so this path has a backend of its own with the cache server alone. While the cache
+server is down HAProxy answers 503 `the cache is down` itself; a scrape that meets a cache that
+died that instant gets HAProxy's own 503, with no retry.
+
+**GET and HEAD only, on the exact path.** Any other method and any other path (`/metrics/`,
+`/metrics/anything`) is routed as before these routes existed, which for everything but
+`/api/check` means to a Lean server. Before them, a `GET` of these three paths went to a Lean
+server too, so the front door now shadows whatever a Lean server answers there. Kimina serves
+none of the three (it answers 404).
+
+**The exporter's answer is fixed by the configuration.** The scraper's query string is replaced
+(`http-request set-query scope=global&scope=frontend&scope=backend&scope=server`) before the
+exporter reads it. Left to the caller, `scope=resolvers` would return each name server's
+address as a label, and `no-maint` would hide a paused server. A paused server is
+`haproxy_server_status{...,state="MAINT"} 1`. HAProxy's counters restart at 0 on every reload
+and `haproxy_process_start_time_seconds` moves with it; with TLS the agent tunnels appear as
+proxies of their own (`agent_tunnel_NAME`), and the cache server appears twice, under
+`proxy="cache"` and `proxy="cache_metrics"`.
+
+**No key, no proof and no address** is in any of the three: server and certificate names from
+the list, and numbers. Whoever can reach the public port can read them.
+
+**The pool's facts are a file.** `render --pool-metrics FILE [--certificates DIR]` writes it
+from the same server list as the configuration, and the configuration then holds
+
+```
+global
+    default-path config
+frontend lean_pool
+    http-request return status 200 content-type "text/plain; version=0.0.4" file pool.metrics if METH_GET is_pool_metrics
+```
+
+HAProxy reads the file when it reads the configuration, at start and at every reload, and
+refuses a configuration whose file is missing: install the file **before** the configuration
+that names it, beside it, readable by HAProxy's user. The server list stays the single source:
+after `pause`, `resume`, `set-workers`, `add` or `remove`, render again (which writes both),
+validate, install both, reload. HAProxy keeps the file in one buffer, so `render` refuses facts
+larger than half of `--max-request-bytes` (128 KiB with the default; a server takes about a
+hundred bytes) and writes nothing. Without `--pool-metrics` the configuration has no rule for
+`/metrics/pool` and that path goes where it went before.
+
+A certificate is named by its path under `--certificates` (`ca.crt`, `servers/lean-a.crt`), and
+its date is read with the standard library alone (the generator has no third-party
+dependency): the one field, straight from the certificate's encoding, with no signature
+checked. A `*.crt` file that is not a certificate gets **no sample** (not a zero), and `render`
+says so on standard error and goes on.
+
+**HAProxy must be built with the exporter** (`USE_PROMEX=1`; `haproxy -vv` then lists
+`prometheus-exporter` under `Available services`). The official `haproxy` images are built with
+it; ask any other build. One built without it refuses the generated configuration, with or
+without `--pool-metrics`.
+
+Every scrape is logged by HAProxy like any other request.
 
 ## With TLS
 

@@ -53,21 +53,33 @@ def test_the_public_frontend_answers_health_itself_from_the_checkers_that_are_up
     assert health_rules[1].endswith("if METH_GET is_health")
 
 
-def test_health_and_every_answer_carry_the_workers_up_the_queue_and_the_servers_up(
+def test_health_and_every_answer_carry_the_open_slots_the_queue_and_the_servers_up(
     config: str,
 ) -> None:
-    """The pool's size: summed per listed server, once for /health's body and once per answer."""
+    """The pool's size: summed per listed server, once for /health's body and once per answer.
+    A server's open slots are the checks it holds and the room under its limit, which is its
+    worker count or what its usage agent states; a server whose weight is 0 is left out."""
     frontend = section(config, "frontend lean_pool")
-    for rule, variable in (
-        ("http-request", "txn.pool_workers"),
-        ("http-after-response", "res.pool_workers"),
-    ):
-        total = [line for line in frontend if line.startswith(f"{rule} set-var({variable}) ")]
-        assert total == [
+    for rule, scope in (("http-request", "txn"), ("http-after-response", "res")):
+        variable = f"{scope}.pool_workers"
+        summed = [line for line in frontend if line.startswith(f"{rule} set-var({scope}.pool_")]
+        assert summed == [
             f"{rule} set-var({variable}) int(0)",
-            f"{rule} set-var({variable}) srv_is_up(checkers/lean-a),mul(4),add({variable})",
-            f"{rule} set-var({variable}) srv_is_up(checkers/lean-b),mul(8),add({variable})",
+            *(
+                line
+                for name in ("lean-a", "lean-b")
+                for line in (
+                    f"{rule} set-var({scope}.pool_held) srv_conn(checkers/{name})",
+                    f"{rule} set-var({scope}.pool_slots) "
+                    f"srv_conn_free(checkers/{name}),add({scope}.pool_held)",
+                    f"{rule} set-var({scope}.pool_taking) srv_weight(checkers/{name}),bool",
+                    f"{rule} set-var({variable}) srv_is_up(checkers/{name}),"
+                    f"mul({scope}.pool_slots),mul({scope}.pool_taking),add({variable})",
+                )
+            ),
         ]
+    # No worker count is written into the sum: the number is what HAProxy holds at that moment.
+    assert not [line for line in frontend if ",mul(4)," in line or ",mul(8)," in line]
     numbers = (
         '"workers":%[var(txn.pool_workers)],'
         '"queued":%[queue(checkers)],"servers":%[nbsrv(checkers)]}'
@@ -189,6 +201,24 @@ def test_a_report_of_one_percent_never_takes_the_largest_server_out_of_rotation(
 def test_each_checker_is_health_checked(config: str) -> None:
     assert "option httpchk GET /health" in section(config, "backend checkers")
     assert "option httpchk GET /health" in section(config, "backend cache")
+
+
+def test_a_lean_servers_health_check_waits_for_a_slow_answer(config: str) -> None:
+    """Every 5 s, 15 s to answer, down after 4 misses in a row, up after 1 answer.
+    The timing is given once, before the servers it applies to, so every server line (a paused
+    one too) is what it was."""
+    checkers = section(config, "backend checkers")
+    assert "timeout check 15s" in checkers
+    timing = "default-server inter 5s fall 4 rise 1"
+    servers = [index for index, line in enumerate(checkers) if line.startswith("server ")]
+    assert checkers.index(timing) < min(servers)
+    assert all(" check " in checkers[index] for index in servers)
+    assert not [line for line in checkers if line.startswith("server ") and " inter " in line]
+    # The cache keeps its own quick check: losing the cache is noticed at the first error.
+    cache = section(config, "backend cache")
+    assert "timeout check 15s" not in cache
+    assert not [line for line in cache if line.startswith("default-server ") and " inter " in line]
+    assert [line for line in cache if line.startswith("server cache ") and " inter 1s " in line]
 
 
 def retried_events(config: str, backend: str) -> list[str]:
@@ -448,3 +478,68 @@ def test_haproxy_accepts_the_generated_configuration(
         ["haproxy", "-c", "-f", str(path)], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- a paused server is listed and sent nothing ---------------------------------------------------
+
+PAUSED_B = (SERVERS[0], dataclasses.replace(SERVERS[1], paused=True))
+
+
+def server_lines(config: str) -> list[str]:
+    return [line for line in section(config, "backend checkers") if line.startswith("server ")]
+
+
+def test_a_paused_server_is_declared_disabled_with_no_agent_check() -> None:
+    assert server_lines(render_haproxy_config(PAUSED_B)) == [
+        "server lean-a lean-a.example:8000 check maxconn 4 weight 128 "
+        "agent-check agent-port 18200 agent-inter 5s",
+        "server lean-b lean-b.example:8000 check maxconn 8 weight 256 disabled",
+    ]
+
+
+def test_pausing_a_server_changes_no_other_servers_line(config: str) -> None:
+    """Also when the largest server is the paused one: the weights keep their scale."""
+    for paused_index in (0, 1):
+        servers = [
+            dataclasses.replace(server, paused=index == paused_index)
+            for index, server in enumerate(SERVERS)
+        ]
+        lines = server_lines(render_haproxy_config(servers))
+        kept = 1 - paused_index
+        assert lines[kept] == server_lines(config)[kept]
+        assert lines[paused_index].endswith(" disabled")
+        assert "agent-check" not in lines[paused_index]
+
+
+def test_the_configuration_says_which_servers_are_paused_and_counts_the_others() -> None:
+    config = render_haproxy_config(PAUSED_B)
+    assert (
+        "# Pool: 1 Lean servers, 4 workers.\n# Paused (listed, sent nothing): lean-b.\n" in config
+    )
+    assert "no agent check, because HAProxy ends a maintenance" in config
+
+
+def test_a_list_with_no_paused_server_does_not_mention_pausing(config: str) -> None:
+    assert "aused" not in config
+    assert "disabled" not in config
+
+
+def test_a_list_of_paused_servers_only_is_refused() -> None:
+    every = [dataclasses.replace(server, paused=True) for server in SERVERS]
+    with pytest.raises(PoolSettingsError, match="every server in the list is paused"):
+        render_haproxy_config(every)
+
+
+@pytest.mark.skipif(shutil.which("haproxy") is None, reason="HAProxy is not installed")
+def test_haproxy_accepts_a_configuration_with_a_paused_server(tmp_path: Path) -> None:
+    servers = [
+        LeanServer(name="lean-a", host="192.0.2.10", port=8000, workers=4),
+        LeanServer(name="lean-b", host="lean-b.invalid", port=8000, workers=8, paused=True),
+    ]
+    path = tmp_path / "haproxy.cfg"
+    path.write_text(render_haproxy_config(servers))
+    result = subprocess.run(
+        ["haproxy", "-c", "-f", str(path)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING" not in result.stdout + result.stderr

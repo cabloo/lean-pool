@@ -464,3 +464,134 @@ def test_usage_errors_exit_with_status_two(
     with pytest.raises(SystemExit) as exit_information:
         main(arguments, environment)
     assert exit_information.value.code == 2
+
+
+# --- pause and resume -----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_servers(servers_file: Path) -> Path:
+    assert run("add", "--servers", str(servers_file), "lean-b", "lean-b.example:8000", "8") == 0
+    return servers_file
+
+
+def test_pause_marks_the_server_and_resume_gives_the_file_it_was(two_servers: Path) -> None:
+    before = two_servers.read_text()
+    assert run("pause", "--servers", str(two_servers), "lean-a") == 0
+    assert two_servers.read_text() == before.replace(
+        "lean-a    lean-a.example:8000    4    18200\n",
+        "lean-a    lean-a.example:8000    4    18200 paused\n",
+    )
+    assert run("resume", "--servers", str(two_servers), "lean-a") == 0
+    assert two_servers.read_text() == before
+
+
+@pytest.mark.parametrize(
+    ("command", "name", "reason"),
+    [
+        ("pause", "lean-z", "no server is named 'lean-z'"),
+        ("resume", "lean-z", "no server is named 'lean-z'"),
+        ("resume", "lean-a", "'lean-a' is not paused"),
+        ("pause", "lean-b", "'lean-b' is already paused"),
+        ("pause", "lean-a", "would leave no server taking checks"),
+    ],
+)
+def test_a_refused_pause_or_resume_leaves_the_file_byte_identical(
+    two_servers: Path, capsys: pytest.CaptureFixture[str], command: str, name: str, reason: str
+) -> None:
+    assert run("pause", "--servers", str(two_servers), "lean-b") == 0
+    before = two_servers.read_bytes()
+    assert run(command, "--servers", str(two_servers), name) == 1
+    assert two_servers.read_bytes() == before
+    assert reason in capsys.readouterr().err
+    assert os.listdir(two_servers.parent) == [two_servers.name]
+
+
+def test_pause_does_not_create_a_missing_list(tmp_path: Path) -> None:
+    path = tmp_path / "servers"
+    assert run("pause", "--servers", str(path), "lean-a") == 1
+    assert not path.exists()
+
+
+def test_list_shows_the_mark_and_counts_the_servers_taking_checks(
+    two_servers: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run("pause", "--servers", str(two_servers), "lean-b") == 0
+    assert run("list", "--servers", str(two_servers)) == 0
+    assert capsys.readouterr().out == (
+        "lean-a lean-a.example:8000 4 18200\n"
+        "lean-b lean-b.example:8000 8 18200 paused\n"
+        "# 1 servers, 4 workers; 1 paused\n"
+    )
+
+
+def test_render_declares_a_paused_server_disabled_and_refuses_a_list_of_paused_servers_only(
+    two_servers: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run("pause", "--servers", str(two_servers), "lean-b") == 0
+    assert run("render", "--servers", str(two_servers)) == 0
+    config = capsys.readouterr().out
+    assert "server lean-b lean-b.example:8000 check maxconn 8 weight 256 disabled\n" in config
+    assert "server lean-a lean-a.example:8000 check maxconn 4 weight 128 agent-check " in config
+
+    # A list edited by hand until nothing takes checks is refused like an empty one.
+    two_servers.write_text(two_servers.read_text().replace("4    18200\n", "4    18200 paused\n"))
+    assert run("render", "--servers", str(two_servers)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "every server in the list is paused" in captured.err
+
+
+# --- the worker count a server is listed with -----------------------------------------------------
+
+
+def test_set_workers_changes_the_count_and_the_rendered_limit_and_weights(
+    two_servers: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = two_servers.read_text()
+    assert run("set-workers", "--servers", str(two_servers), "lean-b", "2") == 0
+    assert two_servers.read_text() == before.replace(
+        "lean-b lean-b.example:8000 8 18200\n", "lean-b lean-b.example:8000 2 18200\n"
+    )
+    assert run("render", "--servers", str(two_servers)) == 0
+    config = capsys.readouterr().out
+    # The largest server has HAProxy's largest weight, so the other server's weight moves too.
+    assert "server lean-a lean-a.example:8000 check maxconn 4 weight 256 agent-check " in config
+    assert "server lean-b lean-b.example:8000 check maxconn 2 weight 128 agent-check " in config
+    assert run("list", "--servers", str(two_servers)) == 0
+    assert capsys.readouterr().out.endswith("# 2 servers, 6 workers\n")
+
+
+def test_set_workers_leaves_a_paused_server_paused(two_servers: Path) -> None:
+    assert run("pause", "--servers", str(two_servers), "lean-b") == 0
+    assert run("set-workers", "--servers", str(two_servers), "lean-b", "6") == 0
+    assert two_servers.read_text().endswith("lean-b lean-b.example:8000 6 18200 paused\n")
+
+
+@pytest.mark.parametrize(
+    ("name", "workers", "reason"),
+    [
+        ("lean-z", "6", "no server is named 'lean-z'"),
+        ("lean-b", "8", "'lean-b' is already listed with 8 workers"),
+        ("lean-b", "0", "workers must be between 1 and 256"),
+        ("lean-b", "257", "workers must be between 1 and 256"),
+        ("lean-b", "six", "workers:"),
+        ("lean-b", "6.0", "workers:"),
+        ("lean-b", "+6", "workers:"),
+        ("lean-b", "", "workers:"),
+    ],
+)
+def test_a_refused_set_workers_leaves_the_file_byte_identical(
+    two_servers: Path, capsys: pytest.CaptureFixture[str], name: str, workers: str, reason: str
+) -> None:
+    before = two_servers.read_bytes()
+    assert run("set-workers", "--servers", str(two_servers), name, workers) == 1
+    assert two_servers.read_bytes() == before
+    assert reason in capsys.readouterr().err
+    assert os.listdir(two_servers.parent) == [two_servers.name]
+
+
+def test_set_workers_does_not_create_a_missing_list(tmp_path: Path) -> None:
+    path = tmp_path / "servers"
+    assert run("set-workers", "--servers", str(path), "lean-a", "6") == 1
+    assert not path.exists()

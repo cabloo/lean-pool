@@ -58,7 +58,8 @@ upstream timeout. Nothing from a failure is stored.
 **Authentication:** the cache compares the request's Bearer token with its configured key, in
 constant time, before it serves anything from `/api/check` or `/status`. It has to do this
 itself: a request answered from the store never reaches a Lean server that would check the key.
-On a miss the caller's `Authorization` header is forwarded. `/health` is open.
+On a miss the caller's `Authorization` header is forwarded. `/health` and `/metrics/cache` are
+open: neither holds a key, a proof or an address.
 
 **Other replies of the cache itself:** 401 without the key, 422 for a malformed request
 (not a JSON object, no snippets, duplicate ids, a `timeout` that is not a whole number of
@@ -84,3 +85,13 @@ Every snippet counts in exactly one of `hits` (answered from the store), `misses
 `coalesced` (waited for an identical check in flight) and `bypasses`. `in_flight` is the number
 of checks waiting for the Lean servers right now. Asked through the pool's public port while
 the cache is down, `/status` is answered by HAProxy: 503 `{"status":"the cache is down"}`.
+
+**`GET /metrics/cache`** returns the same ten numbers as Prometheus text
+(`text/plain; version=0.0.4`), **without the key**: it is the one route of the cache beside
+`/health` that asks for none, and it holds counts and sizes and nothing else. The counters
+`leanpool_cache_hits_total`, `leanpool_cache_misses_total`, `leanpool_cache_coalesced_total`,
+`leanpool_cache_bypasses_total` and `leanpool_cache_evictions_total` count since the cache
+process started and start again at 0 when it does; the gauges are `leanpool_cache_in_flight`,
+`leanpool_cache_stored_entries`, `leanpool_cache_stored_bytes`, `leanpool_cache_file_bytes` and
+`leanpool_cache_maximum_bytes`. [Metrics for Prometheus](haproxy.md#metrics-for-prometheus)
+says how the pool's public port answers it.

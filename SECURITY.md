@@ -18,6 +18,12 @@ only to clients you would let run code there.
 answers anything from its store, and every Lean server checks it again. No command takes a key
 or a token as an argument, and none logs one.
 
+**Three things are answered without the key.** `GET /health`, and for a Prometheus scraper
+`GET /metrics`, `/metrics/cache` and `/metrics/pool`: the names of the pool's servers and
+certificates, their states, and counts. No key, no proof and no address is in them, and none
+of them reaches a Lean server. Whoever can reach the public port can read them
+([what they hold](docs/haproxy.md#metrics-for-prometheus)).
+
 **Plain HTTP is plain.** A pool rendered without TLS sends checks and the API key readable over
 the network, and its generated `haproxy.cfg` says so in its first line. Use it on a network you
 control.

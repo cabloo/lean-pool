@@ -1,4 +1,6 @@
-"""The cache's HTTP interface: Kimina's ``POST /api/check``, plus ``/status`` and ``/health``."""
+"""The cache's HTTP interface: Kimina's ``POST /api/check``, plus ``/status``, ``/health`` and
+``/metrics/cache``.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +10,13 @@ from collections.abc import AsyncIterator
 
 from aiohttp import web
 
+from leanpool.cache.metrics import render_cache_metrics
 from leanpool.cache.request import InvalidRequestError, parse_check_request
 from leanpool.cache.service import CheckService
 from leanpool.cache.settings import CacheSettings
 from leanpool.cache.store import AsyncResultStore
 from leanpool.cache.upstream import UpstreamClient, UpstreamFailure, new_upstream_session
+from leanpool.metrics import CACHE_METRICS_PATH, CONTENT_TYPE
 from leanpool.signals import PRIORITY_HEADER, is_background
 
 _SETTINGS = web.AppKey("settings", CacheSettings)
@@ -33,6 +37,7 @@ def create_application(settings: CacheSettings) -> web.Application:
     application.router.add_post("/api/check/", _handle_check)
     application.router.add_get("/status", _handle_status)
     application.router.add_get("/health", _handle_health)
+    application.router.add_get(CACHE_METRICS_PATH, _handle_metrics)
     return application
 
 
@@ -102,6 +107,17 @@ async def _handle_health(_request: web.Request) -> web.Response:
     reply says nothing but that the process is serving.
     """
     return web.json_response({"status": "ok"})
+
+
+async def _handle_metrics(request: web.Request) -> web.Response:
+    """Answer a Prometheus scrape with the numbers of ``/status``, as text.
+
+    Unauthenticated, unlike ``/status``: a scraper is given no key, and the reply holds counts
+    and sizes only. It reads the counters and changes nothing.
+    """
+    status = await request.app[_SERVICE].status()
+    text = render_cache_metrics(status, request.app[_SETTINGS].maximum_bytes)
+    return web.Response(body=text.encode("ascii"), headers={"Content-Type": CONTENT_TYPE})
 
 
 def _refuse_unauthenticated(request: web.Request, api_key: str | None) -> web.Response | None:

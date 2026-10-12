@@ -5,6 +5,39 @@ Notable changes to lean-pool. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): before 1.0, a minor version may
 change an interface, and this file says when one does.
 
+## Unreleased
+
+A week of running the pool on boxes that also do other work.
+
+### Changed
+
+- **What the pool says its size is.** `X-Lean-Pool-Workers`, and `workers` in the body of
+  `GET /health`, are now the open slots on the servers taking checks: each server's worker
+  count, or the lower number its usage agent states. They were the workers on servers that
+  are up. A client that follows the number now shrinks with a box that is busy.
+- **The health check of a Lean server is patient:** every 5 seconds, 15 seconds to answer, down
+  after 4 misses in a row, up after 1 answer. A busy server that answers `/health` slowly is
+  no longer taken out and handed a full burst when it returns.
+- **HAProxy must be built with its Prometheus exporter** (`USE_PROMEX=1`), as the official
+  images are: the generated configuration uses it.
+- A `GET` of `/metrics`, `/metrics/cache` and `/metrics/pool` at the public port no longer
+  reaches a Lean server (Kimina answers 404 to all three).
+
+### Added
+
+- **Open slots.** A usage agent that is given the Lean server's worker count and its control
+  group's `cpu.stat` states how many checks fit beside the box's other work, counted in cores,
+  and HAProxy sends the box no more (`--workers`, `--lean-cpu-stat-path`, `--cpu-reserve`,
+  `--cpu-topology-path`). A box may also carry a measured limit of its own for while other work
+  runs on it (`--slots-beside-other-work`). An agent given neither answers as before.
+- `leanpool-haproxy-config pause` and `resume`: a server that stays in the list and is sent
+  nothing, across reloads and restarts.
+- `leanpool-haproxy-config set-workers`: change the worker count a server is listed with.
+- Metrics for Prometheus at the public port, without the key: `/metrics` (HAProxy's own
+  exporter), `/metrics/cache` (the cache's counters) and `/metrics/pool` (listed workers,
+  paused servers and the last day of each certificate, written by
+  `render --pool-metrics FILE [--certificates DIR]`).
+
 ## 0.1.0 - 2026-10-05
 
 The first public release. lean-pool was developed inside a private repository and had been

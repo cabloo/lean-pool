@@ -6,14 +6,22 @@ The generated configuration (HAProxy 3.0 syntax) has these parts:
 * frontend ``lean_pool`` on the public port, the one address clients know. It answers
   ``GET /health`` itself, sends checks to the cache first, and sends them straight to the Lean
   servers when the cache is down. Every answer that leaves it says how big the pool is (the
-  workers on servers that are up, the checks queued, the servers taking checks); nothing reads
-  that back.
+  open slots on servers taking checks, the checks queued, the servers taking checks); nothing
+  reads that back. It also answers a Prometheus scraper, without the key: ``GET /metrics``
+  with HAProxy's own exporter, ``GET /metrics/pool`` with a file written beside the
+  configuration (``PoolSettings.pool_metrics_file``), and ``GET /metrics/cache`` with a 503
+  while the cache is down.
 * frontend ``checkers_door`` on loopback, where the cache sends what it could not answer.
 * backend ``cache``: the cache service, with the checkers door as its backup.
+* backend ``cache_metrics``: the cache service alone, for ``GET /metrics/cache``.
 * backend ``checkers``: the Lean servers, least connections first, never more concurrent checks
-  per server than it has workers, weighted by what each server's usage agent reports. A check
-  marked as background work waits here behind every normal check.
+  per server than it has workers, or than the open slots its usage agent states; weighted by
+  what the agent reports. A health check that waits for a slow answer: a busy server is slow,
+  not dead. A check marked as background work waits here behind every normal check.
 * listener ``stats`` on loopback: HAProxy's own statistics.
+
+A paused server (``LeanServer.paused``) stays in backend ``checkers`` as a ``disabled`` server
+with no agent check: it is listed, shown in maintenance, and sent nothing.
 
 Given TLS settings (``PoolSettings.tls``), every hop that leaves the proxy's machine is
 encrypted, TLS 1.3 or later:
@@ -43,6 +51,7 @@ from leanpool.haproxy.servers import (
     ServerListError,
     parse_address,
     refuse_duplicate,
+    servers_taking_checks,
     total_workers,
 )
 from leanpool.haproxy.tls import (
@@ -55,6 +64,7 @@ from leanpool.haproxy.tls import (
     validate_tls_settings,
 )
 from leanpool.loop_guard import DEFAULT_HOP_HEADER, HOP_HEADER_VALUE
+from leanpool.metrics import CACHE_METRICS_PATH, CONTENT_TYPE, METRICS_PATH, POOL_METRICS_PATH
 from leanpool.signals import (
     BACKGROUND_PRIORITY,
     BACKGROUND_PRIORITY_CLASS,
@@ -68,11 +78,19 @@ from leanpool.signals import (
 )
 
 MAXIMUM_WEIGHT = 256
-# The variable the workers on servers that are up are summed into: once while a request is read
+# The variable the open slots on servers taking checks are summed into: once while a request is read
 # (for the body of /health) and once as an answer leaves (for the response header).
 _REQUEST_WORKERS = "txn.pool_workers"
 _RESPONSE_WORKERS = "res.pool_workers"
 AGENT_INTERVAL_SECONDS = 5
+# The health check of a Lean server. A server that shares its box answers /health slowly while it
+# is busy, and being taken out for that helps nobody: the checks it holds go on running, and it
+# comes back to a full burst. So the check waits for a slow answer and takes several misses in a
+# row to call a server down. Overload is the usage agent's matter (the open slots it states).
+HEALTH_CHECK_INTERVAL_SECONDS = 5
+HEALTH_CHECK_ANSWER_SECONDS = 15
+HEALTH_CHECK_MISSES = 4
+HEALTH_CHECK_ANSWERS_TO_RETURN = 1
 
 # A check that failed without Lean's answer is sent to another Lean server, at most this many
 # times, so a proof that crashes every worker it meets is stopped after three workers.
@@ -84,6 +102,16 @@ CHECKER_RETRY_STATUSES = (500, 502, 503, 504)
 # A request the cache dropped unanswered needs two retries to reach the backup: the first finds
 # the cache gone (which marks it down), the second is sent to the backup.
 CACHE_RETRIES = 3
+
+# What HAProxy's Prometheus exporter is asked for, whatever the scraper's own query says: the
+# process, the frontends, the backends and the servers. Left out on purpose: the exporter's
+# report on name resolution, which labels its numbers with the resolver's address.
+EXPORTER_QUERY = "scope=global&scope=frontend&scope=backend&scope=server"
+# The backend that holds the cache server alone, for GET /metrics/cache.
+CACHE_METRICS_BACKEND = "cache_metrics"
+# HAProxy keeps a file it returns in one buffer, and warns when less than its rewrite reserve
+# is left beside it. Half a buffer is far more than a pool's facts take and always leaves that.
+POOL_METRICS_BUFFER_SHARE = 2
 
 RESOLVERS_NAME = "pool_dns"
 RESOLVE_INTERVAL_SECONDS = 10
@@ -108,6 +136,7 @@ UNENCRYPTED_NOTICE = (
 
 _LOOPBACK = "127.0.0.1"
 _HEADER_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
+_FILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _INDENT = "    "
 _BYTES_PER_MEBIBYTE = 1024**2
 
@@ -130,6 +159,10 @@ class PoolSettings:
 
     ``tls`` turns encryption on: with it the public port serves HTTPS and every Lean server and
     usage agent is reached over mutual TLS; without it everything is plain HTTP.
+
+    ``pool_metrics_file`` is the name of the file HAProxy answers ``GET /metrics/pool`` with: a
+    name with no directory, for a file that lies beside the configuration (HAProxy reads it when
+    it reads the configuration). Without it the configuration has no rule for that path.
     """
 
     public_port: int = 18100
@@ -144,6 +177,7 @@ class PoolSettings:
     maximum_request_bytes: int = 262144
     maximum_connections: int = 1024
     tls: TlsSettings | None = None
+    pool_metrics_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,7 +226,8 @@ def server_weights(servers: Sequence[LeanServer]) -> dict[str, int]:
     and a pool that is merely busy would drain itself. Scaling every weight by the same factor
     keeps the ratios between servers (which is all that least-connections balancing reads) while
     leaving room below: the largest server gets close to 256, so a report of 1% still leaves it
-    in rotation.
+    in rotation. The factor comes from the largest server in the list, paused or not, so pausing
+    or resuming a server changes no other server's weight.
     """
     scale = MAXIMUM_WEIGHT // max(server.workers for server in servers)
     return {server.name: server.workers * scale for server in servers}
@@ -208,13 +243,24 @@ def worst_case_buffer_bytes(settings: PoolSettings) -> int:
     return settings.maximum_connections * BUFFERS_PER_CONNECTION * settings.maximum_request_bytes
 
 
+def maximum_pool_metrics_bytes(settings: PoolSettings) -> int:
+    """Return the largest file HAProxy is given to answer ``GET /metrics/pool`` with.
+
+    HAProxy refuses a configuration whose returned file is larger than a buffer. Half a buffer
+    is the limit here: over 100 kB with the default buffer, where a pool's facts take about a
+    hundred bytes a server.
+    """
+    return settings.maximum_request_bytes // POOL_METRICS_BUFFER_SHARE
+
+
 def agent_tunnel_ports(servers: Sequence[LeanServer], settings: PoolSettings) -> dict[str, int]:
     """Give each server's agent tunnel a loopback port; empty without TLS.
 
     The ports are the first free ones counting up from ``tls.agent_tunnel_port``, in the order
     of the server list, skipping the pool's own ports (public, checkers, statistics and the
     cache's). The same list and settings therefore always give the same ports, and a server
-    appended to the list changes no other server's port.
+    appended to the list changes no other server's port. A paused server keeps its port, which
+    nothing listens on while it is paused, so pausing changes no other server's port either.
     """
     if settings.tls is None:
         return {}
@@ -255,13 +301,15 @@ def render_haproxy_config(
         _public_frontend(settings, servers),
         _checkers_door(settings),
         _cache_backend(settings, timeouts),
+        _cache_metrics_backend(settings),
         _checkers_backend(servers, settings.tls, tunnel_ports),
         _stats_listener(settings),
     ]
     if settings.tls is not None:
         sections.append(_agent_tunnel_defaults())
         sections += [
-            _agent_tunnel(server, settings.tls, tunnel_ports[server.name]) for server in servers
+            _agent_tunnel(server, settings.tls, tunnel_ports[server.name])
+            for server in servers_taking_checks(servers)
         ]
     return "\n\n".join(sections) + "\n"
 
@@ -270,6 +318,10 @@ def validate_pool(servers: Sequence[LeanServer], settings: PoolSettings) -> None
     """Refuse a server list or settings that would produce a wrong or unsafe configuration."""
     if not servers:
         raise PoolSettingsError("the server list is empty")
+    if not servers_taking_checks(servers):
+        raise PoolSettingsError(
+            "every server in the list is paused: a pool keeps at least one server taking checks"
+        )
     try:
         for index, server in enumerate(servers):
             refuse_duplicate(servers[:index], server)
@@ -283,6 +335,12 @@ def validate_pool(servers: Sequence[LeanServer], settings: PoolSettings) -> None
         raise PoolSettingsError(
             f"hop header {settings.hop_header!r} must be letters, digits and '-', "
             "starting with a letter"
+        )
+    name = settings.pool_metrics_file
+    if name is not None and not _FILE_NAME_PATTERN.fullmatch(name):
+        raise PoolSettingsError(
+            f"the pool's metrics file cannot be named {name!r}: the configuration names it "
+            "beside itself, by letters, digits, '.', '_' and '-' (64 at most, no directory)"
         )
     if settings.tls is not None:
         _validate_tls(servers, settings, settings.tls)
@@ -364,11 +422,13 @@ def section(title: str, lines: Sequence[str]) -> str:
 def _header_comment(
     servers: Sequence[LeanServer], settings: PoolSettings, timeouts: PoolTimeouts
 ) -> str:
+    paused = [server.name for server in servers if server.paused]
     lines = [
         "# haproxy.cfg for a lean-pool, generated by leanpool-haproxy-config.",
         "# Edit the server list and render again instead of editing this file.",
         "#",
-        f"# Pool: {len(servers)} Lean servers, {total_workers(servers)} workers.",
+        f"# Pool: {len(servers) - len(paused)} Lean servers, {total_workers(servers)} workers.",
+        *([f"# Paused (listed, sent nothing): {', '.join(paused)}."] if paused else []),
         f"# Sized for checks with a Lean timeout of up to {settings.lean_timeout_seconds}s:",
         f"#   a check may wait {timeouts.queue_seconds}s in the queue for a free worker,",
         f"#   and a Lean server may take {timeouts.checker_seconds}s to answer it.",
@@ -404,6 +464,15 @@ def _global_section(settings: PoolSettings) -> str:
             f"ssl-default-server-options ssl-min-ver {MINIMUM_TLS_VERSION}",
         ]
     )
+    file_lines = (
+        []
+        if settings.pool_metrics_file is None
+        else [
+            "# A file named without a directory lies beside this one, wherever the two are put:",
+            f"# {settings.pool_metrics_file}, the answer to GET {POOL_METRICS_PATH}.",
+            "default-path config",
+        ]
+    )
     return section(
         "global",
         [
@@ -419,6 +488,7 @@ def _global_section(settings: PoolSettings) -> str:
             f"# x {settings.maximum_request_bytes} bytes = {worst_case_mebibytes} MiB. "
             "A check through the cache holds two connections.",
             f"maxconn {settings.maximum_connections}",
+            *file_lines,
         ],
     )
 
@@ -469,22 +539,36 @@ def _defaults_section(timeouts: PoolTimeouts) -> str:
     )
 
 
-def workers_up_rules(rule: str, variable: str, servers: Sequence[LeanServer]) -> list[str]:
-    """The rules that sum, into ``variable``, the workers of the servers that are up right now.
+def open_slots_rules(rule: str, variable: str, servers: Sequence[LeanServer]) -> list[str]:
+    """The rules that sum, into ``variable``, the open slots of the servers taking checks now.
 
-    HAProxy has no fetch for it, so the sum is written out: zero, then for each listed server its
-    worker count times ``srv_is_up`` (1 or 0). ``rule`` is the rule set the lines belong to
-    (``http-request`` or ``http-after-response``). A server its usage agent has drained still
-    counts while it is up: the number is the pool's size, not a promise of an idle worker.
+    A server's open slots are its limit on concurrent checks at this moment: its worker count,
+    or the lower number its usage agent last stated (``maxconn:N``). HAProxy has no fetch for a
+    server's limit, so it is put together from two it has: the checks the server holds
+    (``srv_conn``) and the room left under its limit (``srv_conn_free``). While a server holds
+    more checks than a limit that was just lowered, the sum is the checks it holds.
+
+    A server counts when it is up and its weight is not 0. A usage agent that states slots
+    drains with ``drain 0%``, and the weight of 0 is what leaves the server out here:
+    ``srv_is_up`` stays true for a drained server. A server drained by a bare ``drain`` (an agent
+    that states no slots) still counts, as it always did.
+
+    ``rule`` is the rule set the lines belong to (``http-request`` or ``http-after-response``);
+    the three working variables live in the same scope as ``variable``.
     """
-    return [
-        f"{rule} set-var({variable}) int(0)",
-        *(
+    scope = variable.split(".", maxsplit=1)[0]
+    held, slots, taking = (f"{scope}.pool_{name}" for name in ("held", "slots", "taking"))
+    lines = [f"{rule} set-var({variable}) int(0)"]
+    for server in servers:
+        name = f"checkers/{server.name}"
+        lines += [
+            f"{rule} set-var({held}) srv_conn({name})",
+            f"{rule} set-var({slots}) srv_conn_free({name}),add({held})",
+            f"{rule} set-var({taking}) srv_weight({name}),bool",
             f"{rule} set-var({variable}) "
-            f"srv_is_up(checkers/{server.name}),mul({server.workers}),add({variable})"
-            for server in servers
-        ),
-    ]
+            f"srv_is_up({name}),mul({slots}),mul({taking}),add({variable})",
+        ]
+    return lines
 
 
 def _capacity_body(status: str) -> str:
@@ -499,12 +583,54 @@ def _capacity_body(status: str) -> str:
     )
 
 
+def metrics_rules(settings: PoolSettings) -> list[str]:
+    """The frontend's answers to a Prometheus scraper: three paths, GET (and HEAD) only, no key.
+
+    Each rule ends the request in the frontend, so a scrape takes no place in the checkers'
+    queue and is never sent to a Lean server.
+
+    * ``/metrics`` is HAProxy's own exporter. The scraper's query is replaced first, so that
+      nobody asks the exporter for more than ``EXPORTER_QUERY`` names.
+    * ``/metrics/pool`` is the file beside the configuration, when the settings name one.
+      HAProxy reads it when it reads the configuration, and a missing file is a refused
+      configuration.
+    * ``/metrics/cache`` is the cache's own, reached through ``use_backend`` further down. This
+      rule is its answer while the cache server is down.
+    """
+    lines = [
+        "# For a Prometheus scraper: three paths, GET only, answered without the key like",
+        "# /health. HAProxy's own exporter reports the process, the frontends, the backends and",
+        "# the servers. The scraper's query is replaced, so that nobody asks it for more.",
+        f"http-request set-query {EXPORTER_QUERY} if METH_GET is_metrics",
+        "http-request use-service prometheus-exporter if METH_GET is_metrics",
+    ]
+    if settings.pool_metrics_file is not None:
+        lines += [
+            "# What the server list and the certificates said when this file was written: read",
+            "# from the file beside this one when HAProxy starts or reloads.",
+            f'http-request return status 200 content-type "{CONTENT_TYPE}" '
+            f"file {settings.pool_metrics_file} if METH_GET is_pool_metrics",
+        ]
+    return [
+        *lines,
+        "# The cache's counters as the cache writes them. While it is down there are none to",
+        "# read, and nothing else is asked for them.",
+        'http-request return status 503 content-type text/plain string "the cache is down\\n" '
+        "if METH_GET is_cache_metrics !cache_up",
+    ]
+
+
 def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> str:
     reply = "http-request return status {status} content-type application/json string"
     health = "http-request return status {status} content-type application/json lf-string"
     bind = f"bind :{settings.public_port}"
     if settings.tls is not None:
         bind = f"{bind} {bind_options(settings.tls.front_door_pem)}"
+    pool_metrics_acl = (
+        []
+        if settings.pool_metrics_file is None
+        else [f"acl is_pool_metrics path {POOL_METRICS_PATH}"]
+    )
     return section(
         "frontend lean_pool",
         [
@@ -512,15 +638,20 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             "acl is_health path /health",
             "acl is_check path /api/check /api/check/",
             "acl is_cache_status path /status",
+            f"acl is_metrics path {METRICS_PATH}",
+            f"acl is_cache_metrics path {CACHE_METRICS_PATH}",
+            *pool_metrics_acl,
             f"acl is_second_hop req.hdr({settings.hop_header}) -m found",
             "acl checkers_up nbsrv(checkers) gt 0",
             "# The cache server itself: nbsrv(cache) would also count its backup.",
             "acl cache_up srv_is_up(cache/cache)",
+            *metrics_rules(settings),
             "# What the pool says about itself, for clients that size themselves by it: the",
-            "# workers on servers that are up, the checks waiting for a worker, and the servers",
-            "# taking checks (up, and not drained by their usage agent).",
+            "# open slots on servers taking checks (a server's worker count, or the lower number",
+            "# its usage agent states), the checks waiting for a worker, and the servers taking",
+            "# checks (up, and not drained by their usage agent).",
             "# Advisory: nothing here or behind reads these numbers back.",
-            *workers_up_rules("http-request", _REQUEST_WORKERS, servers),
+            *open_slots_rules("http-request", _REQUEST_WORKERS, servers),
             "# Answered here, so a health probe never queues behind proofs or needs the cache.",
             health.format(status=200)
             + f" {_capacity_body('ok')} if METH_GET is_health checkers_up",
@@ -528,7 +659,7 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             + f" {_capacity_body('no Lean server is taking checks')} if METH_GET is_health",
             "# The same three numbers on every answer that leaves this door, summed again as the",
             "# answer leaves: a check may have waited minutes since its request was read.",
-            *workers_up_rules("http-after-response", _RESPONSE_WORKERS, servers),
+            *open_slots_rules("http-after-response", _RESPONSE_WORKERS, servers),
             f"http-after-response set-header {WORKERS_HEADER} %[var({_RESPONSE_WORKERS})]",
             f"http-after-response set-header {QUEUED_HEADER} %[queue(checkers)]",
             f"http-after-response set-header {SERVERS_HEADER} %[nbsrv(checkers)]",
@@ -536,6 +667,8 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             "# backup (a Lean server) must not be asked for them.",
             reply.format(status=503)
             + """ '{"status":"the cache is down"}' if is_cache_status !cache_up""",
+            "# The cache's counters for a scraper: from the cache server alone, never its backup.",
+            f"use_backend {CACHE_METRICS_BACKEND} if METH_GET is_cache_metrics",
             "use_backend cache if is_cache_status",
             "# A request that has already been through the cache is never sent to it again.",
             "use_backend checkers if is_second_hop",
@@ -584,6 +717,26 @@ def _cache_backend(settings: PoolSettings, timeouts: PoolTimeouts) -> str:
     )
 
 
+def _cache_metrics_backend(settings: PoolSettings) -> str:
+    """The backend of ``GET /metrics/cache``: the cache server, and nothing to fall back on.
+
+    Backend ``cache`` has a backup that leads to the Lean servers, which is right for a check
+    and wrong for the cache's counters. Here the cache server stands alone. ``track`` gives it
+    the state of ``cache/cache`` without a second health check, and with no retry a scrape that
+    meets a cache that has just died is answered 503 by HAProxy at once.
+    """
+    return section(
+        f"backend {CACHE_METRICS_BACKEND}",
+        [
+            f"# GET {CACHE_METRICS_PATH} alone. The cache server and no backup: a Lean server is",
+            "# never asked for the cache's counters. Its state is that of cache/cache.",
+            "retries 0",
+            default_server_line(),
+            f"server cache {settings.cache_address} track cache/cache",
+        ],
+    )
+
+
 def _checkers_backend(
     servers: Sequence[LeanServer], tls: TlsSettings | None, tunnel_ports: dict[str, int]
 ) -> str:
@@ -602,6 +755,13 @@ def _checkers_backend(
                 _tls_server_line(server, weights[server.name], tls, tunnel_ports[server.name])
                 for server in servers
             ),
+        ]
+    if any(server.paused for server in servers):
+        server_lines = [
+            "# A paused server is listed and sent nothing: `disabled` holds it in maintenance, "
+            "and it has",
+            "# no agent check, because HAProxy ends a maintenance when an agent answers `ready`.",
+            *server_lines,
         ]
     return section(
         "backend checkers",
@@ -625,6 +785,7 @@ def _checkers_backend(
             "# A name that does not resolve when the proxy starts leaves that server down instead",
             "# of stopping the proxy, and every name is looked up again while the proxy runs.",
             default_server_line(),
+            *health_check_lines(),
             *server_lines,
         ],
     )
@@ -642,11 +803,32 @@ def default_server_line() -> str:
     return f"default-server init-addr last,libc,none resolvers {RESOLVERS_NAME} resolve-prefer ipv4"
 
 
+def health_check_lines() -> list[str]:
+    """The health check of every Lean server: patient with a slow answer (see the constants)."""
+    return [
+        "# A slow /health is not a dead server: a Lean server that shares its box answers slowly",
+        f"# while it is busy. One check every {HEALTH_CHECK_INTERVAL_SECONDS}s, "
+        f"{HEALTH_CHECK_ANSWER_SECONDS}s to answer, down after {HEALTH_CHECK_MISSES} misses in a",
+        f"# row, up again after {HEALTH_CHECK_ANSWERS_TO_RETURN} answer. How many checks a busy "
+        "box is sent is its usage agent's",
+        "# matter (the open slots it states), not this check's.",
+        f"timeout check {HEALTH_CHECK_ANSWER_SECONDS}s",
+        f"default-server inter {HEALTH_CHECK_INTERVAL_SECONDS}s fall {HEALTH_CHECK_MISSES} "
+        f"rise {HEALTH_CHECK_ANSWERS_TO_RETURN}",
+    ]
+
+
+# How a paused server is declared: in maintenance from the start. It stands where the agent
+# check of a server taking checks stands.
+PAUSED_SERVER_OPTION = "disabled"
+
+
 def _server_line(server: LeanServer, weight: int) -> str:
+    agent = f"agent-check agent-port {server.agent_port} agent-inter {AGENT_INTERVAL_SECONDS}s"
     return (
         f"server {server.name} {server.address} check "
         f"maxconn {server.workers} weight {weight} "
-        f"agent-check agent-port {server.agent_port} agent-inter {AGENT_INTERVAL_SECONDS}s"
+        f"{PAUSED_SERVER_OPTION if server.paused else agent}"
     )
 
 
@@ -658,12 +840,15 @@ def _tls_server_line(server: LeanServer, weight: int, tls: TlsSettings, tunnel_p
     the certificate's name for it.
     """
     identity = tls_identity(server.name)
+    agent = (
+        f"agent-check agent-addr {_LOOPBACK} agent-port {tunnel_port} "
+        f"agent-inter {AGENT_INTERVAL_SECONDS}s"
+    )
     return (
         f"server {server.name} {server.address} {server_options(tls, identity)} "
         f"check check-ssl check-sni {identity} "
         f"maxconn {server.workers} weight {weight} "
-        f"agent-check agent-addr {_LOOPBACK} agent-port {tunnel_port} "
-        f"agent-inter {AGENT_INTERVAL_SECONDS}s"
+        f"{PAUSED_SERVER_OPTION if server.paused else agent}"
     )
 
 

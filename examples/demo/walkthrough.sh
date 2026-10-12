@@ -110,7 +110,8 @@ step "6. A Lean server goes away. The pool goes on answering, with the one that 
 check after-loss "${RUN}theorem three : 1 + 2 = 3 := by rfl"
 expect_status 200
 expect_in_body "stand-in lean-a"
-wait_for /health '"servers":1' 60
+# A Lean server is called down after four missed health checks, five seconds apart.
+wait_for /health '"servers":1' 120
 
 step "7. The cache goes away. Checks keep flowing, straight to a Lean server"
 "${COMPOSE[@]}" stop cache

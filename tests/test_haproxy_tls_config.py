@@ -138,6 +138,7 @@ def test_the_tunnels_come_after_every_http_section(config: str) -> None:
         "frontend lean_pool",
         "frontend checkers_door",
         "backend cache",
+        "backend cache_metrics",
         "backend checkers",
         "listen stats",
     ]
@@ -169,8 +170,13 @@ def test_no_listener_off_loopback_and_no_line_to_a_lean_server_or_agent_is_plain
 
     server_lines = directives(config, "server")
     plain = [(title, line) for title, line in server_lines if "ssl" not in line.split()]
-    # The only plain hops: the cache and this proxy's own door, both on loopback.
-    assert [title for title, _line in plain] == ["backend cache", "backend cache"]
+    # The only plain hops: the cache (for checks, and for its counters) and this proxy's own
+    # door, all on loopback.
+    assert [title for title, _line in plain] == [
+        "backend cache",
+        "backend cache",
+        "backend cache_metrics",
+    ]
     for _title, line in plain:
         assert line.split()[2].startswith(LOOPBACK)
     encrypted = [line for _title, line in server_lines if "ssl" in line.split()]
@@ -370,6 +376,60 @@ def test_haproxy_accepts_the_tls_configuration_without_a_warning(
     servers = [
         LeanServer(name="lean-a", host=hosts[0], port=8000, workers=4),
         LeanServer(name="lean-b", host=hosts[1], port=8000, workers=8),
+    ]
+    path = tmp_path / "haproxy.cfg"
+    path.write_text(render_haproxy_config(servers, PoolSettings(tls=certificate_files)))
+    result = subprocess.run(
+        ["haproxy", "-c", "-f", str(path)], capture_output=True, text=True, check=False
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "WARNING" not in output
+    assert "ALERT" not in output
+
+
+# --- a paused server is listed and sent nothing ---------------------------------------------------
+
+PAUSED_A = (dataclasses.replace(SERVERS[0], paused=True), SERVERS[1])
+
+
+def test_a_paused_server_keeps_its_mutual_tls_line_without_an_agent_check(config: str) -> None:
+    paused = render_haproxy_config(PAUSED_A, SETTINGS)
+    was_a, was_b = (
+        line for _title, line in directives(config, "server") if _title == "backend checkers"
+    )
+    now_a, now_b = (
+        line for _title, line in directives(paused, "server") if _title == "backend checkers"
+    )
+    assert now_b == was_b
+    assert now_a == was_a.replace(
+        "agent-check agent-addr 127.0.0.1 agent-port 18300 agent-inter 5s", "disabled"
+    )
+    assert now_a.startswith(f"server lean-a lean-a.example:8000 {MUTUAL_TLS} ")
+
+
+def test_a_paused_server_has_no_agent_tunnel_and_the_other_tunnels_keep_their_ports() -> None:
+    paused = render_haproxy_config(PAUSED_A, SETTINGS)
+    tunnels = {
+        title: lines for title, lines in sections(paused).items() if "agent_tunnel_" in title
+    }
+    assert tunnels == {
+        "listen agent_tunnel_lean-b": [
+            "bind 127.0.0.1:18301",
+            f"server agent 192.0.2.20:18250 {MUTUAL_TLS} sni str(lean-b) verifyhost lean-b",
+        ],
+    }
+    assert agent_tunnel_ports(PAUSED_A, SETTINGS) == agent_tunnel_ports(SERVERS, SETTINGS)
+    assert "lean-a.example:18200" not in paused  # nothing is said to the paused box's agent
+
+
+@pytest.mark.skipif(shutil.which("haproxy") is None, reason="HAProxy is not installed")
+def test_haproxy_accepts_the_tls_configuration_with_a_paused_server_without_a_warning(
+    tmp_path: Path, certificate_files: TlsSettings
+) -> None:
+    servers = [
+        LeanServer(name="lean-a", host="lean-a.invalid", port=8000, workers=4, paused=True),
+        LeanServer(name="lean-b", host="192.0.2.20", port=8000, workers=8),
     ]
     path = tmp_path / "haproxy.cfg"
     path.write_text(render_haproxy_config(servers, PoolSettings(tls=certificate_files)))

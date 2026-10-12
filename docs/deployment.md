@@ -192,6 +192,22 @@ and `remove` validate the whole list before they write, so a refused edit leaves
 it was. A pool that uses TLS renders and validates
 [with its certificates](tls.md#changing-a-pool-that-uses-tls).
 
+### Pausing a server, and changing its workers
+
+Two more edits of the list go the same way (edit, render to a new file, validate, move into
+place, reload):
+
+```sh
+uv run leanpool-haproxy-config pause --servers servers lean-c        # listed, and sent nothing
+uv run leanpool-haproxy-config resume --servers servers lean-c
+uv run leanpool-haproxy-config set-workers --servers servers lean-c 4
+```
+
+[A paused server](haproxy.md#a-paused-server) is sent no check and no health check until it is
+resumed, and the pause survives a reload and a restart; the reload that pauses it drops none
+of the checks it holds. Use `set-workers` after a box's own `LEAN_SERVER_MAX_REPLS` was
+changed: the list is where the pool gets the server's weight and its limit from.
+
 ### Reloading
 
 `kill -HUP 1` inside the container makes HAProxy start new workers on the new configuration
@@ -216,10 +232,21 @@ a container keeps the namespace it was started in. Until then checks flow all th
 | What is the cache doing? | `curl -s http://localhost:18100/status -H "Authorization: Bearer ..."` ([the counters](cache.md)) |
 | Which server answered which check, and how long each part took? | `docker compose logs -f haproxy`: one line per request, with HAProxy's timers. |
 | Each server's state, weight and queue | HAProxy's [statistics](haproxy.md#statistics), on loopback inside the proxy. |
+| All of it over time, in Prometheus | Scrape `/metrics`, `/metrics/cache` and `/metrics/pool` on the public port; no key is needed ([Metrics for Prometheus](haproxy.md#metrics-for-prometheus)). |
 | How long do the certificates last? (TLS) | `leanpool-pki expiry CERTIFICATE` |
 
 A server that drops out shows as `servers` and `workers` going down in `/health`. The checks it
 held are sent to another server, and it is used again as soon as its health check passes.
+
+### A box that also does other work
+
+A weight alone cannot keep checks off a box that is busy with something else: under a client
+that keeps the pool full, every worker that comes free is handed the next waiting check. An
+agent that is given the Lean server's worker count and its control group's `cpu.stat` also
+states how many checks fit beside the box's other work, and the box is sent no more.
+[Open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work) has the rule, what the
+box must arrange, and how to measure a box's own limit. The compose files here do not set it
+up.
 
 ### Sizing
 
@@ -247,7 +274,8 @@ disagree: the pool cannot tell their answers apart.
 On each box, `git pull` in the clone and `docker compose up -d --build`. On the pool box,
 render the configuration again first, because a new version may generate a different one, and
 validate it as [above](#adding-and-removing-a-server). [CHANGELOG.md](../CHANGELOG.md) says
-when a version changes an interface.
+when a version changes an interface. Bring the pool box up to date before the Lean server
+boxes: a newer agent may say things (`maxconn:N`) that only a newer configuration expects.
 
 ### What is kept, and what is not
 

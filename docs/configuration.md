@@ -34,20 +34,32 @@ reference.
 | `--stat-path` | `LEANPOOL_AGENT_STAT_PATH` | `/proc/stat` | Where CPU times are read. |
 | `--meminfo-path` | `LEANPOOL_AGENT_MEMINFO_PATH` | `/proc/meminfo` | Where available memory is read. |
 | `--loadavg-path` | `LEANPOOL_AGENT_LOADAVG_PATH` | `/proc/loadavg` | Where the load average is read. |
+| `--workers` | `LEANPOOL_AGENT_WORKERS` | optional | The Lean server's worker count: the most open slots the agent ever states. Slots are stated only when this and `--lean-cpu-stat-path` are both given (see [Open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work)). |
+| `--lean-cpu-stat-path` | `LEANPOOL_AGENT_LEAN_CPU_STAT_PATH` | optional | The `cpu.stat` file (cgroup v2) of the control group the Lean server runs in. The server's own CPU use is read from it. |
+| `--cpu-reserve` | `LEANPOOL_AGENT_CPU_RESERVE` | `1.0` | Cores left free beside the box's other work before a check counts as fitting. |
+| `--cpu-topology-path` | `LEANPOOL_AGENT_CPU_TOPOLOGY_PATH` | `/sys/devices/system/cpu` | Where the kernel says which logical CPUs share a core. Slots are counted in cores. |
+| `--slots-beside-other-work` | `LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK` | not set | The most open slots stated while the box also runs other work (a CPU or more busy with something else): a number measured for the box. Not set: no such limit. |
 
 ## `leanpool-haproxy-config`
 
 ```
-leanpool-haproxy-config add        --servers FILE NAME HOST:PORT WORKERS [--agent-port PORT]
-leanpool-haproxy-config remove     --servers FILE NAME
-leanpool-haproxy-config list       --servers FILE
-leanpool-haproxy-config render     --servers FILE [options] > haproxy.cfg
-leanpool-haproxy-config render-box [options] > box-haproxy.cfg
+leanpool-haproxy-config add         --servers FILE NAME HOST:PORT WORKERS [--agent-port PORT]
+leanpool-haproxy-config remove      --servers FILE NAME
+leanpool-haproxy-config pause       --servers FILE NAME
+leanpool-haproxy-config resume      --servers FILE NAME
+leanpool-haproxy-config set-workers --servers FILE NAME WORKERS
+leanpool-haproxy-config list        --servers FILE
+leanpool-haproxy-config render      --servers FILE [options] > haproxy.cfg
+leanpool-haproxy-config render-box  [options] > box-haproxy.cfg
 ```
 
 `--servers` may also be given as `LEANPOOL_HAPROXY_SERVERS`. `add` takes `--agent-port` when the
-box's usage agent does not listen on 18200. `list` prints the validated servers and the pool's
-total worker count. `render` writes the pool proxy's configuration; `render-box` writes the
+box's usage agent does not listen on 18200. `pause` and `resume` mark and unmark a server in the
+list (see [A paused server](haproxy.md#a-paused-server)). `set-workers` changes the worker count
+a server is listed with, after the box's own `LEAN_SERVER_MAX_REPLS` was changed: the count is
+the server's weight, its limit until its usage agent first answers after a reload, and the size
+the admission test is run at. `list` prints the validated servers and the worker count of those
+taking checks. `render` writes the pool proxy's configuration; `render-box` writes the
 configuration of one Lean server box's TLS front (see [TLS](tls.md)) and takes no server list.
 Exit status: 0 on success, 1 when the input was refused (nothing is written), 2 on a usage
 error.
@@ -71,10 +83,17 @@ Options of `render`:
 | `--tls-ca-file` | `LEANPOOL_HAPROXY_TLS_CA_FILE` | none | The pool authority's certificate. Every Lean server's certificate is checked against it. |
 | `--tls-client-pem` | `LEANPOOL_HAPROXY_TLS_CLIENT_PEM` | none | The proxy's client certificate and key in one file, presented to every Lean server. |
 | `--agent-tunnel-port` | `LEANPOOL_HAPROXY_AGENT_TUNNEL_PORT` | `18300` | With TLS, the first of the loopback ports the usage agents are asked through: one per server, counting up. |
+| `--pool-metrics` | `LEANPOOL_HAPROXY_POOL_METRICS` | none | Also write the pool's facts for a Prometheus scraper to this file, and have HAProxy answer `GET /metrics/pool` with it. Install the file beside `haproxy.cfg` under the same name. See [Metrics for Prometheus](haproxy.md#metrics-for-prometheus). |
+| `--certificates` | `LEANPOOL_HAPROXY_CERTIFICATES` | none | With `--pool-metrics`: a directory of public certificates. The end of validity of every `*.crt` file under it is written to the facts, under the file's path there. |
 
 The three TLS files are paths as HAProxy sees them (inside its container). They are written into
 the configuration, not read by `render`, so they are absolute paths of letters, digits, `.`,
 `_`, `-` and `/`.
+
+`--pool-metrics` is the one file `render` writes itself, and `--certificates` the one directory
+it reads: both are paths on the machine `render` runs on. The configuration names the file by
+its last part alone (`pool.metrics`), which must be letters, digits, `.`, `_` and `-`. A server
+list or a setting that is refused writes no file.
 
 Options of `render-box`:
 
@@ -91,8 +110,9 @@ Options of `render-box`:
 | `--maximum-connections` | `LEANPOOL_HAPROXY_MAXIMUM_CONNECTIONS` | `1024` | HAProxy's global connection limit (`maxconn`). |
 
 The server list is a text file, one server per line, `NAME HOST:PORT WORKERS [AGENT_PORT]`; `#`
-starts a comment ([example](../deploy/pool/servers.example)). Every field is validated strictly, because
-every field ends up inside `haproxy.cfg`:
+starts a comment ([example](../deploy/pool/servers.example)). The word `paused` as a line's last
+field marks a paused server. Every field is validated strictly, because every field ends up
+inside `haproxy.cfg`:
 
 * `NAME`: letters, digits, `_`, `.`, `-`; starts with a letter or digit; at most 63 characters; unique.
   With TLS the name is what the server's certificate is checked against, so it must also be a DNS
@@ -102,9 +122,12 @@ every field ends up inside `haproxy.cfg`:
 * `PORT`, `AGENT_PORT`: 1 to 65535, plain decimal digits. `AGENT_PORT` is 18200 when left out.
 * `WORKERS`: 1 to 256, the server's `LEAN_SERVER_MAX_REPLS`.
 
-`add` and `remove` validate the whole resulting list before writing anything, and write through
-a temporary file renamed over the original: a refused edit leaves the file byte-identical, and a
-reader never sees a half-written list. `render` refuses a malformed list and an empty one.
+`add`, `remove`, `pause`, `resume` and `set-workers` validate the whole resulting list before
+writing anything, and write through a temporary file renamed over the original: a refused edit
+leaves the file byte-identical, and a reader never sees a half-written list. `pause`, `resume`
+and `set-workers` change one word of one line and leave every other character of the file as it
+was. `set-workers` is refused for the count the server already has. `render` refuses a
+malformed list, an empty one, and one in which every server is paused.
 
 ## `leanpool-admit`
 

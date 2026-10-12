@@ -58,6 +58,17 @@ def parse_positive_number(text: str) -> float:
     return value
 
 
+def parse_non_negative_number(text: str) -> float:
+    """Read a finite number of zero or more, such as a count of CPUs to leave free."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{text!r} is not a number") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{text!r} is not a number of zero or more")
+    return value
+
+
 def parse_switch(text: str) -> bool:
     """Read an on/off value from an environment variable (1/0, true/false, yes/no, on/off)."""
     word = text.strip().lower()

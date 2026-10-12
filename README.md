@@ -13,7 +13,8 @@ lean-pool generates its configuration and adds what a load balancer does not do 
 
 * a **shared result cache** that knows which of Lean's answers are safe to give again;
 * **load balancing by real headroom**: every machine reports its idle CPU and available
-  memory, and receives checks in proportion;
+  memory, and receives checks in proportion; one that is also busy with other work is sent
+  only the checks that fit beside it;
 * **failover that leaves Lean's verdicts alone**: a check goes to another server only when it
   got no answer from Lean (a lost connection, a crashed worker, a gateway error);
 * an **admission test** that keeps a server with the wrong Lean or Mathlib out of the pool;
@@ -56,7 +57,7 @@ workstation, two desktops and a laptop, each also used for other work.
 | The gap | What lean-pool does |
 |---|---|
 | **The same proof is checked again and again.** Provers resubmit the same proof of the same statement across samples, epochs and reruns. Kimina has no cache between servers, and an ordinary HTTP cache cannot be one: a check is a `POST` identified by its body, every attempt carries its own id, and a Lean timeout comes back as HTTP 200. | The [cache](docs/cache.md) answers a repeat from its store, under the caller's own id, and lets identical checks in flight share one worker. It stores only a verdict Lean would give again: a timeout, a crashed worker or an out-of-memory failure is passed on and never stored. |
-| **Machines differ, and are busy with other things.** A balancer that knows nothing sends a 4-core laptop as much as a 32-core workstation, and keeps sending to a box that has started to swap. | Each server gets [at most as many checks as it has workers](docs/haproxy.md), and the rest wait in one queue instead of timing out on a busy box. A small [usage agent](docs/usage-agent.md) on each box reports idle CPU and available memory, and HAProxy scales that box's share by it, down to draining a box that runs out of memory. |
+| **Machines differ, and are busy with other things.** A balancer that knows nothing sends a 4-core laptop as much as a 32-core workstation, and keeps sending to a box that has started to swap. | Each server gets [at most as many checks as it has workers](docs/haproxy.md), and the rest wait in one queue instead of timing out on a busy box. A small [usage agent](docs/usage-agent.md) on each box reports idle CPU and available memory, and HAProxy scales that box's share by it, down to draining a box that runs out of memory. A box that also runs other work states [how many checks fit beside it](docs/usage-agent.md#open-slots-a-box-that-also-does-other-work), counted in cores, and is sent no more. |
 | **Retries can change what you measure.** A balancer that retries a slow check elsewhere turns "timed out" into "passed on a faster box". | A Lean timeout is passed on as it is and [never retried](docs/haproxy.md#failover-among-the-lean-servers). Only a check that got no answer from Lean (a lost connection, a crashed worker, a gateway error) goes to another server, at most twice. |
 | **A server on the wrong version answers confidently and wrongly**, and behind a balancer its answers look like everyone else's. | A server is [tested alone](docs/admission.md) against proofs that must verify and near misses that must not, before it is added. |
 
@@ -192,6 +193,10 @@ and [size itself](docs/clients.md#the-pools-size) from what every answer says ab
 (`X-Lean-Pool-Workers: 37`). [examples/pool_client.py](examples/pool_client.py) does both in
 about 250 lines.
 
+The same address answers a Prometheus scraper, without the key: what every server is doing,
+the cache's counters, and each certificate's last day
+([metrics](docs/haproxy.md#metrics-for-prometheus)).
+
 ## Documentation
 
 | | |
@@ -201,8 +206,8 @@ about 250 lines.
 | [TLS](docs/tls.md) | The pool's own certificate authority, step by step; what is encrypted and who holds which key. |
 | [Joining over the network](docs/joining.md) | Letting a new box request its certificate over HTTPS. |
 | [Cache semantics](docs/cache.md) | The key, what is stored and what never is, bypass, single flight. |
-| [The usage agent](docs/usage-agent.md) | The weight formula, and what HAProxy does with it. |
-| [The generated HAProxy configuration](docs/haproxy.md) | Failover, buffers, name resolution, timeouts, losing the cache. |
+| [The usage agent](docs/usage-agent.md) | The weight formula, what HAProxy does with it, and open slots for a box that also does other work. |
+| [The generated HAProxy configuration](docs/haproxy.md) | Pausing a server, the health check, failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus. |
 | [Admission](docs/admission.md) | Testing a Lean server alone before it joins. |
 | [Configuration reference](docs/configuration.md) | Every flag and environment variable of the six commands. |
 | [What is tested, and what is not verified](docs/verification.md) | The test suite, the deployment's record, and the gaps. |
@@ -225,7 +230,7 @@ configuration.
 | `leanpool-pki` | The pool's certificate authority: issues, signs and inspects certificates. |
 | `leanpool-join` | An HTTPS service that carries a new box's signing request to the pool and its certificate back. It executes nothing: the script a box runs and whatever acts on a request are yours. |
 
-The code is typed (`mypy --strict`), linted, and held to about 1,200 test cases, among them
+The code is typed (`mypy --strict`), linted, and held to about 1,500 test cases, among them
 ones that run a real HAProxy on the generated configuration and take servers and the cache away
 under load.
 

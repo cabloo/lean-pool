@@ -121,7 +121,7 @@ computed by HAProxy as the answer leaves:
 
 | Header | What it counts |
 |---|---|
-| `X-Lean-Pool-Workers` | workers on the Lean servers that are up now, including a server its usage agent has drained |
+| `X-Lean-Pool-Workers` | open slots on the Lean servers taking checks now: for each, its worker count, or the lower number its usage agent states |
 | `X-Lean-Pool-Queued` | checks waiting in the queue for a worker, of both priorities |
 | `X-Lean-Pool-Servers` | Lean servers that are taking checks now: up, and not drained by their usage agent |
 
@@ -142,7 +142,14 @@ older configuration sends none), and should never exceed a ceiling of its own, w
 says. `leanpool.signals` holds the names and two small readers (`capacity_from_headers`,
 `capacity_from_health`) that return `None` for anything they cannot read.
 
-A server that its usage agent has drained stays in the workers while it is up, and leaves the
-servers: the workers are the pool's size, not a promise of an idle worker. While every server
-is drained the pool takes nothing, and says so: `GET /health` and every check are answered 503,
-with the workers still counted and `"servers":0`.
+The workers are the pool's size, not a promise of an idle worker. A server whose usage agent
+states [open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work) counts for that
+many: a box that is busy with other work makes the pool smaller, and a client that follows the
+number shrinks with it. While that agent has drained the server it counts for none. A server
+drained by an agent that states no slots (a bare `drain`) stays in the workers while it is up,
+and leaves the servers. While a server holds more checks than a limit that was just lowered,
+it counts for the checks it holds. A [paused](haproxy.md#a-paused-server) server adds nothing
+to either number.
+
+While every server is drained the pool takes nothing, and says so: `GET /health` and every
+check are answered 503 at once, with `"servers":0`. Pause and ask again.

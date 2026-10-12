@@ -7,7 +7,7 @@ establishes.
 ## The test suite
 
 Two kinds of tests, neither of which needs Docker, the network or a Lean server. Lean servers
-are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1,200 test
+are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1,500 test
 cases.
 
 ### Tests that always run
@@ -19,6 +19,16 @@ cases.
   bypass; single flight; request order; eviction order and the size cap; authentication; that
   the cache does not cap concurrency (150 checks in flight at once);
 * the agent: the formula, the reply format, that the CPU share needs two readings, `drain`;
+  open slots from made-up readings of a 16-CPU box with 13 workers (other work on 0, 9.6 and
+  14.2 CPUs gives 13, 5 and none; the Lean server's own use lowers none), down at once and up
+  by one, never `maxconn:0`, the worker count when the control group cannot be read, and
+  replies that are what they were, to the character, for an agent not told how to measure;
+  slots counted in cores (20 threads on 12 cores, eight of them of two threads, with other work
+  on 8.4: 2, not 10; 16 cores of two threads with other work on 12: 6), the topology read from
+  the kernel's files, each core with its own number of threads, and left out where it
+  describes other CPUs; a box's limit beside other work coming on at one CPU of other work and
+  at once, never raising what the cores give, 0 as a drain, and the slots back one a reading
+  when the box is free;
 * the admission test: verdicts, import hoisting, the report and every exit status. Over TLS,
   against in-process servers that require a client certificate: admission passes when the server
   is dialled by address and named by `--tls-server-name`; another name, another authority, an
@@ -38,6 +48,17 @@ cases.
   a Python TLS server that requires a client certificate refuses a server certificate;
 * the TLS configurations, line by line, every refusal, and the property that with TLS no
   listener off loopback and no line to a Lean server or agent is plain;
+* pausing: a paused server's line in the list and in the configuration, with and without TLS,
+  that no other server's line moves, and every refusal (the last server taking checks, a list
+  of paused servers only); `set-workers` changing one word of one line, and refused for the
+  count a server already has;
+* the metrics: the rules of the three paths and their order before every routing rule, which is
+  what it was; the cache route's text to the character, that it counts what `/status` counts and
+  needs no key while `/status` still does; the pool's facts from a list with a paused server and
+  three certificates, to the character; a certificate's last moment equal to what `cryptography`
+  reads, for a date written with two digits of the year and with four, and a refusal for
+  everything that is not a certificate (a certificate cut at every length is refused or read
+  right, never anything else); facts over the size limit refused with nothing written;
 * the join service: each of its requests, 404 for everything without the token, the
   one-box-per-window rule (from a second loopback address where the machine has one), every
   malformed request, the 16 KiB limit, what is written to the spool and when, and that neither
@@ -60,9 +81,10 @@ cases.
 
 ### Tests that run only where `haproxy` is installed
 
-`tests/test_haproxy_live.py`, `tests/test_tls_live.py` and the walkthrough in
-`tests/test_demo.py`; skipped otherwise. They start a real HAProxy on the generated configuration, in front of the real
-cache and fake Lean servers on loopback, and show what HAProxy does with it:
+`tests/test_haproxy_live.py`, `tests/test_tls_live.py`, `tests/test_metrics_live.py` and the
+walkthrough in `tests/test_demo.py`; skipped otherwise. They start a real HAProxy on the
+generated configuration, in front of the real cache and fake Lean servers on loopback, and
+show what HAProxy does with it:
 
 * a check goes through the cache and a repeat never reaches a Lean server; `/health` and
   `/status` answer as described, with the cache up and down;
@@ -82,8 +104,20 @@ cache and fake Lean servers on loopback, and show what HAProxy does with it:
   beside it is unaffected; a server whose address changes is followed;
 * HAProxy applies the usage agent's replies: 50% halves the weight, 1% leaves the server in
   rotation, `drain` drains it, and the next normal reply restores it;
-* a drained server stays in the workers the pool reports and leaves its servers, and takes no
-  check; with every server drained `/health` and a check are both answered 503.
+* a server drained by a bare `drain` stays in the workers the pool reports and leaves its
+  servers, and takes no check; with every server drained `/health` and a check are both
+  answered 503;
+* with a queue standing, a server whose agent states 2 open slots holds 2 checks while its
+  neighbour holds 4 and two checks wait; with 4 stated it holds 4; drained (`drain 0%`) it stays
+  up, finishes the checks it holds and is sent none; `/health`, a check and a cache hit say 6,
+  then 8, then 4 workers; a limit stays until another is stated, and `maxconn:0` lifts it;
+* a Lean server whose `/health` takes 3 seconds to answer stays up;
+* a paused server whose usage agent keeps answering `ready up 100%` stays in maintenance: it is
+  sent no check and no health check, and `/health` and every answer count the other server's 4
+  workers alone;
+* with every worker of two servers holding a check, a reload that pauses one server loses none
+  of the 8: they all finish, new checks reach the other server only, and a reload that resumes
+  the server gives it its share again.
 
 With TLS (`tests/test_tls_live.py`), the pool proxy and each box's TLS front are real HAProxy
 processes on the generated configurations, with throwaway certificates made by `leanpool.pki`:
@@ -115,13 +149,38 @@ processes on the generated configurations, with throwaway certificates made by `
 * where `curl` is installed, `curl -k --pinnedpubkey` with the pin `leanpool-pki pin` prints
   reaches the front door, and with another pin exits 90 having fetched nothing.
 
+The metrics paths (`tests/test_metrics_live.py`), on a real HAProxy in front of the real cache:
+
+* a scraper with no key reads all three paths; the exporter's answer holds every name a
+  dashboard of the pool reads, a paused server as `MAINT`, and the checks a server answered; the
+  cache's counters are the cache's; the facts are the file, byte for byte; `/status` is still
+  401;
+* no answer holds the key, a proof, an address or a port of the pool;
+* whatever query the scraper sends (`scope=resolvers`, `no-maint`), the exporter's answer has
+  the same samples;
+* with the cache stopped, `/metrics/cache` is 503 from its first moment and
+  `the cache is down` once HAProxy has marked it, a check still passes through the backup, the
+  Lean server saw that check and no scrape, and the other two paths and `/health` answer;
+* `HEAD` is answered with no body; `POST`, `PUT` and `DELETE` to the three paths, and a `GET`
+  of six paths beside them, reach the Lean server as before;
+* with every worker held and two checks waiting, all three paths answer at once and the
+  exporter reports the queue it did not join;
+* a pause and a resume are in the facts and in the exporter's answer once the proxy is reloaded;
+* facts of exactly the size limit (128 KiB) are served whole;
+* a TLS pool, rendered by `render --pool-metrics --certificates` itself, answers a scraper that
+  trusts the pool's authority and holds no key or client certificate, with each certificate's
+  last moment as `cryptography` reads it.
+
 The demo's [walkthrough](../examples/demo/walkthrough.sh) is run the same way: its stand-in
 Lean servers, usage agents and cache as plain processes behind a real HAProxy on the
 configuration rendered for them. Every step must behave as the script says, including a Lean
 server and the cache being stopped and started again.
 
-These have been run against HAProxy 3.0.29, the binary of the official `haproxy:3.0` image, and
-`haproxy -c` accepts every generated file with no warning.
+These have been run against HAProxy 3.0.29, the version of the official `haproxy:3.0` image,
+and `haproxy -c` accepts every generated file with no warning. It must be an `haproxy` built
+with the Prometheus exporter (`USE_PROMEX=1`), as the official images and the distributions'
+packages are. On one built without it every test that starts the pool **fails**, saying that
+the exporter is missing; they are not skipped, because the pool itself would not start there.
 
 ### Continuous integration
 
@@ -189,6 +248,23 @@ flight, a Lean limit of 120 s, 68 minutes:
 start were 403,933 hits, 22,011 checks that joined an identical one in flight and 556,669
 misses, with 781,151 results stored in 853 MB and none evicted.
 
+**Boxes that also do other work, 10 to 12 October 2026.** Three of the pool's four machines
+run other jobs beside their Lean server. The open slots, a box's own limit, the patient health
+check, the pause and the metrics paths were each built against what that showed:
+
+* the measurements quoted on
+  [the usage agent's page](usage-agent.md#open-slots-a-box-that-also-does-other-work) (cores
+  against threads, and what a check costs the work beside it on two boxes) were taken there,
+  each once;
+* on 12 October 2026, under a client that kept the pool full, `GET /health` answered
+  `{"status":"ok","workers":16,"queued":22,"servers":3}` for four listed servers of 12, 3,
+  6 and 9 workers. The 9-worker box was busy with other work and has a limit of 0 beside it:
+  its agent had drained it. The 6-worker box has a limit of 1 and counted for 1;
+* that day a server's listed worker count was changed (`set-workers`) and the proxy reloaded
+  during a run: the 302 answers at the front door in the two minutes around it were all 200;
+* the three metrics paths have been scraped there by a Prometheus since 12 October 2026, on
+  the official `haproxy:3.0` image.
+
 Not part of that deployment, and run once by hand against the demo's pool, whose Lean servers
 are stand-ins: Kimina's own Python client (`kimina-client` 0.2.1), unchanged but for the
 address. Its single and its batched requests were answered, and repeats came from the cache.
@@ -213,6 +289,11 @@ address. Its single and its batched requests were answered, and repeats came fro
 * **Kimina's published image has not been used.** The deployment builds Kimina from source at
   one commit. The fakes and the stand-in follow Kimina's interface as read from that source.
 * **What TLS costs** in CPU or throughput has not been measured, beyond the timers above.
+* **What a check costs the work beside it** was measured on three machines of one deployment
+  and differed on each. Nothing here says what it is on yours: measure the box
+  ([how](usage-agent.md#open-slots-a-box-that-also-does-other-work)).
+* **What a scrape of the exporter costs HAProxy** (about 80 kB of text for a pool of two
+  servers without TLS, about 129 kB for four with it) has not been measured.
 * **A reboot of the pool's host** has not been tested: whether every container comes back is
   Docker's `restart: unless-stopped`, taken on trust.
 * **A real Lean server of the wrong version** has not been refused in the deployment. The

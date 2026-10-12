@@ -19,7 +19,10 @@ All four must pass; CI runs them on Python 3.11, 3.12 and 3.13.
 
 With `haproxy` 3.0 on the `PATH`, `uv run pytest` also runs the tests that start a real HAProxy
 on the generated configuration, and the demo's walkthrough. They take about a minute and a half
-and are reported as skipped where HAProxy is not installed. A few tests compare with `openssl`
+and are reported as skipped where HAProxy is not installed. It must be an HAProxy built with the
+Prometheus exporter (`USE_PROMEX=1`, as the official images and distribution packages are):
+the pool's configuration uses it, so on a build without it these tests fail, each saying so.
+A few tests compare with `openssl`
 or drive `curl`, and are skipped where those are missing. Nothing in the suite needs Docker, the
 network or a Lean server.
 

@@ -15,8 +15,10 @@ item follows from a rule described on another page.
   once, never retried and never stored, so the same check sent again may land on another box
   and finish. Likewise a check that crashes a worker on a small box (out of memory, say) is
   tried on another server, which may be a larger one.
-* While every Lean server is drained by its usage agent (each is below its memory floor),
-  the pool answers `GET /health` and every check with 503 although the servers are up.
+* While every Lean server is drained by its usage agent (each is below its memory floor, or
+  has no room for a check beside its box's other work), the pool has no server to give a check
+  to: it answers `GET /health` and every check with 503 at once, although the servers are up.
+  It does not queue. A client asks again.
 * The cache shares the proxy's network namespace. If the proxy's container is restarted, the
   cache must be restarted after it, and until then the pool runs uncached.
 * The cache trusts the pin. If the Lean servers' image changes and the pin does not, old answers
@@ -27,7 +29,40 @@ item follows from a rule described on another page.
 * The usage agent's CPU figure is the whole box's idle share, so it includes the Lean server's
   own load: a pool that is busy with its own checks reports low percentages on every box.
   Weights are relative, so this still balances; it does not measure how much of the load is
-  someone else's.
+  someone else's. [Open slots](usage-agent.md#open-slots-a-box-that-also-does-other-work) do,
+  and need what the weight does not: cgroup v2, and a control group that holds the Lean server
+  and nothing else.
+* Open slots count CPUs only. A check is taken to need one thread; memory lowers the weight
+  and, at the floor, drains.
+* What other work can carry is not computed. `--slots-beside-other-work` is a number someone
+  measured on that box, for the work that ran there that day; other work may be more or less
+  sensitive, and a box given no number shares by the count of cores alone, which was measured to
+  slow lightly loaded work by a quarter.
+* Other work is taken to hold one core for each thread it keeps busy. Work that packs two of its
+  own threads onto one core leaves more cores than the agent counts, so the count errs toward
+  fewer checks. On a box that mixes cores of two threads and cores of one, other work is taken
+  to hold the two-thread cores first: right for the usual desktop, whose two-thread cores are its
+  fast ones, and erring toward fewer checks anywhere else. Contention for memory or cache between
+  a check and other work on different cores is not counted at all.
+* A server's limit (its open slots, or its worker count) is exact for checks that arrive one
+  after another. HAProxy 3.0.29 places checks on several threads at once, and of checks that
+  arrive in the same instant one can go over: of 450 lots of eight held checks sent at once to
+  two servers of four workers, three left a server holding five, and four left a check waiting
+  in a full server's own queue while the other had a worker free. Either ends when a check on
+  that server ends.
+* HAProxy keeps a limit an agent stated, and forgets it on a reload: a reloaded proxy holds
+  every server to its worker count again until that server's agent next answers (5 seconds).
+* A check that is running is never stopped. When a box's other work grows, the checks it holds
+  finish slowly, and one of them may reach its Lean timeout where it would not have on a free
+  box; new checks stop arriving within one reading.
+* A Lean server that has stopped is noticed after 4 missed health checks: about 20 seconds when
+  its port refuses connections, up to about 100 when it accepts them and says nothing
+  ([the health check](haproxy.md#the-health-check)).
+* The generated configuration needs an HAProxy built with its Prometheus exporter
+  (`USE_PROMEX=1`), as the official images are. One built without it refuses the configuration.
+* The three [metrics paths](haproxy.md#metrics-for-prometheus) are answered to anyone who can
+  reach the public port, without the key: server and certificate names, and numbers. A `GET` of
+  those three paths no longer reaches a Lean server.
 * The percentage is applied in whole numbers. A server whose configured weight is below 100
   (one with less than about 40% of the largest server's workers) reaches weight 0, and gets no
   new checks, when its agent reports less than `100 / weight` percent.

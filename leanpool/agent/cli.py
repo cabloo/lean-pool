@@ -18,9 +18,11 @@ from leanpool.agent.readings import ReadingError
 from leanpool.agent.server import AgentSettings, run_agent
 from leanpool.environment import (
     SettingsParser,
+    parse_non_negative_number,
     parse_port,
     parse_positive_integer,
     parse_positive_number,
+    parse_whole_number,
 )
 
 _BYTES_PER_MEBIBYTE = 1024**2
@@ -47,7 +49,8 @@ def parse_settings(
     defaults = AgentSettings()
     parser = argparse.ArgumentParser(
         prog="leanpool-agent",
-        description="Report this box's CPU and memory headroom to HAProxy (agent-check).",
+        description="Report this box's CPU and memory headroom to HAProxy (agent-check), and, "
+        "when told how to measure it, how many checks fit beside the box's other work.",
         allow_abbrev=False,
     )
     settings = SettingsParser(parser, environment)
@@ -97,6 +100,47 @@ def parse_settings(
         defaults.loadavg_path,
         "where to read the load average",
     )
+    settings.add(
+        "--workers",
+        "LEANPOOL_AGENT_WORKERS",
+        parse_positive_integer,
+        None,
+        "the Lean server's worker count: the most open slots the agent ever states. Slots are "
+        "stated only when this and --lean-cpu-stat-path are both given",
+        optional=True,
+    )
+    settings.add(
+        "--lean-cpu-stat-path",
+        "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH",
+        Path,
+        None,
+        "the cpu.stat file (cgroup v2) of the control group the Lean server runs in, from which "
+        "the server's own CPU use is read",
+        optional=True,
+    )
+    settings.add(
+        "--cpu-reserve",
+        "LEANPOOL_AGENT_CPU_RESERVE",
+        parse_non_negative_number,
+        defaults.cpu_reserve,
+        "cores left free beside the box's other work before a check counts as fitting",
+    )
+    settings.add(
+        "--cpu-topology-path",
+        "LEANPOOL_AGENT_CPU_TOPOLOGY_PATH",
+        Path,
+        defaults.cpu_topology_path,
+        "where the kernel says which logical CPUs share a core (slots are counted in cores)",
+    )
+    settings.add(
+        "--slots-beside-other-work",
+        "LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK",
+        parse_whole_number,
+        None,
+        "the most open slots stated while the box also runs other work (a CPU or more busy with "
+        "something else): a number measured for the box. Not given: no such limit",
+        optional=True,
+    )
     options = parser.parse_args(arguments)
     return AgentSettings(
         host=options.host,
@@ -107,6 +151,11 @@ def parse_settings(
         stat_path=options.stat_path,
         meminfo_path=options.meminfo_path,
         loadavg_path=options.loadavg_path,
+        workers=options.workers,
+        cpu_reserve=options.cpu_reserve,
+        lean_cpu_stat_path=options.lean_cpu_stat_path,
+        cpu_topology_path=options.cpu_topology_path,
+        slots_beside_other_work=options.slots_beside_other_work,
     )
 
 

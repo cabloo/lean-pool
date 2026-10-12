@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import re
 import shutil
 import socket
 import subprocess
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,13 +27,38 @@ from fake_lean_server import FakeLeanServer
 from support import API_KEY, AUTHORIZED, PIN
 
 from leanpool.cache import CacheSettings, create_application
-from leanpool.haproxy import LeanServer, PoolSettings, render_haproxy_config
+from leanpool.haproxy import (
+    LeanServer,
+    PoolSettings,
+    maximum_pool_metrics_bytes,
+    render_haproxy_config,
+    render_pool_metrics,
+    write_pool_metrics,
+)
 from leanpool.signals import PRIORITY_HEADER, PoolCapacity, capacity_from_headers
 
 HAPROXY = shutil.which("haproxy")
 WORKERS = 4
 _STARTUP_SECONDS = 30.0
 _WILDCARD_BIND = re.compile(r"^(\s*bind) :(\d+)", re.MULTILINE)
+# The pool's configuration answers GET /metrics with HAProxy's Prometheus exporter, which is a
+# build option. A test of the pool on an HAProxy built without it fails with these words: it is
+# not skipped, because the pool itself would not start there.
+MISSING_EXPORTER = (
+    f"the haproxy on PATH ({HAPROXY}) was built without the Prometheus exporter "
+    "(`haproxy -vv` does not list prometheus-exporter under its services; build it with "
+    "USE_PROMEX=1). The pool's configuration answers GET /metrics with that exporter, and an "
+    "HAProxy without it refuses the configuration"
+)
+
+
+@functools.cache
+def haproxy_has_exporter() -> bool:
+    """Whether the ``haproxy`` on ``PATH`` lists the Prometheus exporter among its services."""
+    assert HAPROXY is not None
+    built = subprocess.run([HAPROXY, "-vv"], capture_output=True, text=True, check=False).stdout
+    services = [line for line in built.splitlines() if line.startswith("Available services :")]
+    return any("prometheus-exporter" in line for line in services)
 
 
 # Every port a test was given, so that no two tests and no two listeners of one test get the
@@ -94,6 +120,8 @@ class RunningHaproxy:
     directory: Path
     name: str = "haproxy"
     _process: subprocess.Popen[bytes] | None = None
+    # Processes a reload replaced: each ends by itself once the requests it holds have ended.
+    _replaced: list[subprocess.Popen[bytes]] = field(default_factory=list)
 
     async def start(self, config: str, port: int) -> None:
         """Run HAProxy on ``config`` and wait until it accepts connections on ``port``."""
@@ -110,16 +138,40 @@ class RunningHaproxy:
             assert time.monotonic() < deadline, f"HAProxy did not start:\n{self.log}"
             await asyncio.sleep(0.05)
 
+    def reload(self, config: str) -> None:
+        """Hand over to a new HAProxy on ``config`` without dropping a request.
+
+        The new process (``-sf``) binds the same ports, then tells the running one to stop
+        listening and to end once the requests it holds have ended. That is the hand-over a
+        master process makes to a new worker when a deployment reloads it (``kill -HUP``); it
+        is done by hand here so that the test needs no master process.
+        """
+        assert HAPROXY is not None
+        assert self._process is not None, "HAProxy has not been started"
+        path = self.directory / f"{self.name}.cfg"
+        path.write_text(on_loopback(config))
+        replaced = self._process
+        with (self.directory / f"{self.name}.log").open("ab") as log:
+            self._process = subprocess.Popen(
+                [HAPROXY, "-db", "-f", str(path), "-sf", str(replaced.pid)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        self._replaced.append(replaced)
+
     def stop(self) -> None:
-        if self._process is None:
-            return
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
+        processes = [*self._replaced, *([] if self._process is None else [self._process])]
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
         self._process = None
+        self._replaced.clear()
 
     @property
     def log(self) -> str:
@@ -154,6 +206,9 @@ class LivePool:
     checkers_port: int = field(default_factory=free_port)
     stats_port: int = field(default_factory=free_port)
     cache_port: int = field(default_factory=free_port)
+    # The name of the pool's facts file for GET /metrics/pool, beside the configuration. With
+    # none the configuration has no rule for that path, as it has none without --pool-metrics.
+    pool_metrics_file: str | None = None
     _haproxy: RunningHaproxy | None = None
     _cache: TestServer | None = None
 
@@ -168,6 +223,7 @@ class LivePool:
             checkers_port=self.checkers_port,
             stats_port=self.stats_port,
             cache_address=f"127.0.0.1:{self.cache_port}",
+            pool_metrics_file=self.pool_metrics_file,
         )
 
     @property
@@ -192,6 +248,27 @@ class LivePool:
     def render(self, servers: Sequence[LeanServer] | None = None) -> str:
         return render_haproxy_config(self.servers if servers is None else servers, self.settings)
 
+    def write_pool_metrics(
+        self,
+        servers: Sequence[LeanServer] | None = None,
+        certificate_not_after: Mapping[str, int] | None = None,
+    ) -> str:
+        """Write the pool's facts beside the configuration, as ``render --pool-metrics`` does.
+
+        HAProxy reads the file when it reads the configuration, so this comes before a start
+        or a reload. Returns the text written.
+        """
+        assert self.pool_metrics_file is not None, "this pool was given no facts file"
+        text = render_pool_metrics(
+            self.servers if servers is None else servers, certificate_not_after
+        )
+        write_pool_metrics(
+            self.directory / self.pool_metrics_file,
+            text,
+            maximum_pool_metrics_bytes(self.settings),
+        )
+        return text
+
     async def start_cache(self) -> None:
         self._cache = TestServer(create_application(self.cache_settings), port=self.cache_port)
         await self._cache.start_server()
@@ -203,14 +280,29 @@ class LivePool:
         self._cache = None
 
     async def start_haproxy(self, config: str) -> None:
-        """Run HAProxy on ``config`` and wait until it accepts connections."""
+        """Run HAProxy on ``config`` and wait until it accepts connections.
+
+        Fails, with the reason, on an HAProxy built without the Prometheus exporter.
+        """
+        assert haproxy_has_exporter(), MISSING_EXPORTER
         self._haproxy = RunningHaproxy(self.directory)
         await self._haproxy.start(config, self.public_port)
 
-    async def start(self) -> None:
-        """Start the cache and HAProxy with the configuration generated for the fake servers."""
+    def reload_haproxy(self, config: str) -> None:
+        """Hand the running HAProxy's work over to a new one on ``config``."""
+        assert self._haproxy is not None, "HAProxy has not been started"
+        self._haproxy.reload(config)
+
+    async def start(self, servers: Sequence[LeanServer] | None = None) -> None:
+        """Start the cache and HAProxy with the configuration generated for the fake servers.
+
+        ``servers`` is the list to render instead of ``self.servers`` (one of them paused, say).
+        A pool with a facts file has it written first, from the same list.
+        """
         await self.start_cache()
-        await self.start_haproxy(self.render())
+        if self.pool_metrics_file is not None:
+            self.write_pool_metrics(servers)
+        await self.start_haproxy(self.render(servers))
 
     async def close(self) -> None:
         if self._haproxy is not None:
