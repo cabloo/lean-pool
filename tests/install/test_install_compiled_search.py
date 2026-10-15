@@ -26,12 +26,13 @@ pytestmark = [
 
 INSTANCE = "/srv/kimina-demo"
 NATIVE = f"{INSTANCE}/native"
-LEAN = "acme-kimina-demo"
-AGENT = "acme-agent-demo"
+LEAN = "lean-server-demo-kimina-1"
+AGENT = "lean-server-demo-agent-1"
 CTL = "/usr/local/bin/kimina-ctl"
 INSTALL = ("install.sh", "--instance", "demo", "--no-door")
 LAUNCHER = "/opt/lean-native/repl-native"
-PLAIN = "/repl/.lake/build/bin/repl"
+PLAIN = "/repl/.lake/build/bin/repl"  # the image's own, which its LEAN_SERVER_REPL_PATH names
+OVERLAY = "compose.compiled-search.yaml"
 START = "--- compiled search step:"
 MEASURED = (
     "linarith's search took 11.4 s as the image runs it and 1.4 s compiled (8.4 times less); the same answers; "
@@ -76,9 +77,14 @@ def installed(
     return result
 
 
-def settings(machine: Machine) -> dict[str, str]:
-    lines = machine.path(f"{INSTANCE}/kimina.env").read_text().splitlines()
+def settings(machine: Machine, directory: str = INSTANCE) -> dict[str, str]:
+    lines = machine.path(f"{directory}/kimina.env").read_text().splitlines()
     return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+def overlaid(machine: Machine) -> bool:
+    """Whether the instance runs with the compiled search step's overlay: what turns the step on."""
+    return OVERLAY in settings(machine)["COMPOSE_FILE"].split(":")
 
 
 def control(machine: Machine, *words: str, **environment: str) -> subprocess.CompletedProcess[str]:
@@ -124,7 +130,9 @@ def test_an_install_builds_the_step_checks_it_and_only_then_starts_the_workers_w
     assert not list(fresh.path(INSTANCE).glob("native.work.*"))
     # ... before the server's container was made.
     assert calls.index(build) < min(
-        index for index, call in enumerate(calls) if " up -d" in call and "acme-kimina-demo" in call
+        index
+        for index, call in enumerate(calls)
+        if " up -d" in call and "--project-name lean-server-demo " in call
     )
     # What the box holds: the launcher (to be started) and the image's REPL, the library and what ties it to the
     # image, the record.
@@ -139,14 +147,16 @@ def test_an_install_builds_the_step_checks_it_and_only_then_starts_the_workers_w
         fresh.path(f"{INSTANCE}/native.built").exists()
         and fresh.path(f"{INSTANCE}/native.log").exists()
     )
-    # The server mounts that directory read-only, and its workers are the launcher.
-    compose = fresh.path(f"{INSTANCE}/docker-compose.yml").read_text()
-    assert "      - ./native:/opt/lean-native:ro\n" in compose
-    assert "LEAN_SERVER_REPL_PATH: ${KIMINA_REPL_PATH:-/repl/.lake/build/bin/repl}" in compose
+    # The server mounts that directory read-only through the step's overlay, and its workers are the launcher.
+    compose = fresh.path(f"{INSTANCE}/{OVERLAY}").read_text()
     assert (
-        settings(fresh)["KIMINA_REPL_PATH"] == LAUNCHER and fresh.worker_program(LEAN) == LAUNCHER
+        "        source: ./native\n        target: /opt/lean-native\n        read_only: true\n"
+        in compose
     )
-    assert "KIMINA_COMPILED_SEARCH" not in settings(fresh)
+    assert f"      LEAN_SERVER_REPL_PATH: {LAUNCHER}\n" in compose
+    assert settings(fresh)["COMPOSE_FILE"].endswith(f":{OVERLAY}")
+    assert overlaid(fresh) and fresh.worker_program(LEAN) == LAUNCHER
+    assert "LEAN_SERVER_COMPILED_SEARCH" not in settings(fresh)
     # Said where it was made and again in the installer's last lines.
     assert result.stdout.count(f"COMPILED SEARCH STEP: on - {MEASURED}") == 2
     assert f"  search      COMPILED SEARCH STEP: on - {MEASURED}" in result.stdout
@@ -233,11 +243,7 @@ def test_an_image_without_the_c_files_installs_with_the_plain_repl_and_says_so(f
     # Nothing a worker could load, and the server runs the program it always ran.
     assert held(fresh) == LAUNCHER_ONLY and not fresh.path(f"{INSTANCE}/native.built").exists()
     assert fresh.path(f"{NATIVE}/state").read_text().startswith("off nothing was built: ")
-    assert (
-        settings(fresh)["KIMINA_REPL_PATH"] == PLAIN
-        and fresh.worker_program(LEAN) == PLAIN
-        and fresh.running(LEAN)
-    )
+    assert not overlaid(fresh) and fresh.worker_program(LEAN) == PLAIN and fresh.running(LEAN)
     assert status_line(fresh).startswith(f"{START} OFF (nothing was built: ")
     assert status_line(fresh).endswith("; the workers run the plain REPL, with the same answers)")
     # The next run tries again, and a build that passes turns the step on: the server is made again, once.
@@ -253,7 +259,7 @@ def test_a_library_that_does_not_pass_its_check_is_never_given_to_the_server(fre
     assert f"WARNING: COMPILED SEARCH STEP: OFF - {reason}." in result.stderr
     assert held(fresh) == LAUNCHER_ONLY  # the library the build wrote stayed in its container
     assert fresh.path(f"{NATIVE}/state").read_text() == f"off {reason}\n"
-    assert settings(fresh)["KIMINA_REPL_PATH"] == PLAIN and fresh.worker_program(LEAN) == PLAIN
+    assert not overlaid(fresh) and fresh.worker_program(LEAN) == PLAIN
     assert (
         status_line(fresh)
         == f"{START} OFF ({reason}; the workers run the plain REPL, with the same answers)"
@@ -269,7 +275,7 @@ def test_a_box_that_had_the_step_loses_it_when_a_newer_build_does_not_pass(tmp_p
     result = installed(machine, STUB_NATIVE="check-fails")
     assert "COMPILED SEARCH STEP: OFF" in result.stderr
     assert held(machine) == LAUNCHER_ONLY and not machine.path(f"{INSTANCE}/native.built").exists()
-    assert settings(machine)["KIMINA_REPL_PATH"] == PLAIN
+    assert not overlaid(machine)
     assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [*had, LEAN, AGENT]
 
 
@@ -281,10 +287,7 @@ def test_off_starts_the_plain_repl_and_on_goes_back_with_the_library_the_box_kep
     result = control(machine, "compiled-search", "off")
     assert result.returncode == 0, result.stderr
     assert "compiled search step off: the workers run the plain REPL" in result.stdout
-    assert (
-        settings(machine)["KIMINA_REPL_PATH"] == PLAIN
-        and settings(machine)["KIMINA_COMPILED_SEARCH"] == "off"
-    )
+    assert not overlaid(machine) and settings(machine)["LEAN_SERVER_COMPILED_SEARCH"] == "off"
     assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [
         *had,
         LEAN,
@@ -302,9 +305,7 @@ def test_off_starts_the_plain_repl_and_on_goes_back_with_the_library_the_box_kep
     result = control(machine, "compiled-search", "on")
     assert result.returncode == 0, result.stderr
     assert f"compiled search step on: {MEASURED}" in result.stdout
-    assert settings(machine)[
-        "KIMINA_REPL_PATH"
-    ] == LAUNCHER and "KIMINA_COMPILED_SEARCH" not in settings(machine)
+    assert overlaid(machine) and "LEAN_SERVER_COMPILED_SEARCH" not in settings(machine)
     assert machine.worker_program(LEAN) == LAUNCHER and machine.recreated() == [*had, LEAN, LEAN]
     assert status_line(machine) == f"{START} on ({MEASURED})"
 
@@ -314,12 +315,12 @@ def test_a_later_run_of_the_installer_keeps_an_off_and_builds_nothing(machine):
     had = (machine.recreated(), machine.native_builds())
     result = installed(machine)  # the way a refresh runs it
     assert (
-        "COMPILED SEARCH STEP: off by this box's own setting (KIMINA_COMPILED_SEARCH=off"
+        "COMPILED SEARCH STEP: off by this box's own setting (LEAN_SERVER_COMPILED_SEARCH=off"
         in result.stdout
     )
     assert "'sudo kimina-ctl @demo compiled-search on' turns it on" in result.stdout
     assert (machine.recreated(), machine.native_builds()) == had
-    assert settings(machine)["KIMINA_REPL_PATH"] == PLAIN and machine.worker_program(LEAN) == PLAIN
+    assert not overlaid(machine) and machine.worker_program(LEAN) == PLAIN
 
 
 def test_on_refuses_where_the_box_has_no_library_that_passed_and_clears_the_setting(fresh):
@@ -332,9 +333,7 @@ def test_on_refuses_where_the_box_has_no_library_that_passed_and_clears_the_sett
         and "holds no compiled search step that passed its check" in result.stderr
     )
     assert "the join command with --refresh" in result.stderr
-    assert settings(fresh)[
-        "KIMINA_REPL_PATH"
-    ] == PLAIN and "KIMINA_COMPILED_SEARCH" not in settings(fresh)
+    assert not overlaid(fresh) and "LEAN_SERVER_COMPILED_SEARCH" not in settings(fresh)
     assert fresh.worker_program(LEAN) == PLAIN and fresh.recreated() == had
     # The installer's next run makes one, now that nothing says off.
     installed(fresh)
@@ -375,10 +374,11 @@ def test_the_switch_refuses_anything_but_on_or_off_of_a_named_instance(machine, 
 def test_status_says_when_the_settings_and_the_running_container_disagree(machine):
     assert control(machine, "compiled-search", "off").returncode == 0
     env = machine.path(f"{INSTANCE}/kimina.env")
+    files = settings(machine)["COMPOSE_FILE"]
     env.write_text(
         env.read_text()
-        .replace(f"KIMINA_REPL_PATH={PLAIN}", f"KIMINA_REPL_PATH={LAUNCHER}")
-        .replace("KIMINA_COMPILED_SEARCH=off\n", "")
+        .replace(f"COMPOSE_FILE={files}\n", f"COMPOSE_FILE={files}:{OVERLAY}\n")
+        .replace("LEAN_SERVER_COMPILED_SEARCH=off\n", "")
     )
     assert status_line(machine) == (
         f"{START} on in the settings, NOT in effect (the running container was made before it: "
@@ -397,16 +397,10 @@ def test_status_says_when_the_launcher_has_nothing_to_load(machine):
 
 def test_status_of_a_server_from_before_the_step(machine):
     env = machine.path(f"{INSTANCE}/kimina.env")
-    env.write_text(
-        "".join(
-            line
-            for line in env.read_text().splitlines(keepends=True)
-            if not line.startswith("KIMINA_REPL_PATH=")
-        )
-    )
+    env.write_text(env.read_text().replace(f":{OVERLAY}\n", "\n"))
     machine.path(f"{NATIVE}/state").unlink()
     assert control(machine, "restart").returncode == 0
-    assert machine.worker_program(LEAN) == PLAIN  # the compose file's default
+    assert machine.worker_program(LEAN) == PLAIN  # the image's own
     assert (
         status_line(machine)
         == f"{START} OFF (this server was installed before it had one: the installer, or a refresh, makes and checks it)"
@@ -416,15 +410,15 @@ def test_status_of_a_server_from_before_the_step(machine):
 # --- instance 1, and the pool's own host --------------------------------------------------------------------------
 
 
-def test_instance_one_gets_an_empty_directory_and_the_program_it_always_ran(fresh):
+def test_instance_one_gets_no_step_and_the_program_it_always_ran(fresh):
     result = fresh.bash("install.sh", "--no-door")
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
     assert (
         "COMPILED SEARCH STEP" not in result.stdout + result.stderr and fresh.native_builds() == []
     )
-    assert list(fresh.path("/srv/kimina/native").iterdir()) == []
-    assert "KIMINA_REPL_PATH" not in fresh.path("/srv/kimina/kimina.env").read_text()
-    assert fresh.worker_program("acme-kimina") == PLAIN
+    assert not fresh.path("/srv/kimina/native").exists()
+    assert settings(fresh, "/srv/kimina")["COMPOSE_FILE"] == "compose.yaml"
+    assert fresh.worker_program("lean-server-kimina-1") == PLAIN
     status = fresh.bash(fresh.path(CTL), "status")
     assert status.returncode == 0 and START not in status.stdout
 
@@ -439,8 +433,7 @@ def test_the_pools_own_host_keeps_what_its_instance_made_and_says_so_last(machin
         in result.stdout
     )
     assert machine.native_builds() == had and machine.worker_program(LEAN) == LAUNCHER
-    assert (
-        "      - ./native:/opt/lean-native:ro\n"
-        in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()
+    # Behind its TLS front now, with the step's overlay last.
+    assert settings(machine)["COMPOSE_FILE"] == (
+        f"compose.yaml:compose.agent.yaml:compose.tls.yaml:{OVERLAY}"
     )
-    assert "ports:" not in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()

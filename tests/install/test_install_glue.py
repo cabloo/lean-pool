@@ -215,7 +215,7 @@ def test_status_and_check_still_answer_with_the_cache_stopped_and_errors_do_not_
     body = text[
         start : text.index('case "$verb" in', start)
     ]  # an earlier `case` validates the arguments
-    assert "docker exec -i" in body and '--network "container:$PROXY"' in body
+    assert 'docker run --rm -i --network "container:$PROXY"' in body and "docker exec" not in body
     assert "die() { printf 'lean-pool-ctl: %s\\n' \"$1\" >&2;" in text
 
 
@@ -260,8 +260,8 @@ def test_the_pools_key_is_never_an_argument_of_a_program():
     """Text check (needs root): install.sh writes the pool's key with the shell's own printf. Through
     `set_env` it would be an argument of sed, and a command line is visible to every user of the box."""
     text = (INSTALLERS / "install.sh").read_text()
-    assert "set_env KIMINA_API_KEY" not in text
-    assert 'printf \'KIMINA_API_KEY=%s\\n\' "$POOL_KEY" > "$DIR/kimina.env.new"' in text
+    assert "set_env LEAN_SERVER_API_KEY" not in text
+    assert 'printf \'LEAN_SERVER_API_KEY=%s\\n\' "$POOL_KEY" > "$DIR/kimina.env.new"' in text
     for line in text.splitlines():
         if "$POOL_KEY" in line:
             assert line.lstrip().startswith(("printf ", "[[ ", "[ -n ", "if [ -n ")), line
@@ -339,13 +339,13 @@ def test_no_script_signals_a_container_through_docker():
         in control[control.index("  reload)\n") : control.index("  cache-stop)\n")]
     )
     for name in (
-        "docker-compose.pool.yml",
-        "docker-compose.front.yml",
-        "docker-compose.agent.yml",
-        "docker-compose.yml",
+        "pool/compose.yaml",
+        "lean-server/compose.tls.yaml",
+        "lean-server/compose.agent.yaml",
+        "lean-server/compose.yaml",
     ):
         assert (
-            "restart: unless-stopped" in (INSTALLERS / name).read_text()
+            "restart: unless-stopped" in (INSTALLERS.parent / name).read_text()
         )  # kept: what the reload must not defeat
 
 

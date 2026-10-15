@@ -631,7 +631,11 @@ def test_the_certificate_reply_is_split_into_certificate_authority_and_key():
         {"certificate": CERTIFICATE, "ca": CERTIFICATE},  # no key
         {"certificate": CERTIFICATE, "ca": CERTIFICATE, "api_key": None},  # a pool without a key
         {"certificate": CERTIFICATE, "ca": CERTIFICATE, "api_key": "short"},
-        {"certificate": CERTIFICATE, "ca": CERTIFICATE, "api_key": API_KEY + "\nKIMINA_PORT=1"},
+        {
+            "certificate": CERTIFICATE,
+            "ca": CERTIFICATE,
+            "api_key": API_KEY + "\nLEAN_SERVER_PUBLISHED_PORT=1",
+        },
         {"certificate": "nope", "ca": CERTIFICATE, "api_key": API_KEY},
         {"certificate": CERTIFICATE, "ca": CSR, "api_key": API_KEY},
         {"reason": "refused"},

@@ -17,8 +17,7 @@ LEAN_POOL_DNS_NAME='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,6
 LEAN_POOL_SERVER_NAME='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
 # What a join bundle holds beside the lean-pool project and the site (pack_join_bundle): the instance installer
 # and all it needs. No key.
-LEAN_POOL_JOIN_FILES=(install.sh pool-lib.sh kimina-firewall kimina-ctl join_helper.py
-                      docker-compose.yml docker-compose.agent.yml docker-compose.front.yml)
+LEAN_POOL_JOIN_FILES=(install.sh pool-lib.sh kimina-firewall kimina-ctl join_helper.py)
 
 # ------------------------------------------------------------------------------------------------ the site
 # A site is a directory of values: site.env, and one file
@@ -27,8 +26,9 @@ LEAN_POOL_JOIN_FILES=(install.sh pool-lib.sh kimina-firewall kimina-ctl join_hel
 # read the site's names from LEAN_POOL_SITE_ENV, which the installers write.
 LEAN_POOL_SITE_ENV=/etc/lean-pool/site.env
 
-# load_site DIR : SITE (an absolute path) and the values of DIR/site.env. SITE_PREFIX is exported: the compose
-# files name images, containers and networks with it. The site's helpers live in /usr/local/lib/<SITE_PREFIX>.
+# load_site DIR : SITE (an absolute path) and the values of DIR/site.env. SITE_PREFIX names the site's images
+# (<SITE_PREFIX>/kimina:TAG, <SITE_PREFIX>/lean-pool:VERSION) and the directory of its helpers,
+# /usr/local/lib/<SITE_PREFIX>. Containers, networks and volumes have Compose's own names (the compose files).
 load_site() {
   [ -f "$1/site.env" ] || die "no site in $1: site.env is missing (--site DIR names the directory of the site's values)"
   SITE=$(cd "$1" && pwd)
@@ -37,13 +37,12 @@ load_site() {
   SITE_DOOR_KEY_MARKER=$(setting_in "$SITE/site.env" SITE_DOOR_KEY_MARKER)
   SITE_LAN_DOMAIN=$(setting_in "$SITE/site.env" SITE_LAN_DOMAIN)
   [[ "$SITE_PREFIX" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] \
-    || die "$SITE/site.env: SITE_PREFIX must be lower-case letters, digits, '_' and '-' (it begins every image and container name)"
+    || die "$SITE/site.env: SITE_PREFIX must be lower-case letters, digits, '_' and '-' (it begins every image name)"
   SITE_HELPER_DIR=/usr/local/lib/$SITE_PREFIX
   [[ "$SITE_LABEL" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "$SITE/site.env: SITE_LABEL must be letters, digits, '.', '_' and '-'"
   [[ "$SITE_DOOR_KEY_MARKER" =~ ^[A-Za-z0-9_@-]{1,64}$ ]] \
     || die "$SITE/site.env: SITE_DOOR_KEY_MARKER must be letters, digits, '_', '@' and '-' (the operator key's comment)"
   [[ "$SITE_LAN_DOMAIN" =~ $LEAN_POOL_DNS_NAME ]] || die "$SITE/site.env: SITE_LAN_DOMAIN must be a DNS name in lower case"
-  export SITE_PREFIX
 }
 
 # install_site_env : the site's names where the installed programs read them (no secret: readable by all).
@@ -70,6 +69,84 @@ lean_pool_source() {
   done
   return 1
 }
+
+# ------------------------------------------------------------------------------------- the compose files
+# A Lean server instance and a pool each run as ONE compose project, from the lean-pool project's own compose
+# files, copied unchanged into the instance's or the pool's directory:
+#   deploy/lean-server/  compose.yaml (the server) and its overlays: compose.agent.yaml (the usage agent),
+#                        compose.tls.yaml (the TLS front; the server and the agent then publish nothing) and
+#                        compose.compiled-search.yaml (linarith's search step, compiled)
+#   deploy/pool/         compose.yaml (the proxy and the cache), compose.tls.yaml and compose.dns.yaml
+# The env file beside them (kimina.env, pool.env) names the files the box runs, in order (COMPOSE_FILE), and the
+# project (COMPOSE_PROJECT_NAME), and every program passes both to `docker compose` itself. Containers, networks
+# and volumes have Compose's own names: lean-server-NAME-kimina-1, lean-server-NAME_default,
+# lean-pool-NAME_cache-data.
+LEAN_SERVER_COMPOSE_DIR=deploy/lean-server     # in the lean-pool project
+LEAN_POOL_COMPOSE_DIR=deploy/pool
+LEAN_SERVER_COMPOSE_FILES=(compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml)
+LEAN_POOL_COMPOSE_FILES=(compose.yaml compose.tls.yaml compose.dns.yaml)
+
+# lean_server_project INSTANCE : the compose project of a Lean server instance (lean-server for instance 1).
+lean_server_project() { echo "lean-server${1:+-$1}"; }
+
+# install_compose_files DIR server|pool : the project's compose files of a Lean server or of a pool, copied
+# into DIR unchanged (root-owned, 0644). All of them: COMPOSE_FILE says which run.
+install_compose_files() {
+  local dir=$1 from file
+  from=$(compose_source "$2") || exit 1
+  for file in $(compose_names "$2"); do
+    install -o root -g root -m 0644 "$from/$file" "$dir/$file"
+  done
+}
+compose_names() { if [ "$1" = pool ]; then echo "${LEAN_POOL_COMPOSE_FILES[*]}"; else echo "${LEAN_SERVER_COMPOSE_FILES[*]}"; fi; }
+# compose_source server|pool : the lean-pool project's directory of those compose files, once each one is
+# there (a pre-flight asks this before anything is written).
+compose_source() {
+  local project from file
+  project=$(lean_pool_source) || die "$LEAN_POOL_SOURCE_MISSING"
+  from=$project/$LEAN_SERVER_COMPOSE_DIR
+  [ "$1" != pool ] || from=$project/$LEAN_POOL_COMPOSE_DIR
+  for file in $(compose_names "$1"); do
+    [ -f "$from/$file" ] || die "missing $from/$file: $LEAN_POOL_SOURCE_MISSING"
+  done
+  echo "$from"
+}
+
+# compose_in ENV_FILE ARGS... : `docker compose` for the project ENV_FILE names (COMPOSE_PROJECT_NAME), with each
+# file it names (COMPOSE_FILE, beside it) passed by itself, and with ENV_FILE's settings.
+compose_in() {
+  local env=$1 dir file project
+  local -a names files=()
+  shift
+  dir=$(dirname "$env")
+  project=$(setting_in "$env" COMPOSE_PROJECT_NAME)
+  IFS=: read -r -a names <<<"$(setting_in "$env" COMPOSE_FILE)"
+  [ -n "$project" ] && [ "${#names[@]}" -gt 0 ] \
+    || die "$env names no compose project or no compose files (COMPOSE_PROJECT_NAME, COMPOSE_FILE)"
+  for file in "${names[@]}"; do files+=(-f "$dir/$file"); done
+  docker compose --project-name "$project" --env-file "$env" "${files[@]}" "$@"
+}
+
+# set_overlay ENV_FILE FILE on|off : COMPOSE_FILE with the Lean server's overlay FILE in it, or without it. The
+# files keep one order (LEAN_SERVER_COMPOSE_FILES): the server's own first, the compiled search step last.
+set_overlay() {
+  local env=$1 overlay=$2 state=$3 now file list=compose.yaml
+  now=":$(setting_in "$env" COMPOSE_FILE):"
+  for file in "${LEAN_SERVER_COMPOSE_FILES[@]:1}"; do
+    if [ "$file" = "$overlay" ]; then
+      [ "$state" = off ] || list=$list:$file
+    elif [[ "$now" == *":$file:"* ]]; then
+      list=$list:$file
+    fi
+  done
+  set_env_in "$env" COMPOSE_FILE "$list"
+}
+
+# has_overlay ENV_FILE FILE : whether the instance runs the overlay FILE.
+has_overlay() { [[ ":$(setting_in "$1" COMPOSE_FILE):" == *":$2:"* ]]; }
+
+# lean_container ENV_FILE : the Lean server's container of the instance whose settings ENV_FILE holds.
+lean_container() { echo "$(setting_in "$1" COMPOSE_PROJECT_NAME)-kimina-1"; }
 
 # Build the one image that runs the cache, the usage agent, the join service and the pool's tools. Prints
 # nothing but the tag.
@@ -152,7 +229,7 @@ exporter_missing() {
 }
 
 # init_starts IMAGE : whether this host's Docker starts a container of IMAGE that has an init process, under the
-# Lean server's own hardening (docker-compose.yml: `init: true`, no capabilities, no new privileges).
+# Lean server's own hardening (compose.yaml: `init: true`, no capabilities, no new privileges).
 # Docker puts its own docker-init binary into such a container, and a Docker whose package ships none
 # refuses to start it. Asked with a container that does nothing, so that the answer is known BEFORE a running
 # server is replaced by one that would not start. On a refusal Docker's own last line is in INIT_REFUSAL.
@@ -231,10 +308,10 @@ install_cpu_priority() {
   CPU_PRIORITY_INSTALLED=1
   # The box's limit on checks beside other work: 1 on a box that has none
   # yet, and never touched once it is there. An EMPTY value is "no limit", set on purpose (set-beside none).
-  grep -q '^KIMINA_AGENT_BESIDE_OTHER_WORK=' "$env" || set_env_in "$env" KIMINA_AGENT_BESIDE_OTHER_WORK 1
-  priority=${asked:-$(setting_in "$env" KIMINA_CPU_PRIORITY)}
+  grep -q '^LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK=' "$env" || set_env_in "$env" LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK 1
+  priority=${asked:-$(setting_in "$env" LEAN_SERVER_CPU_PRIORITY)}
   priority=${priority:-lowest}
-  set_env_in "$env" KIMINA_CPU_PRIORITY "$priority"
+  set_env_in "$env" LEAN_SERVER_CPU_PRIORITY "$priority"
   parent=$(cpu_priority_parent "$instance" "$priority")
   top=${parent%%-*}.slice
   if cpu_priority_possible; then
@@ -255,13 +332,13 @@ install_cpu_priority() {
     fi
   fi
   if [ -n "$CPU_PRIORITY_REFUSAL" ]; then
-    set_env_in "$env" KIMINA_CGROUP_PARENT ""
-    set_env_in "$env" KIMINA_AGENT_LEAN_CPU_STAT ""
+    set_env_in "$env" LEAN_SERVER_CGROUP_PARENT ""
+    set_env_in "$env" LEANPOOL_AGENT_LEAN_CPU_STAT_PATH ""
     warn "CPU priority '$priority' is NOT available on this box: $CPU_PRIORITY_REFUSAL. Everything else is installed. The Lean server runs at the box's ordinary CPU priority, where it always ran, and its usage agent states no open slots, so the pool may send this box as many checks as it has workers whatever else runs here (sudo kimina-ctl ${instance:+@$instance }status says so)."
     return 0
   fi
-  set_env_in "$env" KIMINA_CGROUP_PARENT "$parent"
-  set_env_in "$env" KIMINA_AGENT_LEAN_CPU_STAT "$LEAN_POOL_AGENT_CGROUPS/$top/$parent/cpu.stat"
+  set_env_in "$env" LEAN_SERVER_CGROUP_PARENT "$parent"
+  set_env_in "$env" LEANPOOL_AGENT_LEAN_CPU_STAT_PATH "$LEAN_POOL_AGENT_CGROUPS/$top/$parent/cpu.stat"
   if [ "$priority" = lowest ]; then
     echo "CPU priority: lowest. The Lean server runs in the control group $parent (under leanpool.slice, CPU weight 1): other work on this box gets a contended CPU first."
   else
@@ -298,7 +375,7 @@ remove_cpu_priority() {
 # server start its workers through a launcher that loads it. The image is not changed and nothing travels
 # between boxes. What Lean accepts does not change: the kernel checks every proof as before. The lean-pool
 # project's compiled-search/make.sh does all of it (docs/compiled-search.md), for the instance's directory:
-#   <instance dir>/native/            mounted read-only at LEAN_NATIVE_MOUNT by the server's compose file
+#   <instance dir>/native/            mounted read-only at /opt/lean-native by compose.compiled-search.yaml
 #     repl-native, repl-path          the launcher (the program a worker is started as), and the image's REPL
 #     linarith-search.so              the library; `sources` and `built-from` tie it to the image's C files
 #     state                           one line: `on ...` with what the box's own check measured, or `off REASON`
@@ -306,26 +383,24 @@ remove_cpu_priority() {
 #   <instance dir>/native.log         the last build and check, in full
 #   <instance dir>/native.work.*      a build in progress; removed when it ends, and by the next run
 LEAN_NATIVE_MAKE=deploy/lean-server/compiled-search/make.sh     # in the lean-pool project
-LEAN_NATIVE_MOUNT=/opt/lean-native
-LEAN_NATIVE_LAUNCHER=$LEAN_NATIVE_MOUNT/repl-native
-LEAN_PLAIN_REPL=/repl/.lake/build/bin/repl       # where an instance's image puts its REPL: the compose file's default
+LEAN_NATIVE_OVERLAY=compose.compiled-search.yaml
 COMPILED_SEARCH_INSTALLED=""     # set once install_compiled_search has run in this process
 COMPILED_SEARCH_SAID=""          # its one line, for the installer's last lines
 
 # install_compiled_search INSTANCE_DIR INSTANCE IMAGE : make the library from IMAGE on this box, check it,
-# and write into the instance's settings which program its workers are, BEFORE its container is (re)made.
-# Nothing here stops an install: a build or a check that fails leaves the server on the plain
-# REPL, which is what it ran before, and says so. Instance 1 gets the (empty) directory and nothing else.
+# and write into the instance's settings which program its workers are (whether COMPOSE_FILE holds
+# compose.compiled-search.yaml), BEFORE its container is (re)made. Nothing here stops an install: a build or a
+# check that fails leaves the server on the plain REPL, which is what it ran before, and says so. Instance 1
+# has no compiled step.
 install_compiled_search() {
   local dir=$1 instance=$2 image=$3 env=$1/kimina.env native=$1/native project said state reason
   COMPILED_SEARCH_INSTALLED=1
-  install -d -o root -g root -m 0755 "$native"
   [ -n "$instance" ] || return 0
   project=$(lean_pool_source) && [ -f "$project/$LEAN_NATIVE_MAKE" ] \
     || die "missing $LEAN_NATIVE_MAKE: $LEAN_POOL_SOURCE_MISSING"
-  if [ "$(setting_in "$env" KIMINA_COMPILED_SEARCH)" = off ]; then
-    set_env_in "$env" KIMINA_REPL_PATH "$LEAN_PLAIN_REPL"
-    COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: off by this box's own setting (KIMINA_COMPILED_SEARCH=off in $env); 'sudo kimina-ctl @$instance compiled-search on' turns it on"
+  if [ "$(setting_in "$env" LEAN_SERVER_COMPILED_SEARCH)" = off ]; then
+    set_overlay "$env" "$LEAN_NATIVE_OVERLAY" off
+    COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: off by this box's own setting (LEAN_SERVER_COMPILED_SEARCH=off in $env); 'sudo kimina-ctl @$instance compiled-search on' turns it on"
     echo "$COMPILED_SEARCH_SAID"
     return 0
   fi
@@ -335,14 +410,14 @@ install_compiled_search() {
   if bash "$project/$LEAN_NATIVE_MAKE" --image "$image" --box "$dir" --name "lean-server-$instance-native" \
        </dev/null | tee "$said"; then
     COMPILED_SEARCH_SAID=$(tail -n 1 "$said")
-    set_env_in "$env" KIMINA_REPL_PATH "$LEAN_NATIVE_LAUNCHER"
+    set_overlay "$env" "$LEAN_NATIVE_OVERLAY" on
   else
     state=$(head -n 1 "$native/state" 2>/dev/null || true)
     case $state in
       "off "*) reason=${state#off } ;;
       *) reason="make.sh stopped: $(last_line_of "$said")" ;;
     esac
-    set_env_in "$env" KIMINA_REPL_PATH "$LEAN_PLAIN_REPL"
+    set_overlay "$env" "$LEAN_NATIVE_OVERLAY" off
     COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: OFF - $reason. The Lean server starts its workers as it did before (the plain REPL): every answer is the same, linarith's search is slower. Full log: $dir/native.log"
     warn "$COMPILED_SEARCH_SAID"
   fi
@@ -356,8 +431,9 @@ install_compiled_search() {
 # is a small filesystem in memory (the compose file). The switch is made only where the RUNNING server has been
 # seen to write nothing else, and kept only where a real check then passes. A server that cannot have it stays
 # writable, and the box says so: what is lost is the protection, never an answer.
-#   KIMINA_READ_ONLY=off              in kimina.env: turned off by hand (kimina-ctl read-only off); every run keeps it
-#   KIMINA_ROOT_READ_ONLY=true|false  in kimina.env: what the compose file makes the container with
+#   LEAN_SERVER_READ_ONLY=off              in kimina.env: turned off by hand (kimina-ctl read-only off); every
+#                                          run keeps it
+#   LEAN_SERVER_ROOT_READ_ONLY=true|false  in kimina.env: what the compose file makes the container with
 #   <instance dir>/read-only.state    one line: `on`, or `off REASON` when the installer turned it off
 #   <instance dir>/read-only.diff     what `docker diff` said of the running server at the last reading
 #   <instance dir>/read-only.outside  of that, every path a read-only root would have refused (when any was)
@@ -370,7 +446,7 @@ READ_ONLY_SAID=""          # its one line, for the installer's last lines
 read_only_off() {
   printf 'off %s\n' "$2" > "$1/read-only.state"
   chmod 0644 "$1/read-only.state"
-  set_env_in "$1/kimina.env" KIMINA_ROOT_READ_ONLY false
+  set_env_in "$1/kimina.env" LEAN_SERVER_ROOT_READ_ONLY false
 }
 
 # install_read_only_root INSTANCE_DIR INSTANCE : decide, BEFORE the Lean server's container is (re)made, whether
@@ -378,18 +454,17 @@ read_only_off() {
 install_read_only_root() {
   local dir=$1 instance=$2 env=$1/kimina.env container made writes reason="" hint project checked=0 said
   READ_ONLY_INSTALLED=1
-  container=$(setting_in "$env" KIMINA_CONTAINER)
-  container=${container:-$SITE_PREFIX-kimina}
+  container=$(lean_container "$env")
   hint="sudo kimina-ctl ${instance:+@$instance }read-only"
-  if [ "$(setting_in "$env" KIMINA_READ_ONLY)" = off ]; then
-    set_env_in "$env" KIMINA_ROOT_READ_ONLY false
-    READ_ONLY_SAID="READ-ONLY ROOT: off by this box's own setting (KIMINA_READ_ONLY=off in $env); '$hint on' turns it on"
+  if [ "$(setting_in "$env" LEAN_SERVER_READ_ONLY)" = off ]; then
+    set_env_in "$env" LEAN_SERVER_ROOT_READ_ONLY false
+    READ_ONLY_SAID="READ-ONLY ROOT: off by this box's own setting (LEAN_SERVER_READ_ONLY=off in $env); '$hint on' turns it on"
     echo "$READ_ONLY_SAID"
     return 0
   fi
   made=$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$container" 2>/dev/null || true)
   if [ "$made" = true ]; then
-    set_env_in "$env" KIMINA_ROOT_READ_ONLY true
+    set_env_in "$env" LEAN_SERVER_ROOT_READ_ONLY true
     printf 'on\n' > "$dir/read-only.state"
     chmod 0644 "$dir/read-only.state"
     READ_ONLY_SAID="READ-ONLY ROOT: on - the server already runs with it; not read again"
@@ -426,7 +501,7 @@ install_read_only_root() {
     warn "$READ_ONLY_SAID"
     return 0
   fi
-  set_env_in "$env" KIMINA_ROOT_READ_ONLY true
+  set_env_in "$env" LEAN_SERVER_ROOT_READ_ONLY true
   printf 'on\n' > "$dir/read-only.state"
   chmod 0644 "$dir/read-only.state"
   if [ -n "$made" ]; then
@@ -444,14 +519,13 @@ confirm_read_only_root() {
   local dir=$1 instance=$2 env=$1/kimina.env container state healthy=0
   # shellcheck disable=SC2086  # no prefix for instance 1
   /usr/local/bin/kimina-ctl ${instance:+@$instance} check && return 0
-  [ "$(setting_in "$env" KIMINA_ROOT_READ_ONLY)" = true ] || return 1
+  [ "$(setting_in "$env" LEAN_SERVER_ROOT_READ_ONLY)" = true ] || return 1
   read_only_off "$dir" "a real check failed against the server with its root read-only"
   READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check failed against the server with its root read-only, so it was made writable again (as it was: every answer is the same, and a check can still change this server for the checks after it). The installer's next run tries again."
   warn "$READ_ONLY_SAID"
   # shellcheck disable=SC2086
   /usr/local/bin/kimina-ctl ${instance:+@$instance} restart
-  container=$(setting_in "$env" KIMINA_CONTAINER)
-  container=${container:-$SITE_PREFIX-kimina}
+  container=$(lean_container "$env")
   for _ in $(seq 1 60); do
     state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true)
     [ "$state" = healthy ] && { healthy=1; break; }
@@ -723,27 +797,33 @@ set_env_in() {
 setting_in() {
   sed -n "s/^$2=//p" "$1" | head -n 1
 }
+# setting_moved_in FILE KEY OLD_KEY : KEY's value, else OLD_KEY's: what is read BEFORE a box's settings have
+# moved to Compose's names (move_to_compose_names), for a box that has not moved yet.
+setting_moved_in() {
+  local value
+  value=$(setting_in "$1" "$2")
+  [ -n "$value" ] || value=$(setting_in "$1" "$3")
+  echo "$value"
+}
 
 # The usage agent beside a Lean server instance: HAProxy asks it for the box's CPU and RAM headroom.
 #   install_usage_agent INSTANCE_DIR INSTANCE_NAME AGENT_PORT LAN_SUBNET   (after build_lean_pool_image)
 # LAN_SUBNET empty = no firewall rule (the caller ran with --no-firewall). This is the PLAIN agent, with its
-# own published port; an instance behind a TLS front gets its agent from install_tls_front instead.
+# own published port; an instance behind a TLS front gets its agent from install_tls_front instead. It is a
+# service of the instance's own project (compose.agent.yaml): the caller's one `compose up` starts it.
 install_usage_agent() {
   local dir=$1 instance=$2 port=$3 subnet=$4
-  local container=$SITE_PREFIX-agent${instance:+-$instance}
   [ -n "$LEAN_POOL_IMAGE" ] || die "build_lean_pool_image must run before install_usage_agent"
-  install -o root -g root -m 0644 "$SRC/docker-compose.agent.yml" "$dir/"
-  set_env_in "$dir/kimina.env" KIMINA_AGENT_IMAGE "$LEAN_POOL_IMAGE"
-  set_env_in "$dir/kimina.env" KIMINA_AGENT_CONTAINER "$container"
-  set_env_in "$dir/kimina.env" KIMINA_AGENT_PORT "$port"
+  set_env_in "$dir/kimina.env" LEAN_SERVER_AGENT_IMAGE "$LEAN_POOL_IMAGE"
+  set_env_in "$dir/kimina.env" LEAN_SERVER_AGENT_PORT "$port"
   record_installer_version "$dir/kimina.env" "$instance"
-  docker compose --project-name "$container" --env-file "$dir/kimina.env" -f "$dir/docker-compose.agent.yml" up -d
+  set_overlay "$dir/kimina.env" compose.agent.yaml on
   if [ -n "$subnet" ]; then
     install_lan_firewall "agent${instance:+-$instance}" "$port" "$subnet"
   else
     warn "no firewall rule for the usage agent's port $port (it reports only CPU and RAM headroom)"
   fi
-  echo "usage agent $container on port $port"
+  echo "usage agent $(lean_server_project "$instance")-agent-1 on port $port"
 }
 
 # The LAN subnet of the interface that carries the default route (what install.sh has always detected).
@@ -756,35 +836,7 @@ detect_lan_subnet() {
 # --------------------------------------------------------------------------------- a box's TLS front
 # With TLS a box publishes neither its Lean server nor its usage agent: it publishes
 # a small HAProxy that requires the pool proxy's client certificate and forwards to both over the
-# instance's own Docker network.
-
-# unpublished_compose FILE : the Lean server's compose file without its `ports:` block (the key and the
-# deeper-indented lines under it). Everything else is printed byte for byte.
-unpublished_compose() {
-  awk '
-    /^    ports:[[:space:]]*$/ { skipping = 1; next }
-    skipping && /^      / { next }
-    { skipping = 0; print }
-  ' "$1"
-}
-
-# install_lean_compose INSTANCE_DIR FRONTED : the Lean server's compose file, as it is (FRONTED=0) or
-# without its published port (FRONTED=1: the TLS front publishes that port instead).
-install_lean_compose() {
-  local dir=$1 fronted=$2 candidate
-  if [ "$fronted" -eq 0 ]; then
-    install -o root -g root -m 0644 "$SRC/docker-compose.yml" "$dir/docker-compose.yml"
-    return 0
-  fi
-  candidate=$(mktemp)
-  unpublished_compose "$SRC/docker-compose.yml" > "$candidate"
-  if grep -Eq '^[[:space:]]*ports:|:8000"' "$candidate" || ! grep -q '^    networks: \[kimina\]' "$candidate"; then
-    rm -f "$candidate"
-    die "could not take the published port out of $SRC/docker-compose.yml; nothing was changed"
-  fi
-  install -o root -g root -m 0644 "$candidate" "$dir/docker-compose.yml"
-  rm -f "$candidate"
-}
+# instance's own Docker network (compose.tls.yaml, the lean-pool project's).
 
 # front_address_for SUBNET : the fixed address of the TLS front on a /24 (its .250).
 front_address_for() {
@@ -824,27 +876,28 @@ container_is_steady() {
 # TLS_SOURCE holds box.pem (the box's certificate, then its private key), box.crt and ca.crt; it may be
 # INSTANCE_DIR/tls itself (a re-run keeps what is installed). LEAN_TIMEOUT and SERVER_WAIT are the POOL's,
 # so the front never cuts a check the pool would still wait for. LAN_SUBNET empty = no firewall rule.
-# After build_lean_pool_image. Until HAProxy has accepted the new config, no container is touched.
+# After build_lean_pool_image. Until HAProxy has accepted the new config, no
+# container is touched; then the instance's ONE project is brought up, with the agent and the front
+# (compose.agent.yaml, compose.tls.yaml: the server and the agent then publish nothing themselves).
 install_tls_front() {
   local dir=$1 instance=$2 name=$3 source=$4 lean_timeout=$5 server_wait=$6 subnet=$7
-  local env=$dir/kimina.env file gid port agent_port lean_container lean_project network container_net address
-  local work holder old_project before
+  local env=$dir/kimina.env file gid port agent_port project network container_net address
+  local work holder before front
   [ -n "$instance" ] || die "a TLS front stands beside a named instance only (instance 1 stays plain HTTP)"
-  local front=$SITE_PREFIX-front-$instance agent=$SITE_PREFIX-agent-$instance
   [ -n "$LEAN_POOL_IMAGE" ] || die "build_lean_pool_image must run before install_tls_front"
   [[ "$name" =~ $LEAN_POOL_DNS_NAME ]] && [ "${#name}" -le 40 ] \
     || die "the server name '$name' must be a DNS name in lower case (it is the name on the certificate)"
   for file in box.pem box.crt ca.crt; do
     [ -s "$source/$file" ] || die "the TLS front needs $source/$file"
   done
-  [ -f "$SRC/docker-compose.front.yml" ] || die "missing $SRC/docker-compose.front.yml - run this from the repo checkout"
-  port=$(setting_in "$env" KIMINA_PORT)
-  lean_container=$(setting_in "$env" KIMINA_CONTAINER)
-  lean_project=$(setting_in "$env" KIMINA_PROJECT)
-  network=$(setting_in "$env" KIMINA_NETWORK)
-  container_net=$(setting_in "$env" KIMINA_SUBNET)
-  [ -n "$port" ] && [ -n "$lean_container" ] && [ -n "$lean_project" ] && [ -n "$network" ] && [ -n "$container_net" ] \
+  install_compose_files "$dir" server     # the overlays this needs, as the lean-pool project has them
+  port=$(setting_in "$env" LEAN_SERVER_PUBLISHED_PORT)
+  project=$(setting_in "$env" COMPOSE_PROJECT_NAME)
+  container_net=$(setting_in "$env" LEAN_SERVER_SUBNET)
+  [ -n "$port" ] && [ -n "$project" ] && [ -n "$container_net" ] \
     || die "$env is incomplete - re-run install.sh --instance $instance"
+  front=$project-front-1
+  network=${project}_default
   agent_port=$((port + 200))
 
   say "TLS front for '$name': ports $port (Lean) and $agent_port (usage) accept only the pool proxy's certificate"
@@ -864,26 +917,27 @@ install_tls_front() {
   chown root:root "$dir/tls/box.crt" "$dir/tls/ca.crt"; chmod 0644 "$dir/tls/box.crt" "$dir/tls/ca.crt"
 
   # The front's fixed address on the instance's network (see kimina-firewall, KIMINA-FRONT).
-  address=$(setting_in "$env" KIMINA_FRONT_ADDRESS)
+  address=$(setting_in "$env" LEAN_SERVER_FRONT_ADDRESS)
   if [ -z "$address" ]; then
     address=$(front_address_for "$container_net") \
-      || die "cannot place the TLS front on $container_net (not a /24): set KIMINA_FRONT_ADDRESS in $env to a free address of that network"
+      || die "cannot place the TLS front on $container_net (not a /24): set LEAN_SERVER_FRONT_ADDRESS in $env to a free address of that network"
   fi
-  [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "KIMINA_FRONT_ADDRESS in $env must be an IPv4 address"
+  [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "LEAN_SERVER_FRONT_ADDRESS in $env must be an IPv4 address"
   holder=$({ docker network inspect "$network" -f '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}' 2>/dev/null || true; } \
     | awk -v address="$address" '{split($2, parts, "/"); if (parts[1] == address) print $1}')
   [ -z "$holder" ] || [ "$holder" = "$front" ] \
-    || die "$address on network $network is in use by $holder: set KIMINA_FRONT_ADDRESS in $env to a free address"
+    || die "$address on network $network is in use by $holder: set LEAN_SERVER_FRONT_ADDRESS in $env to a free address"
 
   # Render, then let the real HAProxy image judge the config AS ITS OWN USER, with the certificate files
   # mounted where the config says they are. mktemp -d is root-only, so the candidate gets the modes the
-  # installed config has (0755 directory, 0644 file; it holds no secret).
+  # installed config has (0755 directory, 0644 file; it holds no secret). The front reaches the server and
+  # the agent by their service names, on the ports they listen on inside the project.
   work=$(mktemp -d)
   docker run --rm --network none "$LEAN_POOL_IMAGE" leanpool-haproxy-config render-box \
       --tls-server-pem "$LEAN_POOL_TLS_MOUNT/box.pem" --tls-ca-file "$LEAN_POOL_TLS_MOUNT/ca.crt" \
       --proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME" \
-      --lean-upstream "$lean_container:8000" --agent-upstream "$agent:18200" \
-      --lean-port "$port" --agent-port "$agent_port" \
+      --lean-upstream kimina:8000 --agent-upstream agent:18200 \
+      --lean-port 8000 --agent-port 18200 \
       --lean-timeout "$lean_timeout" --server-wait "$server_wait" > "$work/haproxy.cfg" \
     || { rm -rf "$work"; die "could not render the TLS front's config; no container was changed"; }
   chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"
@@ -895,51 +949,39 @@ install_tls_front() {
   mv -f "$dir/front/haproxy.cfg.new" "$dir/front/haproxy.cfg"
   rm -rf "$work"
 
-  install -o root -g root -m 0644 "$SRC/docker-compose.front.yml" "$dir/"
-  set_env_in "$env" KIMINA_SERVER_NAME "$name"
-  set_env_in "$env" KIMINA_FRONT_IMAGE "$LEAN_POOL_HAPROXY_IMAGE"
-  set_env_in "$env" KIMINA_FRONT_CONTAINER "$front"
-  set_env_in "$env" KIMINA_FRONT_ADDRESS "$address"
-  set_env_in "$env" KIMINA_FRONT_LEAN_TIMEOUT "$lean_timeout"
-  set_env_in "$env" KIMINA_FRONT_SERVER_WAIT "$server_wait"
-  set_env_in "$env" KIMINA_AGENT_IMAGE "$LEAN_POOL_IMAGE"
-  set_env_in "$env" KIMINA_AGENT_CONTAINER "$agent"
-  set_env_in "$env" KIMINA_AGENT_PORT "$agent_port"
+  set_env_in "$env" LEAN_SERVER_NAME "$name"
+  set_env_in "$env" LEAN_SERVER_FRONT_IMAGE "$LEAN_POOL_HAPROXY_IMAGE"
+  set_env_in "$env" LEAN_SERVER_FRONT_ADDRESS "$address"
+  set_env_in "$env" LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS "$lean_timeout"
+  set_env_in "$env" LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS "$server_wait"
+  set_env_in "$env" LEAN_SERVER_AGENT_IMAGE "$LEAN_POOL_IMAGE"
+  set_env_in "$env" LEAN_SERVER_AGENT_PORT "$agent_port"
   record_installer_version "$env" "$instance"
+  set_overlay "$env" compose.agent.yaml on
+  set_overlay "$env" compose.tls.yaml on
 
-  # From here on containers change. An agent that still publishes its own port (the plain install) goes:
-  # the front's project brings it back, unpublished.
-  old_project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$agent" 2>/dev/null || true)
-  if [ -n "$old_project" ] && [ "$old_project" != "$front" ]; then
-    docker rm -f "$agent" >/dev/null
-    docker network rm "${old_project}_default" >/dev/null 2>&1 || true     # the plain agent's own network
-    echo "the usage agent no longer publishes port $agent_port itself"
-  fi
   # The Lean server's control group, where the caller has not already decided it: the pool's own
   # host comes here from install-pool.sh, which keeps whatever priority the instance's settings name.
   [ -n "$CPU_PRIORITY_INSTALLED" ] \
-    || install_cpu_priority "$dir" "$instance" "$SITE_PREFIX/kimina:$(setting_in "$env" KIMINA_IMAGE_TAG)"
+    || install_cpu_priority "$dir" "$instance" "$(setting_in "$env" LEAN_SERVER_IMAGE)"
   # Which program a worker is, where the caller has not already decided it: the pool's own host,
-  # again. The compose file installed next mounts the directory this makes.
+  # again. The overlay it adds or removes mounts the directory it makes.
   [ -n "$COMPILED_SEARCH_INSTALLED" ] \
-    || install_compiled_search "$dir" "$instance" "$SITE_PREFIX/kimina:$(setting_in "$env" KIMINA_IMAGE_TAG)"
+    || install_compiled_search "$dir" "$instance" "$(setting_in "$env" LEAN_SERVER_IMAGE)"
   # Whether its root filesystem is read-only, decided here for the pool's own host likewise.
   [ -n "$READ_ONLY_INSTALLED" ] || install_read_only_root "$dir" "$instance"
-  # The Lean server stops publishing its port (recreated ONLY if it still did, or if its compose file, its
-  # control group or the program its workers are changed; otherwise nothing happens).
-  install_lean_compose "$dir" 1
-  docker compose --project-name "$lean_project" --env-file "$env" -f "$dir/docker-compose.yml" up -d \
-    || die "could not start the Lean server without its published port (docker compose logs above)"
-  # The egress rule names the whole network; the front's fixed address is its one exception.
+  # The egress rule names the whole network; the front's fixed address is its one exception. In place
+  # BEFORE the front starts, so its first connections to the server are let through.
   if [ -f "$dir/firewall.conf" ]; then
     set_env_in "$dir/firewall.conf" KIMINA_FW_FRONT_ADDRESS "$address"
     install_kimina_firewall
     systemctl restart "kimina-firewall-$instance.service" \
       || warn "could not re-apply kimina-firewall-$instance.service; the TLS front may not reach the Lean server (systemctl status kimina-firewall-$instance)"
   fi
+  # From here on containers change, and only those whose settings did: the server stops publishing its
+  # port if it still did, the agent likewise, and the front takes both ports.
   before=$(docker inspect -f '{{.Id}}' "$front" 2>/dev/null || true)
-  docker compose --project-name "$front" --env-file "$env" -f "$dir/docker-compose.front.yml" up -d \
-    || die "could not start the TLS front (docker compose logs above)"
+  compose_in "$env" up -d || die "could not start the Lean server, its usage agent and its TLS front (docker compose logs above)"
   reload_if_kept "$front" "$before"
   if ! container_is_steady "$front"; then
     docker logs --tail 20 "$front" >&2 || true
@@ -953,20 +995,13 @@ install_tls_front() {
   echo "TLS front $front at $address: the Lean server and the usage agent are no longer published themselves"
 }
 
-# remove_tls_front INSTANCE_DIR INSTANCE : stop the front and its agent (uninstall).
-remove_tls_front() {
-  local dir=$1 instance=$2
-  [ -n "$instance" ] && [ -f "$dir/docker-compose.front.yml" ] && [ -f "$dir/kimina.env" ] || return 0
-  docker compose --project-name "$SITE_PREFIX-front-$instance" --env-file "$dir/kimina.env" \
-    -f "$dir/docker-compose.front.yml" down || true
-}
-
 # ------------------------------------------------------------------------------------ the join bundle
 # pack_join_bundle FILE INSTANCE : what a new box unpacks, as base64 of a gzipped tar with one
 # directory `join/`: the instance installer and everything it needs; `join/site/`, the site's values for INSTANCE
 # alone (site.env, instances/INSTANCE.env and that instance's image recipe), which the installer reads when it is
 # given no --site; and `join/lean_pool/`, the lean-pool project's source (the box builds the pool's image from
-# it, and makes the compiled search step and reads its server with it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
+# it, runs the Lean server from its compose files, and makes the compiled search step and reads its server
+# with it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
 pack_join_bundle() {
   local out=$1 instance=$2 stage source file recipe
   source=$(lean_pool_source) || die "$LEAN_POOL_SOURCE_MISSING"
@@ -982,14 +1017,23 @@ pack_join_bundle() {
     [ -f "$SITE/$file" ] || { rm -rf "$stage"; die "missing $SITE/$file - the site's values for instance '$instance'"; }
     cp "$SITE/$file" "$stage/join/site/$file"
   done
-  # Only what the image build reads (see the project's .dockerignore), the compiled search step and the read-only
-  # check: no tests, no environment, no caches.
-  tar -cf - -C "$source" --exclude=__pycache__ pyproject.toml README.md LICENSE leanpool deploy/Dockerfile \
-      deploy/lean-server/compiled-search "$LEAN_READ_ONLY_CHECK" \
+  local -a bundled
+  mapfile -t bundled < <(bundled_project_paths)
+  tar -cf - -C "$source" --exclude=__pycache__ "${bundled[@]}" \
     | tar -xf - -C "$stage/join/lean_pool" || { rm -rf "$stage"; die "could not copy the lean-pool project"; }
   tar -czf - -C "$stage" --owner=0 --group=0 join | base64 > "$out" \
     || { rm -rf "$stage"; die "could not pack the join bundle"; }
   rm -rf "$stage"
+}
+
+# bundled_project_paths : the lean-pool project's paths a join bundle carries, one a line: only what the image
+# build reads (see the project's .dockerignore), the Lean server's compose files, the compiled search step and
+# the read-only check. No tests, no environment, no caches.
+bundled_project_paths() {
+  local file
+  printf '%s\n' pyproject.toml README.md LICENSE leanpool deploy/Dockerfile
+  for file in "${LEAN_SERVER_COMPOSE_FILES[@]}"; do printf '%s\n' "$LEAN_SERVER_COMPOSE_DIR/$file"; done
+  printf '%s\n' deploy/lean-server/compiled-search "$LEAN_READ_ONLY_CHECK"
 }
 
 # installer_version INSTANCE : the version of this installer, one md5 of everything a join bundle of INSTANCE
@@ -1004,8 +1048,9 @@ installer_version() {
   printf '%s\n' "$files" | md5sum | cut -c 1-32
 }
 installer_files() {       # INSTANCE : the list installer_version hashes
-  local instance=${1:-default} source file recipe lines=""
+  local instance=${1:-default} source file recipe lines="" bundled
   source=$(lean_pool_source) || return 1
+  mapfile -t bundled < <(bundled_project_paths)
   [ -f "$SITE/instances/$instance.env" ] || return 1
   read -r -a recipe <<<"$(setting_in "$SITE/instances/$instance.env" INSTANCE_BUILD_FILES)"
   for file in "${LEAN_POOL_JOIN_FILES[@]}"; do
@@ -1019,24 +1064,24 @@ installer_files() {       # INSTANCE : the list installer_version hashes
   # The same files as the bundle's tar of the project: no __pycache__ anywhere.
   while IFS= read -r file; do
     lines+="$(md5sum < "$source/$file" | cut -c 1-32)  lean_pool/$file"$'\n'
-  done < <(cd "$source" && find pyproject.toml README.md LICENSE leanpool deploy/Dockerfile -name __pycache__ -prune -o -type f -print)
+  done < <(cd "$source" && find "${bundled[@]}" -name __pycache__ -prune -o -type f -print)
   printf '%s' "$lines" | LC_ALL=C sort -k 2
 }
 
-# record_installer_version ENV_FILE INSTANCE : KIMINA_INSTALLER_VERSION in a Lean server's settings, which its
+# record_installer_version ENV_FILE INSTANCE : LEANPOOL_AGENT_VERSION in a Lean server's settings, which its
 # usage agent ends every answer with. Left empty when it cannot be computed: the agent then answers without one.
 record_installer_version() {
   local version
   version=$(installer_version "$2") \
     || { warn "could not compute this installer's version: the usage agent's answers carry none"; version=""; }
-  set_env_in "$1" KIMINA_INSTALLER_VERSION "$version"
+  set_env_in "$1" LEANPOOL_AGENT_VERSION "$version"
 }
 
 # ---------------------------------------------------------------- the Lean image a joining box loads
 # A joining box gets the Lean server's image from the pool's host and builds only as a
 # fallback. No registry: the pool's host exports the image to a file once, and a join window serves it.
 
-# The API key is a setting of the RUNNING container (docker-compose.yml). An image whose config carries the
+# The API key is a setting of the RUNNING container (compose.yaml). An image whose config carries the
 # variable is never exported: nothing secret travels in an image.
 LEAN_POOL_KEY_VARIABLE=LEAN_SERVER_API_KEY
 

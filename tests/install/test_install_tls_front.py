@@ -15,11 +15,14 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
+from compose_files import resolve
 
 SITE = Path(__file__).resolve().parent / "site"
 INSTALLERS = Path(__file__).resolve().parents[2] / "deploy" / "install"
+JOIN_BUNDLE = "# ------------------------------------------------------------------------------------ the join bundle"
 not_root = pytest.mark.skipif(
     os.geteuid() == 0, reason="argument validation is observable only as non-root"
 )
@@ -165,58 +168,55 @@ def test_a_front_address_that_is_not_one_ipv4_address_is_refused_before_any_rule
     assert code == 2 and "must be an IPv4 address" in error and commands == []
 
 
-# --- the Lean server's compose file, with and without its published port -----------------------------------------
+# --- the Lean server's compose files, with and without the front ---------------------------------------------------
+# The installer runs the lean-pool project's own files, copied unchanged: compose.yaml alone for instance 1, with
+# the agent's overlay beside a named instance, and with the TLS overlay too behind a front.
+
+LEAN_SERVER = INSTALLERS.parent / "lean-server"
+PLAIN = ["compose.yaml"]
+WITH_THE_AGENT = ["compose.yaml", "compose.agent.yaml"]
+BEHIND_A_FRONT = ["compose.yaml", "compose.agent.yaml", "compose.tls.yaml"]
+SETTINGS = {
+    "LEAN_SERVER_API_KEY": "key",
+    "LEAN_SERVER_MAX_REPLS": "4",
+    "LEAN_SERVER_PUBLISHED_PORT": "18000",
+}
 
 
-def test_the_lean_servers_compose_file_still_publishes_its_port_as_before():
-    """Instance 1 runs from this file as it is: its published port is what a re-run of install.sh must find."""
-    yaml = pytest.importorskip("yaml")
-    kimina = yaml.safe_load((INSTALLERS / "docker-compose.yml").read_text())["services"]["kimina"]
-    assert kimina["ports"] == ["0.0.0.0:${KIMINA_PORT:-18000}:8000"]
+def services(files: list[str], **settings: str) -> dict[str, Any]:
+    """The services the files make together, as Compose reads them (tests/compose_files.py)."""
+    found: dict[str, Any] = resolve(
+        [LEAN_SERVER / name for name in files], {**SETTINGS, **settings}
+    )["services"]
+    return found
 
 
-def test_behind_a_front_the_same_file_loses_its_ports_block_and_nothing_else():
-    yaml = pytest.importorskip("yaml")
-    result = pool_lib('unpublished_compose "$SRC/docker-compose.yml"')
-    assert result.returncode == 0, result.stderr
-    original = yaml.safe_load((INSTALLERS / "docker-compose.yml").read_text())
-    unpublished = yaml.safe_load(result.stdout)
-    assert "ports" not in unpublished["services"]["kimina"]
-    del original["services"]["kimina"]["ports"]
-    assert unpublished == original  # every other setting, hardening included
-    kept = set(result.stdout.splitlines())
-    removed = [
-        line
-        for line in (INSTALLERS / "docker-compose.yml").read_text().splitlines()
-        if line not in kept
-    ]
-    assert (
-        removed[0] == "    ports:" and removed[-1] == '      - "0.0.0.0:${KIMINA_PORT:-18000}:8000"'
-    )
-    assert all(line.startswith("      ") for line in removed[1:])
+def test_instance_one_publishes_its_port_from_the_servers_own_file():
+    """Instance 1 runs compose.yaml alone: its published port is what a re-run of install.sh must find."""
+    assert services(PLAIN)["kimina"]["ports"] == ["0.0.0.0:18000:8000"]
+
+
+def test_behind_a_front_the_server_loses_its_published_port_and_nothing_else():
+    plain = services(WITH_THE_AGENT)["kimina"]
+    fronted = services(BEHIND_A_FRONT)["kimina"]
+
+    assert "ports" not in fronted
+    del plain["ports"]
+    assert fronted == plain  # every other setting, hardening included
 
 
 def test_the_lean_server_has_an_init_process_with_and_without_its_published_port():
     """The server is its container's first process and collects no process but its own children, so every
-    worker it closes leaves a zombie (test_install_reaping.py runs that mechanism).
-    `init: true` puts Docker's init in front of it: in the file instance 1 runs from, and in the form a pool
-    member runs from, which must lose its ports and not this line."""
-    yaml = pytest.importorskip("yaml")
-    text = (INSTALLERS / "docker-compose.yml").read_text()
-    result = pool_lib('unpublished_compose "$SRC/docker-compose.yml"')
-    assert result.returncode == 0, result.stderr
-    for form in (text, result.stdout):
-        service = yaml.safe_load(form)["services"]["kimina"]
+    worker it closes leaves a zombie (test_install_reaping.py runs that mechanism). `init: true` puts Docker's
+    init in front of it: in the form instance 1 runs, and in the form a pool member runs."""
+    for files in (PLAIN, BEHIND_A_FRONT):
+        service = services(files)["kimina"]
         assert service["init"] is True
         # What would get in an init's way is not there, and the limit the zombies filled still is. (A read-only
         # root is no such thing: the installer decides it, and with nothing decided it stays writable.)
         assert "entrypoint" not in service and service["pids_limit"] == 4096
-        assert service["read_only"] == "${KIMINA_ROOT_READ_ONLY:-false}"
-        # A key of the service itself (four spaces), as the port-stripping awk needs every line it keeps to be.
-        assert form.count("\n    init: true\n") == 1
-    # The comment beside the line names the test that runs the mechanism, and that test is there.
-    assert "tests/install/test_install_reaping.py" in text
-    assert (Path(__file__).resolve().parent / "test_install_reaping.py").is_file()
+        assert service["read_only"] == "false"
+        assert services(files, LEAN_SERVER_ROOT_READ_ONLY="true")["kimina"]["read_only"] == "true"
 
 
 def test_the_fronts_address_is_the_250_of_a_slash_24_and_nothing_is_guessed_for_other_networks():
@@ -226,26 +226,20 @@ def test_the_fronts_address_is_the_250_of_a_slash_24_and_nothing_is_guessed_for_
 
 
 def test_the_front_and_the_agent_behind_it():
-    """The compose file of a front: what is published, what is not, and how it is locked down."""
-    yaml = pytest.importorskip("yaml")
-    compose = yaml.safe_load((INSTALLERS / "docker-compose.front.yml").read_text())
-    front, agent = compose["services"]["front"], compose["services"]["agent"]
+    """What a front publishes, what it does not, and how it is locked down."""
+    fronted = services(
+        BEHIND_A_FRONT, LEAN_SERVER_AGENT_PORT="18200", LEAN_SERVER_FRONT_ADDRESS="172.29.54.250"
+    )
+    front, agent = fronted["front"], fronted["agent"]
     # The front publishes the Lean port and the usage port; the agent publishes nothing.
-    assert front["ports"] == [
-        "0.0.0.0:${KIMINA_PORT:?set by install.sh}:${KIMINA_PORT}",
-        "0.0.0.0:${KIMINA_AGENT_PORT:?set by install_tls_front}:${KIMINA_AGENT_PORT}",
-    ]
+    assert front["ports"] == ["0.0.0.0:18000:8000", "0.0.0.0:18200:18200"]
     assert "ports" not in agent
     for service in (front, agent):
         assert service["read_only"] is True and service["cap_drop"] == ["ALL"]
         assert service["security_opt"] == ["no-new-privileges:true"]
-    # Both on the instance's own network, which the Lean server's project made; the front at a FIXED address.
-    assert compose["networks"]["kimina"] == {
-        "name": "${KIMINA_NETWORK:?set by install.sh}",
-        "external": True,
-    }
-    assert front["networks"]["kimina"]["ipv4_address"].startswith("${KIMINA_FRONT_ADDRESS:?")
-    assert agent["networks"] == ["kimina"]
+    # Both on the instance's own network; the front at a FIXED address, which its settings name.
+    assert front["networks"] == {"default": {"ipv4_address": "172.29.54.250"}}
+    assert "networks" not in agent and "network_mode" not in agent
     # The certificate directory is mounted read-only, where pool-lib.sh renders the config to look for it.
     assert (
         "./tls:/etc/leanpool/tls:ro" in front["volumes"]
@@ -373,7 +367,7 @@ def test_instance_one_can_never_be_put_behind_a_front():
     assert 'elif [ -n "$INSTANCE" ] && [ -s "$DIR/tls/box.pem" ]' in detect
     assert detect.count("TLS=1") == 2
     library = (INSTALLERS / "pool-lib.sh").read_text()
-    front = library[library.index("install_tls_front() {") : library.index("remove_tls_front() {")]
+    front = library[library.index("install_tls_front() {") : library.index(JOIN_BUNDLE)]
     assert '[ -n "$instance" ] || die' in front
 
 
@@ -382,7 +376,9 @@ def test_install_sh_installs_the_firewall_from_the_canonical_file_and_names_the_
     the tests above ran; and a fronted instance's firewall.conf names the front's address."""
     text = (INSTALLERS / "install.sh").read_text()
     assert "cat > /usr/local/sbin/kimina-firewall" not in text and "install_kimina_firewall" in text
-    assert 'KIMINA_FW_FRONT_ADDRESS=$(setting_in "$DIR/kimina.env" KIMINA_FRONT_ADDRESS)' in text
+    assert (
+        'KIMINA_FW_FRONT_ADDRESS=$(setting_in "$DIR/kimina.env" LEAN_SERVER_FRONT_ADDRESS)' in text
+    )
     library = (INSTALLERS / "pool-lib.sh").read_text()
     installer = library[
         library.index("install_kimina_firewall() {") : library.index("# set_env_in FILE KEY VALUE")
@@ -398,11 +394,7 @@ def test_install_sh_installs_the_firewall_from_the_canonical_file_and_names_the_
 
 def front_function() -> str:
     library = (INSTALLERS / "pool-lib.sh").read_text()
-    return library[
-        library.index("install_tls_front() {") : library.index(
-            "# remove_tls_front INSTANCE_DIR INSTANCE"
-        )
-    ]
+    return library[library.index("install_tls_front() {") : library.index(JOIN_BUNDLE)]
 
 
 def test_the_fronts_key_is_readable_by_the_fronts_group_and_by_nobody_else():
@@ -436,32 +428,34 @@ def test_the_fronts_config_is_judged_by_haproxy_itself_before_any_container_chan
     validate = body.index("haproxy -c -f /cfg/haproxy.cfg")
     assert body.index('chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"') < validate
     assert '-v "$work":/cfg:ro -v "$dir/tls":"$LEAN_POOL_TLS_MOUNT":ro' in body
-    for change in ('docker rm -f "$agent"', "install_lean_compose", "systemctl restart", "up -d"):
+    for change in ("set_overlay", "systemctl restart", 'compose_in "$env" up -d'):
         assert validate < body.index(change), change
     # The front is rendered with the POOL's durations, so it never cuts a check the pool still waits for.
     assert '--lean-timeout "$lean_timeout" --server-wait "$server_wait"' in body
     assert '--proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME"' in body
 
 
-def test_the_lean_server_is_unpublished_before_the_front_takes_its_port_and_nothing_is_forced_to_restart():
-    """Text check (needs root and Docker). Order on the first run: the old agent goes, the Lean server is
-    recreated without its port, the firewall learns the front's address, then the front starts. A re-run
-    recreates nothing: no --force-recreate, and a front that kept running only reloads (HUP)."""
+def test_the_firewall_knows_the_front_before_the_one_start_and_nothing_is_forced_to_restart():
+    """Text check (needs root and Docker). The instance is one project: its overlays are chosen, the firewall
+    learns the front's address, then the project starts ONCE, which recreates the server and the agent
+    without their published ports and starts the front. A re-run recreates nothing: no --force-recreate,
+    and a front that kept running only reloads (HUP)."""
     body = front_function()
     order = [
         body.index(step)
         for step in (
-            'docker rm -f "$agent"',
-            'install_lean_compose "$dir" 1',
+            'set_overlay "$env" compose.agent.yaml on',
+            'set_overlay "$env" compose.tls.yaml on',
             'set_env_in "$dir/firewall.conf" KIMINA_FW_FRONT_ADDRESS',
-            '-f "$dir/docker-compose.front.yml" up -d',
+            'compose_in "$env" up -d',
         )
     ]
     assert order == sorted(order)
+    assert body.count("up -d") == 1
     assert "--force-recreate" not in body and 'reload_if_kept "$front" "$before"' in body
-    assert (
-        'if [ -n "$old_project" ] && [ "$old_project" != "$front" ]; then' in body
-    )  # only the PLAIN agent goes
+    # The front reaches the server and the agent by their service names, on the ports inside the project.
+    assert "--lean-upstream kimina:8000 --agent-upstream agent:18200" in body
+    assert "--lean-port 8000 --agent-port 18200" in body
 
 
 def test_a_front_that_keeps_restarting_is_not_taken_for_a_running_one():
@@ -496,39 +490,41 @@ def test_a_front_that_keeps_restarting_is_not_taken_for_a_running_one():
 
 
 def test_the_lean_server_is_started_in_the_control_group_its_settings_name():
-    """The name comes from the settings (pool-lib.sh's install_cpu_priority decides it, and
-    leaves it empty on a box that cannot keep such a group); the ceiling on its CPUs still stands. A key of
-    the service itself, in the file instance 1 runs from and in the form a pool member runs from."""
-    yaml = pytest.importorskip("yaml")
-    text = (INSTALLERS / "docker-compose.yml").read_text()
-    result = pool_lib('unpublished_compose "$SRC/docker-compose.yml"')
-    assert result.returncode == 0, result.stderr
-    for form in (text, result.stdout):
-        service = yaml.safe_load(form)["services"]["kimina"]
-        assert service["cgroup_parent"] == "${KIMINA_CGROUP_PARENT:-}"
-        assert service["cpus"] == "${KIMINA_CPUS:-16}"
-        assert form.count("\n    cgroup_parent: ${KIMINA_CGROUP_PARENT:-}\n") == 1
+    """The name comes from the settings (pool-lib.sh's install_cpu_priority decides it, and leaves it empty on
+    a box that cannot keep such a group); the ceiling on its CPUs still stands. In the form instance 1 runs and
+    in the form a pool member runs."""
+    for files in (PLAIN, BEHIND_A_FRONT):
+        service = services(
+            files, LEAN_SERVER_CGROUP_PARENT="leanpool-demo.slice", LEAN_SERVER_CPUS="16"
+        )["kimina"]
+        assert service["cgroup_parent"] == "leanpool-demo.slice"
+        assert service["cpus"] == "16"
+        assert services(files)["kimina"]["cgroup_parent"] == ""
 
 
 def test_the_usage_agent_is_told_how_to_measure_open_slots_with_a_front_and_without():
-    """The worker count, the cpu.stat of the Lean server's control group, the reserve and the
-    box's limit beside other work come from the settings (empty means "not set" to the agent), and so does the
-    installer's version it states; the box's control groups are its one host mount, read-only. The front beside
-    it is given none of this."""
-    yaml = pytest.importorskip("yaml")
-    plain = yaml.safe_load((INSTALLERS / "docker-compose.agent.yml").read_text())["services"][
-        "agent"
-    ]
-    fronted = yaml.safe_load((INSTALLERS / "docker-compose.front.yml").read_text())["services"]
+    """The worker count, the cpu.stat of the Lean server's control group, the reserve and the box's limit
+    beside other work come from the settings (empty means "not set" to the agent), and so does the
+    installer's version it states; the box's control groups are its one host mount, read-only. The front
+    beside it is given none of this."""
+    given = {
+        "LEAN_SERVER_MAX_REPLS": "12",
+        "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH": "/host-cgroup/leanpool.slice/leanpool-demo.slice/cpu.stat",
+        "LEANPOOL_AGENT_CPU_RESERVE": "",
+        "LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK": "1",
+        "LEANPOOL_AGENT_VERSION": "0123456789abcdef0123456789abcdef",
+    }
+    plain = services(WITH_THE_AGENT, **given)["agent"]
+    fronted = services(BEHIND_A_FRONT, **given)
     for agent in (plain, fronted["agent"]):
         assert agent["environment"] == {
             "LEANPOOL_AGENT_HOST": "0.0.0.0",
             "LEANPOOL_AGENT_PORT": "18200",
-            "LEANPOOL_AGENT_WORKERS": "${KIMINA_MAX_REPLS:-}",
-            "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH": "${KIMINA_AGENT_LEAN_CPU_STAT:-}",
-            "LEANPOOL_AGENT_CPU_RESERVE": "${KIMINA_AGENT_CPU_RESERVE:-}",
-            "LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK": "${KIMINA_AGENT_BESIDE_OTHER_WORK:-}",
-            "LEANPOOL_AGENT_VERSION": "${KIMINA_INSTALLER_VERSION:-}",
+            "LEANPOOL_AGENT_WORKERS": "12",
+            "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH": "/host-cgroup/leanpool.slice/leanpool-demo.slice/cpu.stat",
+            "LEANPOOL_AGENT_CPU_RESERVE": "",
+            "LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK": "1",
+            "LEANPOOL_AGENT_VERSION": "0123456789abcdef0123456789abcdef",
         }
         assert agent["volumes"] == ["/sys/fs/cgroup:/host-cgroup:ro"]
         assert agent["read_only"] is True and agent["cap_drop"] == ["ALL"]

@@ -13,7 +13,7 @@
 #   1. pre-flight: docker, the instance, the LAN subnet and resolver; pulls the pinned HAProxy image and
 #      stops, with nothing of the pool changed, if it was built without its Prometheus exporter
 #   2. builds the lean-pool image (cache, usage agent, join service, tools)
-#   3. /srv/lean-pool-NAME (root-owned): compose file, pool.env, the pool key (readable by root and the pool
+#   3. /srv/lean-pool-NAME (root-owned): the compose files, pool.env, the pool key (readable by root and the pool
 #      image's group), the server list (this box's server first), the admission cases, the join bundle, and
 #      this box's Lean image exported once for joining boxes
 #   4. certificates: the pool's authority (root only, made once), the front door's, the proxy's client
@@ -81,16 +81,19 @@ done
 
 DIR=/srv/lean-pool-$POOL
 INSTANCE_DIR=/srv/kimina-$POOL
-compose() { docker compose --project-name "$SITE_PREFIX-pool-$POOL" --env-file "$DIR/pool.env" -f "$DIR/docker-compose.pool.yml" "$@"; }
+# The pool's one project (compose_in, pool-lib.sh): the proxy and the cache, from the files pool.env names.
+PROJECT=lean-pool-$POOL
+PROXY=$PROJECT-haproxy-1
+compose() { compose_in "$DIR/pool.env" "$@"; }
 
 if [ "$UNINSTALL" -eq 1 ]; then
   say "Uninstalling the $POOL pool's front door (the Lean servers stay)"
-  docker rm -f -v "$SITE_PREFIX-join-$POOL" >/dev/null 2>&1 || true
-  if [ -f "$DIR/pool.env" ]; then compose down || true; fi
+  docker rm -f -v "$PROJECT-join" >/dev/null 2>&1 || true
+  if [ -f "$DIR/pool.env" ] && [ -n "$(setting_in "$DIR/pool.env" COMPOSE_PROJECT_NAME)" ]; then compose down || true; fi
   remove_lan_firewall "proxy-$POOL"
   remove_lan_firewall "join-$POOL"
   if [ "$PURGE" -eq 1 ]; then
-    docker volume rm "$SITE_PREFIX-cache-$POOL" 2>/dev/null || true
+    docker volume rm "${PROJECT}_cache-data" 2>/dev/null || true
     rm -rf "$DIR"
     echo "removed $DIR (the pool's certificate authority with it: every certificate it signed is void) and the cache volume"
   else
@@ -105,20 +108,25 @@ command -v docker >/dev/null || die "docker is not installed"
 ! docker_is_snap || die "$SNAP_DOCKER_UNSUPPORTED"
 command -v python3 >/dev/null || die "python3 is needed on the host (the admission cases, and the join window's checks)"
 [ -f "$INSTANCE_DIR/kimina.env" ] || die "no Lean server instance '$POOL' here; first: sudo bash install.sh --instance $POOL"
-for file in docker-compose.pool.yml docker-compose.agent.yml docker-compose.front.yml lean-pool-ctl kimina-ctl kimina-firewall \
-            join_helper.py join-box.sh "${LEAN_POOL_JOIN_FILES[@]}"; do
+for file in lean-pool-ctl kimina-ctl kimina-firewall join_helper.py join-box.sh "${LEAN_POOL_JOIN_FILES[@]}"; do
   [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
 done
+# The compose files are the lean-pool project's own (deploy/pool/, and deploy/lean-server/ for this box's server).
+compose_source pool >/dev/null
+compose_source server >/dev/null
 [ -f "$SITE/instances/$POOL.env" ] || die "the site has no instance '$POOL' ($SITE/instances/$POOL.env): a joining box installs it from there"
 # What a server must verify and reject before it may join: the site's own cases (leanpool-admit reads them).
 [ -n "$ADMIT_CASES" ] || die "--admit-cases DIR is needed: the cases a server must verify and reject before it may join pool '$POOL'"
 [ -d "$ADMIT_CASES" ] && [ -n "$(ls -A "$ADMIT_CASES" 2>/dev/null)" ] || die "--admit-cases: $ADMIT_CASES is not a directory of cases"
 instance_setting() { setting_in "$INSTANCE_DIR/kimina.env" "$1"; }
-INSTANCE_PORT=$(instance_setting KIMINA_PORT)
-INSTANCE_WORKERS=$(instance_setting KIMINA_MAX_REPLS)
-INSTANCE_WAIT=$(instance_setting KIMINA_MAX_WAIT)
-PIN=$(instance_setting KIMINA_IMAGE_TAG)
-[ -n "$INSTANCE_PORT" ] && [ -n "$INSTANCE_WORKERS" ] && [ -n "$PIN" ] || die "$INSTANCE_DIR/kimina.env is incomplete"
+INSTANCE_PORT=$(instance_setting LEAN_SERVER_PUBLISHED_PORT)
+INSTANCE_WORKERS=$(instance_setting LEAN_SERVER_MAX_REPLS)
+INSTANCE_WAIT=$(instance_setting LEAN_SERVER_MAX_WAIT)
+LEAN_IMAGE=$(instance_setting LEAN_SERVER_IMAGE)
+# The cache's pin names the servers' Lean and Mathlib: the tag of the server's image, as it always was.
+PIN=${LEAN_IMAGE##*:}
+[ -n "$INSTANCE_PORT" ] && [ -n "$INSTANCE_WORKERS" ] && [ -n "$LEAN_IMAGE" ] && [ "$PIN" != "$LEAN_IMAGE" ] \
+  || die "$INSTANCE_DIR/kimina.env is incomplete"
 AGENT_PORT=$((INSTANCE_PORT + 200))
 SERVER_WAIT=${INSTANCE_WAIT:-120}
 
@@ -136,8 +144,8 @@ fi
 echo "resolver for the proxy (other boxes are named on the LAN): $DNS"
 # This box's own Lean server is recreated below if its compose file changed, and that file gives the container
 # an init process: a Docker that cannot start one is found out here, before anything is written.
-if [ -n "$(docker image inspect -f '{{.Id}}' "$SITE_PREFIX/kimina:$PIN" 2>/dev/null || true)" ] && ! init_starts "$SITE_PREFIX/kimina:$PIN"; then
-  die "$(init_unsupported "$SITE_PREFIX/kimina:$PIN")"
+if [ -n "$(docker image inspect -f '{{.Id}}' "$LEAN_IMAGE" 2>/dev/null || true)" ] && ! init_starts "$LEAN_IMAGE"; then
+  die "$(init_unsupported "$LEAN_IMAGE")"
 fi
 GATEWAY=$(echo "$POOL_SUBNET" | sed 's|\.[0-9]*/[0-9]*$|.1|')
 # The names clients use for this host: its short name and that name on the LAN.
@@ -164,43 +172,45 @@ POOL_GID=$(image_group_id "$LEAN_POOL_IMAGE") || die "could not read the group $
 say "Installing files into $DIR"
 install_site_env             # the site's names, for lean-pool-ctl (its check of the config below runs it)
 install -d -o root -g root -m 0755 "$DIR" "$DIR/haproxy"
-install -o root -g root -m 0644 "$SRC/docker-compose.pool.yml" "$DIR/"
+install_compose_files "$DIR" pool
 # The pool's key is this instance's key. Readable by root and by the pool image's group (the cache, and
 # the join service while a window is open), nobody else.
-( umask 077; instance_setting KIMINA_API_KEY > "$DIR/api-key" )
+( umask 077; instance_setting LEAN_SERVER_API_KEY > "$DIR/api-key" )
 [ -s "$DIR/api-key" ] || die "the instance has no API key"
 chown root:"$POOL_GID" "$DIR/api-key"; chmod 0640 "$DIR/api-key"
 
 ( umask 077; : >> "$DIR/pool.env" )
 chown root:root "$DIR/pool.env"; chmod 0600 "$DIR/pool.env"
 pool_setting() { setting_in "$DIR/pool.env" "$1"; }
-set_env_in "$DIR/pool.env" POOL_NAME "$POOL"
-set_env_in "$DIR/pool.env" POOL_IMAGE "$LEAN_POOL_IMAGE"
-set_env_in "$DIR/pool.env" POOL_IMAGE_GID "$POOL_GID"
-set_env_in "$DIR/pool.env" POOL_HAPROXY_IMAGE "$HAPROXY_IMAGE"
-set_env_in "$DIR/pool.env" POOL_PUBLIC_PORT "$PORT"
-set_env_in "$DIR/pool.env" POOL_PIN "$PIN"
-set_env_in "$DIR/pool.env" POOL_LEAN_TIMEOUT "$LEAN_TIMEOUT"
-set_env_in "$DIR/pool.env" POOL_SERVER_WAIT "$SERVER_WAIT"
-set_env_in "$DIR/pool.env" POOL_SUBNET "$POOL_SUBNET"
-set_env_in "$DIR/pool.env" POOL_DNS "$DNS"
-set_env_in "$DIR/pool.env" POOL_JOIN_PORT "$JOIN_PORT"
+pool_default() { grep -q "^$1=" "$DIR/pool.env" || echo "$1=$2" >> "$DIR/pool.env"; }
+set_env_in "$DIR/pool.env" COMPOSE_PROJECT_NAME "$PROJECT"
+set_env_in "$DIR/pool.env" COMPOSE_FILE "$(IFS=:; echo "${LEAN_POOL_COMPOSE_FILES[*]}")"
+set_env_in "$DIR/pool.env" LEANPOOL_IMAGE "$LEAN_POOL_IMAGE"
+set_env_in "$DIR/pool.env" LEANPOOL_IMAGE_GID "$POOL_GID"
+set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_IMAGE "$HAPROXY_IMAGE"
+set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_PUBLIC_PORT "$PORT"
+set_env_in "$DIR/pool.env" LEANPOOL_CACHE_PIN "$PIN"
+set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS "$LEAN_TIMEOUT"
+set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS "$SERVER_WAIT"
+set_env_in "$DIR/pool.env" LEANPOOL_SUBNET "$POOL_SUBNET"
+set_env_in "$DIR/pool.env" LEANPOOL_DNS "$DNS"
+set_env_in "$DIR/pool.env" LEANPOOL_JOIN_PUBLIC_PORT "$JOIN_PORT"
 # This installer's version (pool-lib.sh, installer_version), which the pool's GET /health carries.
 POOL_VERSION=$(installer_version "$POOL") \
   || { warn "could not compute this installer's version: the pool's GET /health carries none"; POOL_VERSION=""; }
-set_env_in "$DIR/pool.env" POOL_INSTALLER_VERSION "$POOL_VERSION"
-grep -q '^POOL_MAX_REQUEST_BYTES=' "$DIR/pool.env" || echo "POOL_MAX_REQUEST_BYTES=262144" >> "$DIR/pool.env"
-grep -q '^POOL_CACHE_MAX_BYTES=' "$DIR/pool.env" || echo "POOL_CACHE_MAX_BYTES=4294967296" >> "$DIR/pool.env"
-grep -q '^POOL_CACHE_UPSTREAM_TIMEOUT=' "$DIR/pool.env" || echo "POOL_CACHE_UPSTREAM_TIMEOUT=1200" >> "$DIR/pool.env"
+set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_INSTALLER_VERSION "$POOL_VERSION"
+pool_default LEANPOOL_CACHE_MAX_REQUEST_BYTES 262144
+pool_default LEANPOOL_CACHE_MAX_BYTES 4294967296
+pool_default LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS 1200
 # The host name a new box is told to fetch its join script from. Kept once set, so it can be edited here.
-grep -q '^POOL_JOIN_HOST=' "$DIR/pool.env" || echo "POOL_JOIN_HOST=$SHORT.$SITE_LAN_DOMAIN" >> "$DIR/pool.env"
+pool_default LEANPOOL_JOIN_PUBLIC_HOST "$SHORT.$SITE_LAN_DOMAIN"
 # Further names clients use for the front door (--front-name). Kept across re-runs: a re-run without the
 # option asks for the same certificate as before.
 if [ "${#FRONT_NAMES[@]}" -gt 0 ]; then
-  set_env_in "$DIR/pool.env" POOL_FRONT_NAMES "$(IFS=,; echo "${FRONT_NAMES[*]}")"
+  set_env_in "$DIR/pool.env" LEANPOOL_FRONT_NAMES "$(IFS=,; echo "${FRONT_NAMES[*]}")"
 fi
-EXTRA_FRONT_NAMES=$(pool_setting POOL_FRONT_NAMES)
-[[ "$EXTRA_FRONT_NAMES" =~ ^[a-z0-9.,-]*$ ]] || die "POOL_FRONT_NAMES in $DIR/pool.env must be DNS names separated by commas"
+EXTRA_FRONT_NAMES=$(pool_setting LEANPOOL_FRONT_NAMES)
+[[ "$EXTRA_FRONT_NAMES" =~ ^[a-z0-9.,-]*$ ]] || die "LEANPOOL_FRONT_NAMES in $DIR/pool.env must be DNS names separated by commas"
 
 if [ ! -f "$DIR/servers" ]; then
   # This box's own Lean server, reached at the pool network's gateway (an IPv4 literal, see the compose file).
@@ -236,7 +246,7 @@ install -o root -g root -m 0644 "$SRC/join-box.sh" "$DIR/join/join-box.sh"
 
 # This host's Lean image, exported once, so that a joining box loads it instead of building.
 say "The Lean server's image for joining boxes (exported once per image; a box without it builds its own)"
-export_join_image "$DIR" "$POOL_GID" "$SITE_PREFIX/kimina:$PIN"
+export_join_image "$DIR" "$POOL_GID" "$LEAN_IMAGE"
 
 # ----------------------------------------------------------------------------------------- certificates
 # Layout, with who may read what:
@@ -270,7 +280,7 @@ wanted_names="$SHORT, $SHORT.$SITE_LAN_DOMAIN"
 if [ -n "$EXTRA_FRONT_NAMES" ]; then
   IFS=, read -r -a extra_names <<<"$EXTRA_FRONT_NAMES"
   for front_name in "${extra_names[@]}"; do
-    [[ "$front_name" =~ $LEAN_POOL_DNS_NAME ]] || die "POOL_FRONT_NAMES in $DIR/pool.env: '$front_name' is not a DNS name in lower case"
+    [[ "$front_name" =~ $LEAN_POOL_DNS_NAME ]] || die "LEANPOOL_FRONT_NAMES in $DIR/pool.env: '$front_name' is not a DNS name in lower case"
     front_arguments+=(--dns "$front_name"); wanted_names="$wanted_names, $front_name"
   done
 fi
@@ -330,7 +340,7 @@ install -o root -g root -m 0755 "$SRC/join_helper.py" "$SITE_HELPER_DIR/join_hel
 
 # ------------------------------------------------------------------ this box's own server: a TLS front
 # The shared function a joining box uses too. It validates the front's config before it touches a
-# container; then the Lean server is recreated without its published port, once.
+# container; then the instance's project is brought up with the front, once.
 if [ "$FIREWALL" -eq 1 ]; then install_tls_front "$INSTANCE_DIR" "$POOL" "$OWN_NAME" "$DIR/pki/box" "$LEAN_TIMEOUT" "$SERVER_WAIT" "$SUBNET"
 else install_tls_front "$INSTANCE_DIR" "$POOL" "$OWN_NAME" "$DIR/pki/box" "$LEAN_TIMEOUT" "$SERVER_WAIT" ""; fi
 
@@ -338,10 +348,10 @@ else install_tls_front "$INSTANCE_DIR" "$POOL" "$OWN_NAME" "$DIR/pki/box" "$LEAN
 say "Installing the config and starting the proxy and the cache"
 rendered=$(/usr/local/sbin/lean-pool-ctl "$POOL" render --no-reload) || die "could not install the HAProxy config"
 upstream_timeout=$(echo "$rendered" | sed -n 's/^cache_upstream_timeout=//p')
-[ -z "$upstream_timeout" ] || set_env_in "$DIR/pool.env" POOL_CACHE_UPSTREAM_TIMEOUT "$upstream_timeout"
-proxy_before=$(docker inspect -f '{{.Id}}' "$SITE_PREFIX-proxy-$POOL" 2>/dev/null || true)
+[ -z "$upstream_timeout" ] || set_env_in "$DIR/pool.env" LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS "$upstream_timeout"
+proxy_before=$(docker inspect -f '{{.Id}}' "$PROXY" 2>/dev/null || true)
 compose up -d
-reload_if_kept "$SITE_PREFIX-proxy-$POOL" "$proxy_before"     # a proxy that kept running loads the config now
+reload_if_kept "$PROXY" "$proxy_before"     # a proxy that kept running loads the config now
 
 if [ "$FIREWALL" -eq 1 ]; then
   say "Firewall"
@@ -367,7 +377,7 @@ done
 # another server could have answered. One that fails is made writable again and checked once more. It runs
 # after a failed check through the pool too (a pool whose only server the read-only root broke is put back),
 # and the first failure stays the verdict.
-if [ "$(setting_in "$INSTANCE_DIR/kimina.env" KIMINA_ROOT_READ_ONLY)" = true ]; then
+if [ "$(setting_in "$INSTANCE_DIR/kimina.env" LEAN_SERVER_ROOT_READ_ONLY)" = true ]; then
   say "Verifying this box's own Lean server by itself, with its root read-only"
   if ! confirm_read_only_root "$INSTANCE_DIR" "$POOL" && [ "$checked" -eq 1 ]; then
     verdict="POOL INSTALLED, BUT THIS BOX'S OWN LEAN SERVER FAILED ITS CHECK - see: sudo kimina-ctl @$POOL logs 200"

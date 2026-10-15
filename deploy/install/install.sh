@@ -193,7 +193,8 @@ load_site "$SITE"
 # ------------------------------------------------------------------------------------------- instance
 # Everything that differs between instances is the site's instance file and nowhere else: instances/NAME.env,
 # or instances/default.env for the instance with no name ("instance 1"). Re-running with the same file changes
-# none of what it says. The names follow from the instance's own: /srv/kimina[-NAME], <prefix>-kimina[-NAME].
+# none of what it says. The names follow from the instance's own: /srv/kimina[-NAME], and the compose project
+# lean-server[-NAME], whose containers Compose names (lean-server[-NAME]-kimina-1, -agent-1, -front-1).
 # (What every instance's own installer brings it: the init process, and a control group of its own
 # with three settings added to kimina.env.)
 load_instance() {   # NAME (empty: the instance with no name) : its values, each checked for its shape
@@ -241,15 +242,16 @@ load_instance() {   # NAME (empty: the instance with no name) : its values, each
   || die "--instance takes 1-16 lower-case letters and digits (not 'default': that is the file of the instance with no name; not 'main': that is the name of its control group)"
 load_instance "$INSTANCE"
 DIR=/srv/kimina${INSTANCE:+-$INSTANCE}
-CONTAINER=$SITE_PREFIX-kimina${INSTANCE:+-$INSTANCE}
-PROJECT=$CONTAINER
+PROJECT=$(lean_server_project "$INSTANCE")
+CONTAINER=$PROJECT-kimina-1
 IMAGE=$SITE_PREFIX/kimina:$IMAGE_TAG
 FW_UNIT=kimina-firewall${INSTANCE:+-$INSTANCE}.service
 PORT=${PORT:-$DEFAULT_PORT}
 # The usage agent (lean-pool) runs beside a named instance by default; instance 1 is left as it was.
 if [ -z "$AGENT" ]; then if [ -n "$INSTANCE" ]; then AGENT=1; else AGENT=0; fi; fi
 AGENT_PORT=$((PORT + 200))
-AGENT_CONTAINER=$SITE_PREFIX-agent${INSTANCE:+-$INSTANCE}
+AGENT_CONTAINER=$PROJECT-agent-1
+FRONT_CONTAINER=$PROJECT-front-1
 CTL_PREFIX=${INSTANCE:+@$INSTANCE }
 # The door: an operator key, unless --no-door.
 DOOR=0
@@ -301,12 +303,8 @@ if [ -n "$TLS_DIR$SERVER_NAME$POOL_LEAN_TIMEOUT$POOL_SERVER_WAIT" ]; then
 fi
 [ "$(id -u)" -eq 0 ] || die "run with sudo: sudo bash $0"
 
-# The compose file takes the container's and network's names from the environment: a named instance's kimina.env
-# holds them too, the instance with no name's does not (its container and network have the site's plain names).
-compose() {
-  KIMINA_CONTAINER=$CONTAINER KIMINA_NETWORK=$PROJECT \
-    docker compose --project-name "$PROJECT" --env-file "$DIR/kimina.env" -f "$DIR/docker-compose.yml" "$@"
-}
+# The instance's one project, with the files kimina.env names (compose_in, pool-lib.sh).
+compose() { compose_in "$DIR/kimina.env" "$@"; }
 
 door_home() { getent passwd "$1" | cut -d: -f6; }
 
@@ -334,10 +332,8 @@ other_instances_remain() {   # any OTHER installed instance still has a kimina.e
 # ------------------------------------------------------------------------------------------- uninstall
 if [ "$UNINSTALL" -eq 1 ]; then
   say "Uninstalling ${INSTANCE:-instance 1}"
-  # A TLS front and its agent go first: they hold the instance's network and its published ports.
-  if declare -F remove_tls_front >/dev/null; then remove_tls_front "$DIR" "$INSTANCE"; fi
-  if [ -f "$DIR/kimina.env" ] && [ -f "$DIR/docker-compose.yml" ]; then compose down || true; fi
-  docker rm -f "$AGENT_CONTAINER" >/dev/null 2>&1 || true
+  # The instance's one project: the server, and beside a named instance its usage agent and TLS front.
+  if [ -f "$DIR/kimina.env" ] && [ -n "$(setting_in "$DIR/kimina.env" COMPOSE_PROJECT_NAME)" ]; then compose down || true; fi
   if declare -F remove_lan_firewall >/dev/null; then remove_lan_firewall "agent${INSTANCE:+-$INSTANCE}"; fi
   if [ -x /usr/local/sbin/kimina-firewall ]; then /usr/local/sbin/kimina-firewall remove $INSTANCE || true; fi
   systemctl disable --now "$FW_UNIT" 2>/dev/null || true
@@ -381,15 +377,15 @@ if [ -n "$TLS_DIR" ]; then
   TLS=1; TLS_SOURCE=$TLS_DIR
 elif [ -n "$INSTANCE" ] && [ -s "$DIR/tls/box.pem" ] && [ -f "$DIR/kimina.env" ] && declare -F install_tls_front >/dev/null; then
   TLS=1; TLS_SOURCE=$DIR/tls
-  SERVER_NAME=$(setting_in "$DIR/kimina.env" KIMINA_SERVER_NAME)
-  [ -n "$SERVER_NAME" ] || die "$DIR/tls holds a certificate but $DIR/kimina.env names no server (KIMINA_SERVER_NAME)"
+  SERVER_NAME=$(setting_moved_in "$DIR/kimina.env" LEAN_SERVER_NAME KIMINA_SERVER_NAME)
+  [ -n "$SERVER_NAME" ] || die "$DIR/tls holds a certificate but $DIR/kimina.env names no server (LEAN_SERVER_NAME)"
   [ "$AGENT" -eq 1 ] || die "this instance is behind a TLS front, which carries the usage agent's port: --no-agent cannot go with it"
   echo "this instance is behind a TLS front as '$SERVER_NAME': keeping it"
 fi
 if [ "$TLS" -eq 1 ]; then      # the pool's two durations: given now, else what the front was installed with
   if [ -f "$DIR/kimina.env" ]; then
-    POOL_LEAN_TIMEOUT=${POOL_LEAN_TIMEOUT:-$(setting_in "$DIR/kimina.env" KIMINA_FRONT_LEAN_TIMEOUT)}
-    POOL_SERVER_WAIT=${POOL_SERVER_WAIT:-$(setting_in "$DIR/kimina.env" KIMINA_FRONT_SERVER_WAIT)}
+    POOL_LEAN_TIMEOUT=${POOL_LEAN_TIMEOUT:-$(setting_moved_in "$DIR/kimina.env" LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS KIMINA_FRONT_LEAN_TIMEOUT)}
+    POOL_SERVER_WAIT=${POOL_SERVER_WAIT:-$(setting_moved_in "$DIR/kimina.env" LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS KIMINA_FRONT_SERVER_WAIT)}
   fi
   POOL_LEAN_TIMEOUT=${POOL_LEAN_TIMEOUT:-300}
   POOL_SERVER_WAIT=${POOL_SERVER_WAIT:-120}
@@ -513,29 +509,16 @@ fi
 for file in ${BUILD_FILES[@]+"${BUILD_FILES[@]}"}; do
   [ -f "$SITE/$file" ] || die "missing $SITE/$file, which the instance's recipe names (INSTANCE_BUILD_FILES)"
 done
-for file in docker-compose.yml kimina-ctl; do
-  [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-done
-if [ "$FIREWALL" -eq 1 ]; then
-  for file in pool-lib.sh kimina-firewall; do
-    [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-  done
-fi
-if [ "$AGENT" -eq 1 ]; then
-  for file in pool-lib.sh docker-compose.agent.yml; do
-    [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-  done
-  lean_pool_source >/dev/null || die "$LEAN_POOL_SOURCE_MISSING (it is needed for the usage agent; --no-agent skips that)"
+[ -f "$SRC/kimina-ctl" ] || die "missing $SRC/kimina-ctl - run this from the repo checkout"
+# The compose files are the lean-pool project's own (deploy/lean-server/), for every instance.
+compose_source server >/dev/null
+if [ "$FIREWALL" -eq 1 ] || [ "$TLS" -eq 1 ]; then
+  [ -f "$SRC/kimina-firewall" ] || die "missing $SRC/kimina-firewall - run this from the repo checkout"
 fi
 # A named instance compiles linarith's search step from its own image, with the lean-pool project's make.sh.
 if [ -n "$INSTANCE" ] && declare -F install_compiled_search >/dev/null; then
   project=$(lean_pool_source) && [ -f "$project/$LEAN_NATIVE_MAKE" ] \
     || die "missing $LEAN_NATIVE_MAKE: $LEAN_POOL_SOURCE_MISSING"
-fi
-if [ "$TLS" -eq 1 ]; then
-  for file in docker-compose.front.yml kimina-firewall; do
-    [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-  done
 fi
 # The server's container has an init process. Where the image is already on
 # this host (a re-run, a refresh), a Docker that cannot start such a container is found out HERE, before
@@ -573,7 +556,6 @@ echo "cpu microcode: $(grep -m1 microcode /proc/cpuinfo | awk '{print $3}')"
 # The port may be held by this instance's own server, or by its TLS front; by anything else it is taken.
 # (Asked of Docker for one container: a listing piped into `grep -q` can fail under pipefail.)
 runs() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = true ]; }
-FRONT_CONTAINER=$SITE_PREFIX-front-${INSTANCE:-none}
 if ! runs "$CONTAINER" && ! runs "$FRONT_CONTAINER"; then
   if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
     die "port $PORT is already in use; pass --port N"
@@ -589,12 +571,12 @@ fi
 # here, before anything is written, as well as where the setting is read below.
 wanted_net=$DEFAULT_NET
 if [ -f "$DIR/kimina.env" ]; then
-  wanted_net=$(sed -n 's/^KIMINA_SUBNET=//p' "$DIR/kimina.env" | head -n 1)
+  wanted_net=$(setting_moved_in "$DIR/kimina.env" LEAN_SERVER_SUBNET KIMINA_SUBNET)
   wanted_net=${wanted_net:-$DEFAULT_NET}
 fi
 if { ip -4 route show 2>/dev/null || true; } | awk '{print $1}' | grep -qx "$wanted_net" \
-   && ! docker network inspect "$PROJECT" >/dev/null 2>&1; then
-  die "the host already routes $wanted_net, which this server's own network would use; put KIMINA_SUBNET=<a free /24> in $DIR/kimina.env (make the file if it is not there), then run this again"
+   && ! docker network inspect "${PROJECT}_default" >/dev/null 2>&1; then
+  die "the host already routes $wanted_net, which this server's own network would use; put LEAN_SERVER_SUBNET=<a free /24> in $DIR/kimina.env (make the file if it is not there), then run this again"
 fi
 
 if [ "$FIREWALL" -eq 1 ] && [ -z "$SUBNET" ]; then
@@ -647,9 +629,7 @@ fi
 say "Installing files into $DIR"
 install_site_env             # the site's names, for the programs installed on this host (kimina-ctl, lean-pool-ctl)
 install_build_files
-install -o root -g root -m 0644 "$SRC/docker-compose.yml" "$DIR/"
-# Behind a TLS front the Lean server publishes no port: the front holds it.
-[ "$TLS" -eq 0 ] || install_lean_compose "$DIR" 1
+install_compose_files "$DIR" server     # unchanged; kimina.env says which of them the instance runs
 
 set_env() {   # set_env KEY VALUE : replace or append one line of kimina.env
   if grep -q "^$1=" "$DIR/kimina.env"; then sed -i "s|^$1=.*|$1=$2|" "$DIR/kimina.env"; else echo "$1=$2" >> "$DIR/kimina.env"; fi
@@ -660,43 +640,42 @@ default_env() {   # default_env KEY VALUE : only when the key is absent (keeps t
 
 if [ ! -f "$DIR/kimina.env" ]; then
   ( umask 077; : > "$DIR/kimina.env" )
-  echo "KIMINA_API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$DIR/kimina.env"
+  echo "LEAN_SERVER_API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$DIR/kimina.env"
   echo "generated a new API key"
 else
   echo "keeping the existing API key and settings"
 fi
 chown root:root "$DIR/kimina.env"; chmod 0600 "$DIR/kimina.env"
-set_env KIMINA_IMAGE_TAG "$IMAGE_TAG"
-set_env KIMINA_PORT "$PORT"
-if [ -n "$INSTANCE" ]; then          # instance 1 keeps the compose defaults, so its env file is unchanged
-  set_env KIMINA_CONTAINER "$CONTAINER"
-  set_env KIMINA_PROJECT "$PROJECT"
-  set_env KIMINA_NETWORK "$PROJECT"
-fi
-default_env KIMINA_MAX_REPLS "$DEFAULT_REPLS"
-default_env KIMINA_MAX_REPL_USES 200
-default_env KIMINA_MAX_REPL_MEM "$DEFAULT_REPL_MEM"
-default_env KIMINA_MAX_WAIT 120
-default_env KIMINA_MEM_LIMIT 36g
-default_env KIMINA_LOG_LEVEL WARNING
-default_env KIMINA_CPUS "$DEFAULT_CPUS"
-default_env KIMINA_SUBNET "$DEFAULT_NET"
-CONTAINER_NET=$(sed -n 's/^KIMINA_SUBNET=//p' "$DIR/kimina.env" | head -n 1)
-[[ "$CONTAINER_NET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "KIMINA_SUBNET in $DIR/kimina.env must be CIDR"
+# Which project, and which of its files: compose.yaml alone until the agent, the TLS front or the compiled
+# search step adds its overlay. Never reset here: a run that stops halfway must not drop a running box's.
+set_env COMPOSE_PROJECT_NAME "$PROJECT"
+default_env COMPOSE_FILE compose.yaml
+set_env LEAN_SERVER_IMAGE "$IMAGE"
+set_env LEAN_SERVER_PUBLISHED_PORT "$PORT"
+default_env LEAN_SERVER_MAX_REPLS "$DEFAULT_REPLS"
+default_env LEAN_SERVER_MAX_REPL_USES 200
+default_env LEAN_SERVER_MAX_REPL_MEM "$DEFAULT_REPL_MEM"
+default_env LEAN_SERVER_MAX_WAIT 120
+default_env LEAN_SERVER_MEM_LIMIT 36g
+default_env LEAN_SERVER_LOG_LEVEL WARNING
+default_env LEAN_SERVER_CPUS "$DEFAULT_CPUS"
+default_env LEAN_SERVER_SUBNET "$DEFAULT_NET"
+CONTAINER_NET=$(setting_in "$DIR/kimina.env" LEAN_SERVER_SUBNET)
+[[ "$CONTAINER_NET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "LEAN_SERVER_SUBNET in $DIR/kimina.env must be CIDR"
 # The container's own network must not collide with one the host already routes (other than ours).
 if ip -4 route show | awk '{print $1}' | grep -qx "$CONTAINER_NET" \
-   && ! docker network inspect "$PROJECT" >/dev/null 2>&1; then
-  die "the host already routes $CONTAINER_NET; set KIMINA_SUBNET in $DIR/kimina.env to a free /24"
+   && ! docker network inspect "${PROJECT}_default" >/dev/null 2>&1; then
+  die "the host already routes $CONTAINER_NET; set LEAN_SERVER_SUBNET in $DIR/kimina.env to a free /24"
 fi
-[ -z "$REPLS" ] || set_env KIMINA_MAX_REPLS "$REPLS"
-[ -z "$MEM_LIMIT" ] || set_env KIMINA_MEM_LIMIT "$MEM_LIMIT"
-[ -z "$CPUS" ] || set_env KIMINA_CPUS "$CPUS"
+[ -z "$REPLS" ] || set_env LEAN_SERVER_MAX_REPLS "$REPLS"
+[ -z "$MEM_LIMIT" ] || set_env LEAN_SERVER_MEM_LIMIT "$MEM_LIMIT"
+[ -z "$CPUS" ] || set_env LEAN_SERVER_CPUS "$CPUS"
 if [ -n "$POOL_KEY" ]; then
   # Not through set_env: sed would be handed the key as an argument, and a command line is visible to every
   # user of the box. grep is given no secret, and printf is the shell's own.
-  other_settings=$(grep -v '^KIMINA_API_KEY=' "$DIR/kimina.env" || true)
+  other_settings=$(grep -v '^LEAN_SERVER_API_KEY=' "$DIR/kimina.env" || true)
   ( umask 077
-    printf 'KIMINA_API_KEY=%s\n' "$POOL_KEY" > "$DIR/kimina.env.new"       # the key's place: the first line
+    printf 'LEAN_SERVER_API_KEY=%s\n' "$POOL_KEY" > "$DIR/kimina.env.new"       # the key's place: the first line
     [ -z "$other_settings" ] || printf '%s\n' "$other_settings" >> "$DIR/kimina.env.new" )
   chown root:root "$DIR/kimina.env.new"; chmod 0600 "$DIR/kimina.env.new"
   mv -f "$DIR/kimina.env.new" "$DIR/kimina.env"
@@ -723,21 +702,25 @@ fi
 if declare -F install_read_only_root >/dev/null; then
   install_read_only_root "$DIR" "$INSTANCE"
 fi
-say "Starting the service"
-compose up -d
-
-# ---------------------------------------------------------------------------------------- usage agent
+# The usage agent and the TLS front are services of the instance's own project: their settings and overlays
+# come first, and the project starts once.
+agent_subnet=""
 if [ "$AGENT" -eq 1 ]; then
   build_lean_pool_image
-  agent_subnet=""
   [ "$FIREWALL" -eq 0 ] || agent_subnet=$SUBNET
-  if [ "$TLS" -eq 1 ]; then
-    # The front publishes the Lean port and the usage port; the agent runs behind it, unpublished.
-    install_tls_front "$DIR" "$INSTANCE" "$SERVER_NAME" "$TLS_SOURCE" "$POOL_LEAN_TIMEOUT" "$POOL_SERVER_WAIT" "$agent_subnet"
-  else
+elif [ -n "$INSTANCE" ]; then
+  set_overlay "$DIR/kimina.env" compose.agent.yaml off
+fi
+if [ "$TLS" -eq 1 ]; then
+  # The front publishes the Lean port and the usage port; the server and the agent run behind it, unpublished.
+  install_tls_front "$DIR" "$INSTANCE" "$SERVER_NAME" "$TLS_SOURCE" "$POOL_LEAN_TIMEOUT" "$POOL_SERVER_WAIT" "$agent_subnet"
+else
+  if [ "$AGENT" -eq 1 ]; then
     say "Usage agent: reports this box's CPU and RAM headroom to the pool's proxy"
     install_usage_agent "$DIR" "$INSTANCE" "$AGENT_PORT" "$agent_subnet"
   fi
+  say "Starting the service"
+  compose up -d
 fi
 
 # ------------------------------------------------------------------------------------------ firewall
@@ -745,7 +728,7 @@ if [ "$FIREWALL" -eq 1 ]; then
   say "Firewall: port $PORT reachable from $SUBNET and the docker bridges only; the container may not open connections"
   printf 'KIMINA_FW_PORT=%s\nKIMINA_FW_SUBNET=%s\nKIMINA_FW_CONTAINER_NET=%s\n' "$PORT" "$SUBNET" "$CONTAINER_NET" > "$DIR/firewall.conf"
   # Behind a TLS front: the front's fixed address is the one exception to the egress block.
-  [ "$TLS" -eq 0 ] || echo "KIMINA_FW_FRONT_ADDRESS=$(setting_in "$DIR/kimina.env" KIMINA_FRONT_ADDRESS)" >> "$DIR/firewall.conf"
+  [ "$TLS" -eq 0 ] || echo "KIMINA_FW_FRONT_ADDRESS=$(setting_in "$DIR/kimina.env" LEAN_SERVER_FRONT_ADDRESS)" >> "$DIR/firewall.conf"
   install_kimina_firewall      # /usr/local/sbin/kimina-firewall, from the file beside this one
   cat > "/etc/systemd/system/$FW_UNIT" <<EOF
 [Unit]

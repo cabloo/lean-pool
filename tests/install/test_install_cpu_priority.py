@@ -13,7 +13,6 @@ import subprocess
 
 import pytest
 from stand_ins import (
-    INSTALLERS,
     Machine,
     rewritten_installers,
     tools_run_from_source,
@@ -27,8 +26,8 @@ pytestmark = [
 ]
 
 INSTANCE = "/srv/kimina-demo"
-LEAN = "acme-kimina-demo"
-AGENT = "acme-agent-demo"
+LEAN = "lean-server-demo-kimina-1"
+AGENT = "lean-server-demo-agent-1"
 IMAGE = "acme/kimina:lean-demo-1"
 UNIT = "/etc/systemd/system/leanpool.slice"
 INSTALL = ("install.sh", "--instance", "demo", "--no-door")
@@ -94,15 +93,15 @@ def test_the_lean_server_is_started_in_its_own_control_group_at_the_lowest_cpu_w
     started = next(
         index
         for index, call in enumerate(calls)
-        if "--project-name acme-kimina-demo" in call and call.endswith(" up -d")
+        if "--project-name lean-server-demo " in call and call.endswith(" up -d")
     )
     assert asked < loaded < made < tried < started
     # The settings the compose files read, and the container as it was made.
     said = settings(machine)
-    assert said["KIMINA_CPU_PRIORITY"] == "lowest"
-    assert said["KIMINA_CGROUP_PARENT"] == "leanpool-demo.slice"
+    assert said["LEAN_SERVER_CPU_PRIORITY"] == "lowest"
+    assert said["LEAN_SERVER_CGROUP_PARENT"] == "leanpool-demo.slice"
     assert (
-        said["KIMINA_AGENT_LEAN_CPU_STAT"]
+        said["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"]
         == "/host-cgroup/leanpool.slice/leanpool-demo.slice/cpu.stat"
     )
     assert machine.control_group(LEAN) == "leanpool-demo.slice"
@@ -117,25 +116,29 @@ def test_the_agent_is_given_the_worker_count_that_group_and_the_boxs_control_gro
 ):
     machine = Machine(tmp_path / "host", deploy)
     installed(machine)
-    compose = machine.path(f"{INSTANCE}/docker-compose.agent.yml").read_text()
+    # The agent's own overlay, which the instance runs.
+    assert "compose.agent.yaml" in settings(machine)["COMPOSE_FILE"].split(":")
+    compose = machine.path(f"{INSTANCE}/compose.agent.yaml").read_text()
     # From the settings, so a later `set-repls` reaches the agent; an empty value is "not set" to the agent.
-    assert "      LEANPOOL_AGENT_WORKERS: ${KIMINA_MAX_REPLS:-}\n" in compose
-    assert "      LEANPOOL_AGENT_LEAN_CPU_STAT_PATH: ${KIMINA_AGENT_LEAN_CPU_STAT:-}\n" in compose
-    assert "      LEANPOOL_AGENT_CPU_RESERVE: ${KIMINA_AGENT_CPU_RESERVE:-}\n" in compose
+    assert '      LEANPOOL_AGENT_WORKERS: "${LEAN_SERVER_MAX_REPLS:-}"\n' in compose
     assert (
-        "      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: ${KIMINA_AGENT_BESIDE_OTHER_WORK:-}\n"
+        '      LEANPOOL_AGENT_LEAN_CPU_STAT_PATH: "${LEANPOOL_AGENT_LEAN_CPU_STAT_PATH:-}"\n'
+        in compose
+    )
+    assert '      LEANPOOL_AGENT_CPU_RESERVE: "${LEANPOOL_AGENT_CPU_RESERVE:-}"\n' in compose
+    assert (
+        '      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: "${LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK:-}"\n'
         in compose
     )
     # One host mount, read-only, and where the settings' path points into.
     assert "    volumes:\n" in compose and "      - /sys/fs/cgroup:/host-cgroup:ro\n" in compose
-    assert settings(machine)["KIMINA_AGENT_LEAN_CPU_STAT"].startswith("/host-cgroup/")
-    assert settings(machine)["KIMINA_MAX_REPLS"] == "8"
-    # The agent of a pool member (behind a TLS front) is given exactly the same.
-    front = (INSTALLERS / "docker-compose.front.yml").read_text()
-    for line in [
-        line for line in compose.splitlines() if "LEANPOOL_AGENT_" in line or "/host-cgroup" in line
-    ]:
-        assert line + "\n" in front, line
+    assert settings(machine)["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"].startswith("/host-cgroup/")
+    assert settings(machine)["LEAN_SERVER_MAX_REPLS"] == "8"
+    # The agent of a pool member (behind a TLS front) is given exactly the same: the TLS overlay takes away
+    # its published port and nothing else.
+    tls = machine.path(f"{INSTANCE}/compose.tls.yaml").read_text()
+    agent = tls[tls.index("\n  agent:\n") : tls.index("\n  front:\n")]
+    assert agent.split() == ["agent:", "ports:", "!reset", "[]"]
 
 
 def test_status_says_the_cpu_priority_and_what_the_agent_says(tmp_path, deploy):
@@ -178,7 +181,7 @@ def test_setting_the_workers_tells_the_agent_which_states_no_more_slots_than_tha
     had = machine.recreated()
     result = machine.bash(machine.path("/usr/local/bin/kimina-ctl"), "@demo", "set-repls", "5")
     assert result.returncode == 0, result.stderr
-    assert settings(machine)["KIMINA_MAX_REPLS"] == "5"
+    assert settings(machine)["LEAN_SERVER_MAX_REPLS"] == "5"
     # The Lean server with its new worker count, then its agent with the same number as the most it states.
     assert machine.recreated() == [*had, LEAN, AGENT]
     assert "of 5 workers)" in line_of(status(machine), "--- usage agent says:")
@@ -192,10 +195,10 @@ CTL = "/usr/local/bin/kimina-ctl"
 def test_a_box_has_a_limit_of_one_check_beside_other_work_until_it_is_measured(tmp_path, deploy):
     machine = Machine(tmp_path / "host", deploy)
     installed(machine)
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == "1"
-    compose = machine.path(f"{INSTANCE}/docker-compose.agent.yml").read_text()
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == "1"
+    compose = machine.path(f"{INSTANCE}/compose.agent.yaml").read_text()
     assert (
-        "      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: ${KIMINA_AGENT_BESIDE_OTHER_WORK:-}\n"
+        '      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: "${LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK:-}"\n'
         in compose
     )
     assert line_of(status(machine), "--- beside other work:").startswith(
@@ -210,7 +213,7 @@ def test_set_beside_changes_the_boxs_limit_and_makes_only_the_agent_again(tmp_pa
     result = machine.bash(machine.path(CTL), "@demo", "set-beside", "3")
     assert result.returncode == 0, result.stderr
     assert "checks beside other work: 3" in result.stdout
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == "3"
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == "3"
     assert machine.recreated() == [
         *had,
         AGENT,
@@ -220,19 +223,19 @@ def test_set_beside_changes_the_boxs_limit_and_makes_only_the_agent_again(tmp_pa
     result = machine.bash(machine.path(CTL), "@demo", "set-beside", "none")
     assert result.returncode == 0, result.stderr
     assert "checks beside other work: no limit of its own" in result.stdout
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == ""
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == ""
     assert "no limit of its own (the free cores alone decide" in line_of(
         status(machine), "--- beside other work:"
     )
     installed(machine)
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == ""
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == ""
     # 0: nothing beside other work. Also kept.
     assert machine.bash(machine.path(CTL), "@demo", "set-beside", "0").returncode == 0
     assert "no check (while anything else keeps a CPU busy here" in line_of(
         status(machine), "--- beside other work:"
     )
     installed(machine)
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == "0"
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -264,14 +267,14 @@ def test_a_box_installed_before_the_limit_says_so_and_gets_one_from_the_installe
     kept = [
         line
         for line in env.read_text().splitlines(keepends=True)
-        if not line.startswith("KIMINA_AGENT_BESIDE_OTHER_WORK=")
+        if not line.startswith("LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK=")
     ]
     env.write_text("".join(kept))
     assert "this box was installed before it had one" in line_of(
         status(machine), "--- beside other work:"
     )
     installed(machine)
-    assert settings(machine)["KIMINA_AGENT_BESIDE_OTHER_WORK"] == "1"
+    assert settings(machine)["LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK"] == "1"
 
 
 # --- a box that cannot --------------------------------------------------------------------------------------------
@@ -310,9 +313,9 @@ def test_a_box_that_cannot_keep_the_group_gets_everything_else_and_is_told(
     # Empty settings: the container starts where Docker puts every container, and the agent is told nothing.
     said = settings(machine)
     assert (
-        said["KIMINA_CPU_PRIORITY"],
-        said["KIMINA_CGROUP_PARENT"],
-        said["KIMINA_AGENT_LEAN_CPU_STAT"],
+        said["LEAN_SERVER_CPU_PRIORITY"],
+        said["LEAN_SERVER_CGROUP_PARENT"],
+        said["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"],
     ) == ("lowest", "", "")
     assert machine.control_group(LEAN) == ""
     assert machine.running(LEAN) and machine.running(AGENT)
@@ -340,7 +343,8 @@ def test_a_host_without_systemd_installs_as_it_always_did_and_calls_no_systemd(t
     assert not any(call.startswith("systemctl") for call in machine.calls)
     assert GROUP_TEST not in machine.calls and not machine.path(UNIT).exists()
     assert (
-        machine.control_group(LEAN) == "" and settings(machine)["KIMINA_AGENT_LEAN_CPU_STAT"] == ""
+        machine.control_group(LEAN) == ""
+        and settings(machine)["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"] == ""
     )
 
 
@@ -351,7 +355,9 @@ def test_a_box_that_could_and_no_longer_can_goes_back_to_where_it_ran(tmp_path, 
     installed(machine)
     assert machine.control_group(LEAN) == "leanpool-demo.slice"
     installed(machine, STUB_NO_CGROUP_PARENT="1")
-    assert machine.control_group(LEAN) == "" and settings(machine)["KIMINA_CGROUP_PARENT"] == ""
+    assert (
+        machine.control_group(LEAN) == "" and settings(machine)["LEAN_SERVER_CGROUP_PARENT"] == ""
+    )
     assert machine.running(LEAN)
 
 
@@ -364,11 +370,11 @@ def test_cpu_priority_normal_is_a_group_of_ordinary_weight_and_is_kept_by_a_late
     machine = Machine(tmp_path / "host", deploy)
     result = installed(machine, "--cpu-priority", "normal")
     said = settings(machine)
-    assert said["KIMINA_CPU_PRIORITY"] == "normal"
-    assert said["KIMINA_CGROUP_PARENT"] == "leanpoolnormal-demo.slice"
+    assert said["LEAN_SERVER_CPU_PRIORITY"] == "normal"
+    assert said["LEAN_SERVER_CGROUP_PARENT"] == "leanpoolnormal-demo.slice"
     # The agent still reads the server's own use, so it still states open slots.
     assert (
-        said["KIMINA_AGENT_LEAN_CPU_STAT"]
+        said["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"]
         == "/host-cgroup/leanpoolnormal.slice/leanpoolnormal-demo.slice/cpu.stat"
     )
     assert machine.control_group(LEAN) == "leanpoolnormal-demo.slice"
@@ -380,7 +386,7 @@ def test_cpu_priority_normal_is_a_group_of_ordinary_weight_and_is_kept_by_a_late
     # A later run that says nothing (a refresh is one) keeps the choice, and changes nothing that runs.
     had = machine.recreated()
     installed(machine)
-    assert settings(machine)["KIMINA_CPU_PRIORITY"] == "normal" and machine.recreated() == had
+    assert settings(machine)["LEAN_SERVER_CPU_PRIORITY"] == "normal" and machine.recreated() == had
     assert machine.control_group(LEAN) == "leanpoolnormal-demo.slice"
     # Asked for, the lowest: the server is made again once, in the other group.
     installed(machine, "--cpu-priority", "lowest")
@@ -404,7 +410,7 @@ def test_instance_one_gets_a_group_of_its_own_under_the_same_top_level_group(tmp
     machine = Machine(tmp_path / "host", deploy)
     result = machine.bash("install.sh", "--no-door")
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
-    assert machine.control_group("acme-kimina") == "leanpool-main.slice"
+    assert machine.control_group("lean-server-kimina-1") == "leanpool-main.slice"
     installed(machine)
     assert machine.control_group(LEAN) == "leanpool-demo.slice"
     assert machine.path(UNIT).read_text().count("CPUWeight=1") == 1

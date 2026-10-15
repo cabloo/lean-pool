@@ -25,6 +25,9 @@ services:
       LEANPOOL_AGENT_CPU_RESERVE: "${LEANPOOL_AGENT_CPU_RESERVE:-}"
       # The most checks while other work is on the box, a number measured for the box. Empty: no such limit.
       LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: "${LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK:-}"
+      # The version of the installer that set this box up: every reply ends `# version V`, which the pool's
+      # HAProxy keeps as the server's check description. Empty: the replies carry none.
+      LEANPOOL_AGENT_VERSION: "${LEANPOOL_AGENT_VERSION:-}"
     volumes:
       # The whole tree, because the server's group is made again whenever its container is.
       - /sys/fs/cgroup:/host-cgroup:ro

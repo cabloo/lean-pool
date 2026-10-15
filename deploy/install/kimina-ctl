@@ -19,8 +19,8 @@
 #   [@NAME] check                       one valid and one invalid proof through the live server
 #   [@NAME] logs [N]                    last N server log lines (default 100, max 500)
 #   [@NAME] logs build                  tail of the last image build log
-#   [@NAME] up | down                   start / stop the service
-#   [@NAME] restart                     recreate the container (picks up kimina.env changes)
+#   [@NAME] up | down                   start / stop the server, and its usage agent and TLS front if it has them
+#   [@NAME] restart                     recreate the containers (picks up kimina.env changes)
 #   [@NAME] set-repls N                 set the worker count (1-32) and restart
 #   [@NAME] set-cpus N                  set the CPU ceiling (1-32) and restart
 #   [@NAME] set-mem SIZE                set the memory ceiling (28g, 512m) and restart; the worker count,
@@ -50,14 +50,14 @@
 #                                       the lean-pool front door of pool NAME (HAProxy + cache); these
 #                                       are handed to /usr/local/sbin/lean-pool-ctl after validation here
 #
-# No @NAME is instance 1 (/srv/kimina), the instance with no name. The names of its container and
-# network come from the site this host was installed for (/etc/lean-pool/site.env, written by the installer).
+# No @NAME is instance 1 (/srv/kimina), the instance with no name. Each instance is ONE compose project,
+# which its kimina.env names (COMPOSE_PROJECT_NAME) with the files it runs (COMPOSE_FILE); Compose names
+# its containers (PROJECT-kimina-1, -agent-1, -front-1).
 # A site may put a program of its own in front of this one as the door's (install.sh --door-program): it
 # answers what it adds and hands everything else here unchanged.
 set -uo pipefail
 
 LOG=/var/log/kimina-ctl.log
-SITE_ENV=/etc/lean-pool/site.env
 
 # `sudo` scrubs the environment; the sudoers drop-in env_keeps SSH_ORIGINAL_COMMAND. Fall back to argv
 # (hand invocation), then to the read-only verb.
@@ -172,26 +172,49 @@ DIR=/srv/kimina${INSTANCE:+-$INSTANCE}
 ENV_FILE=$DIR/kimina.env
 [ -f "$ENV_FILE" ] || { echo "kimina-ctl: $ENV_FILE is missing - run install.sh${INSTANCE:+ --instance $INSTANCE}" >&2; exit 1; }
 
-SITE_PREFIX=$(sed -n 's/^SITE_PREFIX=//p' "$SITE_ENV" 2>/dev/null | head -n 1)
-[[ "$SITE_PREFIX" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] \
-  || { echo "kimina-ctl: $SITE_ENV is missing or names no site (SITE_PREFIX) - run install.sh${INSTANCE:+ --instance $INSTANCE}" >&2; exit 1; }
-
 setting() { sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1; }
-CONTAINER=$(setting KIMINA_CONTAINER); CONTAINER=${CONTAINER:-$SITE_PREFIX-kimina}
-PROJECT=$(setting KIMINA_PROJECT); PROJECT=${PROJECT:-$SITE_PREFIX-kimina}
-NETWORK=$(setting KIMINA_NETWORK); NETWORK=${NETWORK:-$SITE_PREFIX-kimina}
+# The instance's one compose project (install.sh writes its name and its files). An instance installed before
+# it had one keeps its settings under older names: its installer moves it.
+PROJECT=$(setting COMPOSE_PROJECT_NAME)
+if [ -z "$PROJECT" ] || [ -z "$(setting COMPOSE_FILE)" ]; then
+  echo "kimina-ctl: $ENV_FILE names no compose project (COMPOSE_PROJECT_NAME): ${INSTANCE:-instance 1} was installed under the older names. Move it, keeping everything it holds: run its installer again (sudo bash install.sh${INSTANCE:+ --instance $INSTANCE}; on a box that joined a pool, its join command with --refresh)" >&2
+  exit 1
+fi
+CONTAINER=$PROJECT-kimina-1
+AGENT=$PROJECT-agent-1
+FRONT=$PROJECT-front-1
 FW_UNIT=kimina-firewall${INSTANCE:+-$INSTANCE}.service
 CHAIN_SUFFIX=${INSTANCE:+-$(echo "$INSTANCE" | tr '[:lower:]' '[:upper:]')}
-# The compose files name the image with the site's prefix, and the container and network with these (the
-# instance with no name's kimina.env holds neither: its names are the site's plain ones).
-export SITE_PREFIX KIMINA_CONTAINER=$CONTAINER KIMINA_NETWORK=$NETWORK
-COMPOSE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE" -f "$DIR/docker-compose.yml")
+# `docker compose` for the project, with each file COMPOSE_FILE names passed by itself.
+compose_command() {
+  local file
+  local -a files
+  IFS=: read -r -a files <<<"$(setting COMPOSE_FILE)"
+  COMPOSE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE")
+  for file in "${files[@]}"; do COMPOSE+=(-f "$DIR/$file"); done
+}
+compose_command
 
 log "request: ${cmd}"
 
 set_setting() {   # set_setting KEY VALUE : replace or append one line of kimina.env
   sed -i "s/^$1=.*/$1=$2/" "$ENV_FILE"
   grep -q "^$1=$2\$" "$ENV_FILE" || echo "$1=$2" >> "$ENV_FILE"
+}
+
+# The overlays, in the order the installer lists them after compose.yaml: the usage agent, the TLS front and
+# the compiled search step.
+OVERLAYS=(compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml)
+has_overlay() { [[ ":$(setting COMPOSE_FILE):" == *":$1:"* ]]; }
+set_overlay() {   # set_overlay FILE on|off : COMPOSE_FILE with FILE in or out, the others as they were
+  local now list=compose.yaml file
+  now=":$(setting COMPOSE_FILE):"
+  for file in "${OVERLAYS[@]}"; do
+    if [ "$file" = "$1" ]; then [ "$2" = off ] || list=$list:$file
+    elif [[ "$now" == *":$file:"* ]]; then list=$list:$file; fi
+  done
+  set_setting COMPOSE_FILE "$list"
+  compose_command
 }
 
 # zombies_in CONTAINER : how many of the container's processes have exited and been collected by nobody. Each
@@ -223,8 +246,8 @@ zombies_in() {
 cpu_priority_line() {
   local parent weight="" priority wanted
   parent=$(docker inspect -f '{{.HostConfig.CgroupParent}}' "$CONTAINER" 2>/dev/null)
-  priority=$(setting KIMINA_CPU_PRIORITY)
-  wanted=$(setting KIMINA_CGROUP_PARENT)
+  priority=$(setting LEAN_SERVER_CPU_PRIORITY)
+  wanted=$(setting LEAN_SERVER_CGROUP_PARENT)
   case "$parent" in
     leanpool-*.slice)
       [ ! -r /sys/fs/cgroup/leanpool.slice/cpu.weight ] || weight=$(tr -d '[:space:]' < /sys/fs/cgroup/leanpool.slice/cpu.weight)
@@ -257,7 +280,7 @@ memory_ceiling_line() {
   ceiling=$(docker inspect -f '{{.HostConfig.Memory}}' "$CONTAINER" 2>/dev/null)
   box=$(free -b 2>/dev/null | awk '$1 == "Mem:" { print $2; exit }')
   hint="sudo kimina-ctl ${INSTANCE:+@$INSTANCE }set-mem SIZE"
-  [[ "${ceiling:-}" =~ ^[0-9]+$ ]] || { echo "--- memory ceiling: ? (settings say $(setting KIMINA_MEM_LIMIT))"; return 0; }
+  [[ "${ceiling:-}" =~ ^[0-9]+$ ]] || { echo "--- memory ceiling: ? (settings say $(setting LEAN_SERVER_MEM_LIMIT))"; return 0; }
   [ "$ceiling" -gt 0 ] || { echo "--- memory ceiling: none (set one with: $hint)"; return 0; }
   awk -v ceiling="$ceiling" -v box="${box:-}" -v hint="$hint" 'BEGIN {
     gib = 1024 * 1024 * 1024
@@ -267,14 +290,10 @@ memory_ceiling_line() {
   }'
 }
 
-# The compiled search step: the launcher the installer puts in the
-# instance's `native/` directory, mounted in the container at this path, and the image's own REPL.
+# The compiled search step: the launcher the installer puts in the instance's `native/` directory, mounted
+# in the container at this path by its overlay (compose.compiled-search.yaml), which starts every worker with it.
 NATIVE_LAUNCHER=/opt/lean-native/repl-native
-PLAIN_REPL=/repl/.lake/build/bin/repl
-
-set_path_setting() {   # set_path_setting KEY VALUE : as set_setting, for a value that holds slashes
-  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
-}
+NATIVE_OVERLAY=compose.compiled-search.yaml
 
 # compiled_search_here : this box holds a library its installer made AND saw work (the launcher loads it only
 # while it still matches the image's C files, which it checks itself each time a worker starts).
@@ -299,9 +318,9 @@ compiled_search_line() {
     else
       echo "--- compiled search step: OFF in effect (the workers are started through the launcher, but this box holds no library that passed its check, so each runs the plain REPL: re-run the installer)"
     fi
-  elif [ "$(setting KIMINA_REPL_PATH)" = "$NATIVE_LAUNCHER" ]; then
+  elif has_overlay "$NATIVE_OVERLAY"; then
     echo "--- compiled search step: on in the settings, NOT in effect (the running container was made before it: $hint restart)"
-  elif [ "$(setting KIMINA_COMPILED_SEARCH)" = off ]; then
+  elif [ "$(setting LEAN_SERVER_COMPILED_SEARCH)" = off ]; then
     echo "--- compiled search step: OFF (turned off on this box; the workers run the plain REPL: $hint compiled-search on)"
   elif [ "${state%% *}" = off ]; then
     echo "--- compiled search step: OFF (${state#off }; the workers run the plain REPL, with the same answers)"
@@ -320,9 +339,9 @@ read_only_line() {
     echo "--- read-only root: on (a check can change neither Lean, Mathlib nor the REPL for the checks after it; /tmp is in memory)"
   elif [ "$made" != false ]; then
     echo "--- read-only root: ? (Docker did not say how the running container was made)"
-  elif [ "$(setting KIMINA_ROOT_READ_ONLY)" = true ]; then
+  elif [ "$(setting LEAN_SERVER_ROOT_READ_ONLY)" = true ]; then
     echo "--- read-only root: on in the settings, NOT in effect (the running container was made before it: ${hint}restart)"
-  elif [ "$(setting KIMINA_READ_ONLY)" = off ]; then
+  elif [ "$(setting LEAN_SERVER_READ_ONLY)" = off ]; then
     echo "--- read-only root: OFF (turned off on this box: ${hint}read-only on)"
   elif [ "${state%% *}" = off ]; then
     echo "--- read-only root: OFF (${state#off }; the server is writable, as it was, with the same answers)"
@@ -352,7 +371,7 @@ agent_line() {
   local said
   said=$(agent_says "$1")
   case "$said" in
-    *maxconn:*) echo "--- usage agent says: $said (maxconn = the open slots: the checks that fit beside this box's other work, of $(setting KIMINA_MAX_REPLS) workers)" ;;
+    *maxconn:*) echo "--- usage agent says: $said (maxconn = the open slots: the checks that fit beside this box's other work, of $(setting LEAN_SERVER_MAX_REPLS) workers)" ;;
     "drain 0%"|"drain 0% #"*) echo "--- usage agent says: $said (no check fits beside this box's other work, or memory is below the floor: the pool sends none)" ;;
     "") echo "--- usage agent says: ? (it did not answer)" ;;
     *) echo "--- usage agent says: $said (open slots are NOT stated: the pool may send this box a check for every worker, whatever else runs here)" ;;
@@ -363,11 +382,11 @@ agent_line() {
 # setting says what the agent was GIVEN; `usage agent says` above says what it states now.
 beside_line() {
   local beside
-  if ! grep -q '^KIMINA_AGENT_BESIDE_OTHER_WORK=' "$ENV_FILE"; then
+  if ! grep -q '^LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK=' "$ENV_FILE"; then
     echo "--- beside other work: no limit of its own (this box was installed before it had one: the installer, or a refresh, brings 1)"
     return 0
   fi
-  beside=$(setting KIMINA_AGENT_BESIDE_OTHER_WORK)
+  beside=$(setting LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK)
   case "$beside" in
     "") echo "--- beside other work: no limit of its own (the free cores alone decide; set one with: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }set-beside N)" ;;
     0)  echo "--- beside other work: no check (while anything else keeps a CPU busy here the pool sends none; the whole box when it is free)" ;;
@@ -376,18 +395,14 @@ beside_line() {
 }
 
 # refresh_agent : the usage agent again from the settings as they now are (its worker count is the Lean
-# server's). Only its own service changes; a TLS front beside it is not made again.
+# server's). Only its own service changes: neither the Lean server nor a TLS front beside it is made again.
 refresh_agent() {
-  local agent front
-  agent=$(setting KIMINA_AGENT_CONTAINER)
-  front=$(setting KIMINA_FRONT_CONTAINER)
-  [ -n "$agent" ] || return 0
-  if [ -n "$front" ] && [ -f "$DIR/docker-compose.front.yml" ]; then
-    docker compose --project-name "$front" --env-file "$ENV_FILE" -f "$DIR/docker-compose.front.yml" up -d 2>&1 | tail -n 5
-  elif [ -f "$DIR/docker-compose.agent.yml" ]; then
-    docker compose --project-name "$agent" --env-file "$ENV_FILE" -f "$DIR/docker-compose.agent.yml" up -d 2>&1 | tail -n 5
-  fi
+  has_overlay compose.agent.yaml || return 0
+  "${COMPOSE[@]}" up -d --no-deps agent 2>&1 | tail -n 5
 }
+# The Lean server alone made again (`--force-recreate` with a setting Docker cannot see change, such as a
+# worker count), with the overlays it runs with; the agent and the front stay as they are.
+server_again() { "${COMPOSE[@]}" up -d "$@" --no-deps kimina 2>&1 | tail -n 5; }
 
 run_check() {
   # Runs INSIDE the container with its own Python and its own copy of the key, so the host needs
@@ -446,7 +461,7 @@ case "$verb" in
   status)
     "${COMPOSE[@]}" ps 2>&1
     # The installer's version, as the installer wrote it: its first 12 digits, as `lean-pool-ctl status` shows it.
-    version=$(setting KIMINA_INSTALLER_VERSION)
+    version=$(setting LEANPOOL_AGENT_VERSION)
     version=${version:0:12}
     echo "--- health: $(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$CONTAINER" 2>&1) (installer version ${version:-?})"
     echo "--- image: $(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>&1)"
@@ -460,7 +475,7 @@ case "$verb" in
       *)    echo "--- init process: NO (every worker the server closes leaves a zombie that holds a process slot; the installer's compose file adds one: re-run the installer)" ;;
     esac
     cpu_priority_line
-    echo "--- settings: port=$(setting KIMINA_PORT) repls=$(setting KIMINA_MAX_REPLS) repl_uses=$(setting KIMINA_MAX_REPL_USES) repl_mem=$(setting KIMINA_MAX_REPL_MEM) mem_limit=$(setting KIMINA_MEM_LIMIT) max_wait=$(setting KIMINA_MAX_WAIT)"
+    echo "--- settings: port=$(setting LEAN_SERVER_PUBLISHED_PORT) repls=$(setting LEAN_SERVER_MAX_REPLS) repl_uses=$(setting LEAN_SERVER_MAX_REPL_USES) repl_mem=$(setting LEAN_SERVER_MAX_REPL_MEM) mem_limit=$(setting LEAN_SERVER_MEM_LIMIT) max_wait=$(setting LEAN_SERVER_MAX_WAIT)"
     echo "--- cpu limit: $(docker inspect -f '{{.HostConfig.NanoCpus}}' "$CONTAINER" 2>/dev/null | awk '{ if ($1 > 0) print $1 / 1e9 " cores"; else print "none" }')"
     memory_ceiling_line
     compiled_search_line
@@ -470,16 +485,14 @@ case "$verb" in
     else
       echo "--- firewall: $FW_UNIT NOT installed"
     fi
-    agent=$(setting KIMINA_AGENT_CONTAINER)
-    if [ -n "$agent" ]; then
-      echo "--- usage agent: $(docker inspect -f '{{.State.Status}}' "$agent" 2>&1) on port $(setting KIMINA_AGENT_PORT)"
-      agent_line "$agent"
+    if has_overlay compose.agent.yaml; then
+      echo "--- usage agent: $(docker inspect -f '{{.State.Status}}' "$AGENT" 2>&1) on port $(setting LEAN_SERVER_AGENT_PORT)"
+      agent_line "$AGENT"
       beside_line
     fi
-    front=$(setting KIMINA_FRONT_CONTAINER)
-    if [ -n "$front" ]; then
+    if has_overlay compose.tls.yaml; then
       # A pool member: only the front is published, and it lets in the pool proxy's certificate alone.
-      echo "--- tls front: $(docker inspect -f '{{.State.Status}}' "$front" 2>&1) as '$(setting KIMINA_SERVER_NAME)' on ports $(setting KIMINA_PORT) and $(setting KIMINA_AGENT_PORT); its certificate has $(docker run --rm --network none --user 0:0 -v "$DIR/tls/box.crt":/box.crt:ro "$(setting KIMINA_AGENT_IMAGE)" leanpool-pki expiry /box.crt 2>/dev/null || echo '?') days left (renewal is joining again)"
+      echo "--- tls front: $(docker inspect -f '{{.State.Status}}' "$FRONT" 2>&1) as '$(setting LEAN_SERVER_NAME)' on ports $(setting LEAN_SERVER_PUBLISHED_PORT) and $(setting LEAN_SERVER_AGENT_PORT); its certificate has $(docker run --rm --network none --user 0:0 -v "$DIR/tls/box.crt":/box.crt:ro "$(setting LEAN_SERVER_AGENT_IMAGE)" leanpool-pki expiry /box.crt 2>/dev/null || echo '?') days left (renewal is joining again)"
     fi
     ;;
 
@@ -512,8 +525,8 @@ case "$verb" in
     ;;
 
   set-repls)
-    set_setting KIMINA_MAX_REPLS "$arg"
-    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5
+    set_setting LEAN_SERVER_MAX_REPLS "$arg"
+    server_again --force-recreate
     refresh_agent        # the most open slots the agent states is the worker count
     log "set-repls $arg"
     echo "workers set to $arg"
@@ -521,15 +534,15 @@ case "$verb" in
 
   set-beside)
     [ "$arg" != none ] || arg=""
-    set_setting KIMINA_AGENT_BESIDE_OTHER_WORK "$arg"
+    set_setting LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK "$arg"
     refresh_agent        # the agent alone: the Lean server and the checks it holds are not touched
     log "set-beside ${arg:-none}"
     echo "checks beside other work: ${arg:-no limit of its own}"
     ;;
 
   set-cpus)
-    set_setting KIMINA_CPUS "$arg"
-    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5
+    set_setting LEAN_SERVER_CPUS "$arg"
+    server_again --force-recreate
     log "set-cpus $arg"
     echo "cpu ceiling set to $arg"
     ;;
@@ -539,12 +552,12 @@ case "$verb" in
     # usage agent stay. A ceiling Docker will not make a container with (under its 6 MB floor) is taken back:
     # the settings are again what they were, and the server is brought up with them.
     arg=${arg,,}
-    had=$(grep -c '^KIMINA_MEM_LIMIT=' "$ENV_FILE")
-    previous=$(setting KIMINA_MEM_LIMIT)
-    set_setting KIMINA_MEM_LIMIT "$arg"
-    if ! "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5; then
-      if [ "$had" -gt 0 ]; then set_setting KIMINA_MEM_LIMIT "$previous"; else sed -i '/^KIMINA_MEM_LIMIT=/d' "$ENV_FILE"; fi
-      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+    had=$(grep -c '^LEAN_SERVER_MEM_LIMIT=' "$ENV_FILE")
+    previous=$(setting LEAN_SERVER_MEM_LIMIT)
+    set_setting LEAN_SERVER_MEM_LIMIT "$arg"
+    if ! server_again --force-recreate; then
+      if [ "$had" -gt 0 ]; then set_setting LEAN_SERVER_MEM_LIMIT "$previous"; else sed -i '/^LEAN_SERVER_MEM_LIMIT=/d' "$ENV_FILE"; fi
+      server_again
       log "set-mem $arg -> FAILED, settings as they were"
       echo "kimina-ctl: the server could not be made with a memory ceiling of $arg (Docker's words are above); the settings are as they were" >&2
       exit 1
@@ -554,24 +567,24 @@ case "$verb" in
     ;;
 
   compiled-search)
-    # Only the program a worker is changes, so only the Lean server is made again (and
-    # only if that program is not already the one it runs). `off` is a setting every later installer run
-    # keeps; the library stays on the box, so `on` needs no installer.
+    # Only the program a worker is changes (the overlay comes in or goes), so only the Lean server is made
+    # again (and only if that program is not already the one it runs). `off` is a setting every later
+    # installer run keeps; the library stays on the box, so `on` needs no installer.
     if [ "$arg" = off ]; then
-      set_path_setting KIMINA_REPL_PATH "$PLAIN_REPL"
-      set_setting KIMINA_COMPILED_SEARCH off
-      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      set_setting LEAN_SERVER_COMPILED_SEARCH off
+      set_overlay "$NATIVE_OVERLAY" off
+      server_again
       log "compiled-search off"
       echo "compiled search step off: the workers run the plain REPL (the same answers; linarith's search is slower)"
     else
-      sed -i '/^KIMINA_COMPILED_SEARCH=/d' "$ENV_FILE"
+      sed -i '/^LEAN_SERVER_COMPILED_SEARCH=/d' "$ENV_FILE"
       if ! compiled_search_here; then
         log "compiled-search on -> no checked library here"
         echo "kimina-ctl: this box holds no compiled search step that passed its check, so the workers stay on the plain REPL. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) makes one and checks it" >&2
         exit 1
       fi
-      set_path_setting KIMINA_REPL_PATH "$NATIVE_LAUNCHER"
-      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      set_overlay "$NATIVE_OVERLAY" on
+      server_again
       log "compiled-search on"
       echo "compiled search step on: $(head -n 1 "$DIR/native/state" | cut -d ' ' -f 2-)"
     fi
@@ -582,27 +595,27 @@ case "$verb" in
     # made again. `off` is a setting every later installer run keeps. `on` makes the server read-only only where
     # the installer's own reading of it passed (`on` in read-only.state); elsewhere its next run reads it again.
     if [ "$arg" = off ]; then
-      set_setting KIMINA_READ_ONLY off
-      set_setting KIMINA_ROOT_READ_ONLY false
-      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      set_setting LEAN_SERVER_READ_ONLY off
+      set_setting LEAN_SERVER_ROOT_READ_ONLY false
+      server_again
       log "read-only off"
       echo "read-only root off: the Lean server is writable, as it was (the same answers; a check can change this server for the checks after it)"
     else
-      sed -i '/^KIMINA_READ_ONLY=/d' "$ENV_FILE"
+      sed -i '/^LEAN_SERVER_READ_ONLY=/d' "$ENV_FILE"
       if [ "$(head -n 1 "$DIR/read-only.state" 2>/dev/null)" != on ]; then
         log "read-only on -> no reading of this server passed"
         echo "kimina-ctl: the installer has not found this server writing nothing outside /tmp, so it stays writable. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) reads it again" >&2
         exit 1
       fi
-      set_setting KIMINA_ROOT_READ_ONLY true
-      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      set_setting LEAN_SERVER_ROOT_READ_ONLY true
+      server_again
       log "read-only on"
       echo "read-only root on: the Lean server was made again with it (to check it: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }check)"
     fi
     ;;
 
   show-key)
-    setting KIMINA_API_KEY
+    setting LEAN_SERVER_API_KEY
     ;;
 
   *)

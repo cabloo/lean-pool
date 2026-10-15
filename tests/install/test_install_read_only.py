@@ -11,6 +11,7 @@ import os
 import subprocess
 
 import pytest
+import yaml
 from stand_ins import (
     ADMIT_CASES,
     INSTALLERS,
@@ -27,7 +28,7 @@ pytestmark = [
 ]
 
 INSTANCE = "/srv/kimina-demo"
-LEAN = "acme-kimina-demo"
+LEAN = "lean-server-demo-kimina-1"
 CTL = "/usr/local/bin/kimina-ctl"
 INSTALL = ("install.sh", "--instance", "demo", "--no-door")
 START = "--- read-only root:"
@@ -75,7 +76,7 @@ def before_read_only_roots(machine: Machine) -> None:
         "".join(
             line
             for line in env.read_text().splitlines(keepends=True)
-            if not line.startswith(("KIMINA_ROOT_READ_ONLY=", "KIMINA_READ_ONLY="))
+            if not line.startswith(("LEAN_SERVER_ROOT_READ_ONLY=", "LEAN_SERVER_READ_ONLY="))
         )
     )
     machine.path(f"{INSTANCE}/read-only.state").unlink(missing_ok=True)
@@ -112,10 +113,11 @@ def said(result: subprocess.CompletedProcess[str], words: str) -> int:
 
 
 def test_the_compose_file_makes_the_root_read_only_only_when_the_setting_says_so_and_puts_tmp_in_memory():
-    compose = (INSTALLERS / "docker-compose.yml").read_text()
-    assert "    read_only: ${KIMINA_ROOT_READ_ONLY:-false}\n" in compose
-    assert "    tmpfs:\n      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev\n" in compose
-    assert compose.count("read_only:") == 1 and compose.count("tmpfs:") == 1
+    text = (INSTALLERS.parent / "lean-server" / "compose.yaml").read_text()
+    kimina = yaml.safe_load(text)["services"]["kimina"]
+    assert kimina["read_only"] == "${LEAN_SERVER_ROOT_READ_ONLY:-false}"
+    assert kimina["tmpfs"] == ["/tmp:size=512m,mode=1777,noexec,nosuid,nodev"]
+    assert text.count("read_only:") == 1 and text.count("tmpfs:") == 1
 
 
 # --- the reading, and the switch ----------------------------------------------------------------------------------
@@ -126,8 +128,8 @@ def test_a_first_install_is_read_only_with_nothing_to_read_first(fresh):
     result = installed(fresh)
     assert fresh.diffs() == [] and fresh.read_only(LEAN)
     assert settings(fresh)[
-        "KIMINA_ROOT_READ_ONLY"
-    ] == "true" and "KIMINA_READ_ONLY" not in settings(fresh)
+        "LEAN_SERVER_ROOT_READ_ONLY"
+    ] == "true" and "LEAN_SERVER_READ_ONLY" not in settings(fresh)
     assert (
         state(fresh) == "on\n"
         and fresh.path(f"{INSTANCE}/read-only.state").stat().st_mode & 0o777 == 0o644
@@ -135,7 +137,9 @@ def test_a_first_install_is_read_only_with_nothing_to_read_first(fresh):
     line = "READ-ONLY ROOT: on - a new server, with nothing to read first; a real check is sent to it once it is made"
     assert said(result, line) == 2 and f"  read-only   {line}" in result.stdout
     # The check after the switch went to this server, by itself.
-    assert any("exec -i acme-kimina-demo python -" in call for call in fresh.calls_since(mark))
+    assert any(
+        "exec -i lean-server-demo-kimina-1 python -" in call for call in fresh.calls_since(mark)
+    )
     assert status_line(fresh) == (
         f"{START} on (a check can change neither Lean, Mathlib nor the REPL for the checks "
         "after it; /tmp is in memory)"
@@ -164,7 +168,7 @@ def test_an_install_over_a_server_that_wrote_only_tmp_and_byte_code_switches_it(
     ) in result.stdout
     line = "READ-ONLY ROOT: on - the running server wrote nothing outside /tmp; a real check is sent to it once it is made again"
     assert said(result, line) == 2
-    assert state(writable) == "on\n" and settings(writable)["KIMINA_ROOT_READ_ONLY"] == "true"
+    assert state(writable) == "on\n" and settings(writable)["LEAN_SERVER_ROOT_READ_ONLY"] == "true"
 
 
 def test_a_server_that_wrote_elsewhere_stays_writable_and_the_next_run_reads_it_again(writable):
@@ -179,7 +183,7 @@ def test_a_server_that_wrote_elsewhere_stays_writable_and_the_next_run_reads_it_
     assert "docker diff: 21 lines, 1 outside /tmp" in result.stdout
     assert (
         state(writable) == f"off {reason}\n"
-        and settings(writable)["KIMINA_ROOT_READ_ONLY"] == "false"
+        and settings(writable)["LEAN_SERVER_ROOT_READ_ONLY"] == "false"
     )
     assert (
         status_line(writable)
@@ -224,8 +228,11 @@ def test_a_check_that_fails_with_the_root_read_only_makes_the_server_writable_ag
     assert not fresh.read_only(LEAN) and fresh.running(LEAN)
     reason = "a real check failed against the server with its root read-only"
     assert said(result, f"READ-ONLY ROOT: OFF - {reason}, so it was made writable again") == 2
-    assert state(fresh) == f"off {reason}\n" and settings(fresh)["KIMINA_ROOT_READ_ONLY"] == "false"
-    assert "KIMINA_READ_ONLY" not in settings(fresh)
+    assert (
+        state(fresh) == f"off {reason}\n"
+        and settings(fresh)["LEAN_SERVER_ROOT_READ_ONLY"] == "false"
+    )
+    assert "LEAN_SERVER_READ_ONLY" not in settings(fresh)
     # The next run tries again: it reads the writable server, and keeps the switch when the check passes.
     installed(fresh)
     assert fresh.diffs() == [LEAN] and fresh.read_only(LEAN) and state(fresh) == "on\n"
@@ -272,8 +279,8 @@ def test_off_makes_the_lean_server_alone_writable_and_on_goes_back(machine):
     assert result.returncode == 0, result.stderr
     assert "read-only root off: the Lean server is writable, as it was" in result.stdout
     assert (
-        settings(machine)["KIMINA_READ_ONLY"] == "off"
-        and settings(machine)["KIMINA_ROOT_READ_ONLY"] == "false"
+        settings(machine)["LEAN_SERVER_READ_ONLY"] == "off"
+        and settings(machine)["LEAN_SERVER_ROOT_READ_ONLY"] == "false"
     )
     assert not machine.read_only(LEAN) and machine.recreated() == [
         *had,
@@ -290,8 +297,8 @@ def test_off_makes_the_lean_server_alone_writable_and_on_goes_back(machine):
         in result.stdout
     )
     assert (
-        "KIMINA_READ_ONLY" not in settings(machine)
-        and settings(machine)["KIMINA_ROOT_READ_ONLY"] == "true"
+        "LEAN_SERVER_READ_ONLY" not in settings(machine)
+        and settings(machine)["LEAN_SERVER_ROOT_READ_ONLY"] == "true"
     )
     assert machine.read_only(LEAN) and machine.recreated() == [*had, LEAN, LEAN]
 
@@ -300,7 +307,9 @@ def test_a_later_run_of_the_installer_keeps_an_off_and_reads_nothing(machine):
     assert control(machine, "read-only", "off").returncode == 0
     had = machine.recreated()
     result = installed(machine)
-    assert "READ-ONLY ROOT: off by this box's own setting (KIMINA_READ_ONLY=off" in result.stdout
+    assert (
+        "READ-ONLY ROOT: off by this box's own setting (LEAN_SERVER_READ_ONLY=off" in result.stdout
+    )
     assert "'sudo kimina-ctl @demo read-only on' turns it on" in result.stdout
     assert machine.diffs() == [] and machine.recreated() == had and not machine.read_only(LEAN)
 
@@ -316,8 +325,8 @@ def test_on_refuses_where_no_reading_of_the_server_passed_and_clears_the_setting
     )
     assert "the join command with --refresh" in result.stderr
     assert (
-        "KIMINA_READ_ONLY" not in settings(writable)
-        and settings(writable)["KIMINA_ROOT_READ_ONLY"] == "false"
+        "LEAN_SERVER_READ_ONLY" not in settings(writable)
+        and settings(writable)["LEAN_SERVER_ROOT_READ_ONLY"] == "false"
     )
     assert not writable.read_only(LEAN) and writable.recreated() == had
 
@@ -355,7 +364,7 @@ def test_the_switch_refuses_anything_but_on_or_off(machine, words):
 
 def test_status_says_when_the_settings_and_the_running_container_disagree(writable):
     env = writable.path(f"{INSTANCE}/kimina.env")
-    env.write_text(env.read_text() + "KIMINA_ROOT_READ_ONLY=true\n")
+    env.write_text(env.read_text() + "LEAN_SERVER_ROOT_READ_ONLY=true\n")
     assert status_line(writable) == (
         f"{START} on in the settings, NOT in effect (the running container was made "
         "before it: sudo kimina-ctl @demo restart)"
@@ -377,7 +386,7 @@ def test_status_of_a_server_installed_before_read_only_roots(writable):
 def test_instance_one_is_read_only_too(fresh):
     result = fresh.bash("install.sh", "--no-door")
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
-    assert fresh.read_only("acme-kimina") and "READ-ONLY ROOT: on" in result.stdout
+    assert fresh.read_only("lean-server-kimina-1") and "READ-ONLY ROOT: on" in result.stdout
     status = fresh.bash(fresh.path(CTL), "status")
     assert status.returncode == 0 and f"{START} on (" in status.stdout
 
@@ -394,7 +403,9 @@ def test_the_pools_own_host_switches_its_server_and_checks_it_by_itself(writable
         "  read-only   READ-ONLY ROOT: on - the running server wrote nothing outside /tmp"
         in result.stdout
     )
-    assert any("exec -i acme-kimina-demo python -" in call for call in writable.calls_since(mark))
+    assert any(
+        "exec -i lean-server-demo-kimina-1 python -" in call for call in writable.calls_since(mark)
+    )
 
 
 def test_the_pools_own_host_makes_its_server_writable_again_when_its_check_fails(writable):

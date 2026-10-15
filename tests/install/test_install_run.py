@@ -96,18 +96,37 @@ def changing(calls: list[str]) -> list[str]:
     ]
 
 
+def compose_files_of(machine: Machine, directory: str = INSTANCE) -> list[str]:
+    """The compose files an instance or a pool runs, as its env file names them (COMPOSE_FILE)."""
+    env = "pool.env" if directory.startswith("/srv/lean-pool-") else "kimina.env"
+    for line in machine.path(f"{directory}/{env}").read_text().splitlines():
+        if line.startswith("COMPOSE_FILE="):
+            return line.removeprefix("COMPOSE_FILE=").split(":")
+    return []
+
+
+def started(machine: Machine, project: str, directory: str) -> str:
+    """How `compose up -d` of a project shows in the record of calls: its name, its env file, and each of its
+    files passed by itself."""
+    env = "pool.env" if project.startswith("lean-pool-") else "kimina.env"
+    files = " ".join(
+        f"-f {machine.path(directory)}/{name}" for name in compose_files_of(machine, directory)
+    )
+    return f"docker compose --project-name {project} --env-file {machine.path(directory)}/{env} {files} up -d"
+
+
 def reload_of(container: str) -> str:
     """How a reload shows in the record of calls: sent from INSIDE the container, never with `docker kill`."""
     return f"docker exec {container} sh -c kill -HUP 1"
 
 
 EVERY_CONTAINER = (
-    "acme-kimina",
-    "acme-kimina-demo",
-    "acme-front-demo",
-    "acme-agent-demo",
-    "acme-proxy-demo",
-    "acme-cache-demo",
+    "lean-server-kimina-1",
+    "lean-server-demo-kimina-1",
+    "lean-server-demo-front-1",
+    "lean-server-demo-agent-1",
+    "lean-pool-demo-haproxy-1",
+    "lean-pool-demo-cache-1",
 )
 
 
@@ -137,11 +156,11 @@ def upgraded(tmp_path_factory, today):
     machine = today.copy_to(tmp_path_factory.mktemp("upgraded") / "host")
     before = SimpleNamespace(
         instance_one=snapshot(machine.path("/srv/kimina")),
-        instance_one_container=machine.container_id("acme-kimina"),
-        demo_container=machine.container_id("acme-kimina-demo"),
-        demo_compose=machine.path(f"{INSTANCE}/docker-compose.yml").read_text(),
-        proxy=machine.container_id("acme-proxy-demo"),
-        cache=machine.container_id("acme-cache-demo"),
+        instance_one_container=machine.container_id("lean-server-kimina-1"),
+        demo_container=machine.container_id("lean-server-demo-kimina-1"),
+        demo_files=compose_files_of(machine),
+        proxy=machine.container_id("lean-pool-demo-haproxy-1"),
+        cache=machine.container_id("lean-pool-demo-cache-1"),
         firewall_script=machine.path("/usr/local/sbin/kimina-firewall").read_text(),
     )
     mark = machine.mark()
@@ -191,14 +210,15 @@ def test_the_upgrade_records_one_installer_version_for_the_pool_and_its_own_serv
     """The version is written for the usage agent of the pool's own server and for the pool's
     /health, the same for both; `kimina-ctl status` shows its first 12 digits."""
     machine = upgraded.machine
-    version = setting_of(machine, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    version = setting_of(machine, f"{INSTANCE}/kimina.env", "LEANPOOL_AGENT_VERSION")
     assert re.fullmatch(r"[0-9a-f]{32}", version), version
-    assert setting_of(machine, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION") == version
+    assert setting_of(machine, f"{POOL}/pool.env", "LEANPOOL_HAPROXY_INSTALLER_VERSION") == version
     assert f',"version":"{version}"}}\'' in machine.path(f"{POOL}/haproxy/haproxy.cfg").read_text()
-    # The agent behind the front is handed it by its compose file.
+    # The agent behind the front is handed it by its compose overlay.
+    assert "compose.agent.yaml" in compose_files_of(machine)
     assert (
-        "LEANPOOL_AGENT_VERSION: ${KIMINA_INSTALLER_VERSION:-}"
-        in machine.path(f"{INSTANCE}/docker-compose.front.yml").read_text()
+        'LEANPOOL_AGENT_VERSION: "${LEANPOOL_AGENT_VERSION:-}"'
+        in machine.path(f"{INSTANCE}/compose.agent.yaml").read_text()
     )
     output = status(machine, "@demo").stdout
     (health,) = [line for line in output.splitlines() if line.startswith("--- health: ")]
@@ -207,14 +227,15 @@ def test_the_upgrade_records_one_installer_version_for_the_pool_and_its_own_serv
 
 def test_a_plain_instance_with_an_agent_records_the_installers_version(today):
     """No pool yet: the agent beside `demo` publishes its own port, and is handed the version too."""
-    version = setting_of(today, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    version = setting_of(today, f"{INSTANCE}/kimina.env", "LEANPOOL_AGENT_VERSION")
     assert re.fullmatch(r"[0-9a-f]{32}", version), version
+    assert "compose.agent.yaml" in compose_files_of(today)
     assert (
-        "LEANPOOL_AGENT_VERSION: ${KIMINA_INSTALLER_VERSION:-}"
-        in today.path(f"{INSTANCE}/docker-compose.agent.yml").read_text()
+        'LEANPOOL_AGENT_VERSION: "${LEANPOOL_AGENT_VERSION:-}"'
+        in today.path(f"{INSTANCE}/compose.agent.yaml").read_text()
     )
     # Instance 1 runs no agent, and its settings are as they were: no version, and its status says so.
-    assert "KIMINA_INSTALLER_VERSION" not in today.path("/srv/kimina/kimina.env").read_text()
+    assert "LEANPOOL_AGENT_VERSION" not in today.path("/srv/kimina/kimina.env").read_text()
     assert " (installer version ?)" in status(today).stdout
 
 
@@ -235,11 +256,8 @@ def test_the_upgrade_gives_the_pools_own_lean_server_the_compiled_search_step(up
         upgraded.result.stdout[-3000:] + upgraded.result.stderr[-3000:]
     )
     assert "  search      COMPILED SEARCH STEP: on - " in upgraded.result.stdout
-    assert machine.worker_program("acme-kimina-demo") == "/opt/lean-native/repl-native"
-    assert (
-        "KIMINA_REPL_PATH=/opt/lean-native/repl-native\n"
-        in machine.path(f"{INSTANCE}/kimina.env").read_text()
-    )
+    assert machine.worker_program("lean-server-demo-kimina-1") == "/opt/lean-native/repl-native"
+    assert compose_files_of(machine)[-1] == "compose.compiled-search.yaml"
     assert {path.name for path in machine.path(f"{INSTANCE}/native").iterdir()} == {
         "repl-native",
         "repl-path",
@@ -251,7 +269,7 @@ def test_the_upgrade_gives_the_pools_own_lean_server_the_compiled_search_step(up
     status = machine.bash(machine.path("/usr/local/bin/kimina-ctl"), "@demo", "status")
     assert status.returncode == 0 and "--- compiled search step: on (" in status.stdout
     # Instance 1 is not the pool's: the refresh left its container and its settings as they were.
-    assert machine.container_id("acme-kimina") == upgraded.before.instance_one_container
+    assert machine.container_id("lean-server-kimina-1") == upgraded.before.instance_one_container
     assert snapshot(machine.path("/srv/kimina")) == upgraded.before.instance_one
 
 
@@ -362,7 +380,8 @@ def test_the_pools_config_is_tls_on_every_listener_that_leaves_the_box(upgraded)
 def test_this_boxs_server_went_behind_a_front_that_lets_in_the_proxy_alone(upgraded):
     machine = upgraded.machine
     front = machine.path(f"{INSTANCE}/front/haproxy.cfg").read_text()
-    for port in ("18001", "18201"):
+    # Inside the project; the host's 18001 and 18201 are published to them.
+    for port in ("8000", "18200"):
         assert (
             f"bind :{port} ssl crt /etc/leanpool/tls/box.pem ssl-min-ver TLSv1.3 ca-file /etc/leanpool/tls/ca.crt verify required"
             in front
@@ -371,22 +390,31 @@ def test_this_boxs_server_went_behind_a_front_that_lets_in_the_proxy_alone(upgra
         front.count("tcp-request session reject unless { ssl_c_s_dn(cn) -m str lean-pool-proxy }")
         == 2
     )
-    assert (
-        "server lean acme-kimina-demo:8000" in front
-        and "server agent acme-agent-demo:18200" in front
-    )
+    assert "server lean kimina:8000" in front and "server agent agent:18200" in front
     assert (
         "timeout client 780s" in front
     )  # the pool's own limit (300 s Lean timeout, 120 s wait) and a margin
-    # The Lean server and the agent publish nothing any more; the front does.
-    assert "ports:" in upgraded.before.demo_compose
-    assert "ports:" not in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()
+    # The Lean server and the agent publish nothing any more; the front does (the TLS overlay).
+    assert upgraded.before.demo_files == [
+        "compose.yaml",
+        "compose.agent.yaml",
+        "compose.compiled-search.yaml",
+    ]
+    assert compose_files_of(machine) == [
+        "compose.yaml",
+        "compose.agent.yaml",
+        "compose.tls.yaml",
+        "compose.compiled-search.yaml",
+    ]
     settings = machine.path(f"{INSTANCE}/kimina.env").read_text()
     assert (
-        "KIMINA_FRONT_ADDRESS=172.29.54.250" in settings
-        and "KIMINA_SERVER_NAME=workstation" in settings
+        "LEAN_SERVER_FRONT_ADDRESS=172.29.54.250" in settings
+        and "LEAN_SERVER_NAME=workstation" in settings
     )
-    assert (machine.stub / "state" / "label.acme-agent-demo").read_text() == "acme-front-demo"
+    for service in ("kimina", "agent", "front"):  # one project
+        assert (
+            machine.stub / "state" / f"label.lean-server-demo-{service}-1"
+        ).read_text() == "lean-server-demo"
     # The firewall learned the front's address, and only the demo unit was re-applied.
     assert (
         "KIMINA_FW_FRONT_ADDRESS=172.29.54.250"
@@ -394,7 +422,7 @@ def test_this_boxs_server_went_behind_a_front_that_lets_in_the_proxy_alone(upgra
     )
     assert "systemctl restart kimina-firewall-demo.service" in upgraded.calls
     # The Lean server was recreated exactly once, to drop its published port.
-    assert machine.container_id("acme-kimina-demo") != upgraded.before.demo_container
+    assert machine.container_id("lean-server-demo-kimina-1") != upgraded.before.demo_container
 
 
 def test_haproxy_judged_both_configs_before_anything_that_runs_was_touched(upgraded):
@@ -408,7 +436,11 @@ def test_haproxy_judged_both_configs_before_anything_that_runs_was_touched(upgra
         "/srv/lean-pool-demo/tls:/etc/leanpool/tls:ro" in calls[validations[0]]
     )  # the pool's config
     assert "/srv/kimina-demo/tls:/etc/leanpool/tls:ro" in calls[validations[1]]  # this box's front
-    assert changing(calls)[0] == "docker rm -f acme-agent-demo"  # the plain agent goes first
+    # The first change: the firewall learns the front's address, before the project starts with the front.
+    assert changing(calls)[:2] == [
+        "systemctl restart kimina-firewall-demo.service",
+        started(upgraded.machine, "lean-server-demo", INSTANCE),
+    ]
 
 
 def test_instance_one_is_untouched(upgraded):
@@ -416,9 +448,13 @@ def test_instance_one_is_untouched(upgraded):
     call named its project, its container or its firewall unit."""
     machine = upgraded.machine
     assert snapshot(machine.path("/srv/kimina")) == upgraded.before.instance_one
-    assert machine.container_id("acme-kimina") == upgraded.before.instance_one_container != ""
+    assert (
+        machine.container_id("lean-server-kimina-1") == upgraded.before.instance_one_container != ""
+    )
     for call in upgraded.calls:
-        assert not re.search(r"acme-kimina( |$)|/srv/kimina/|kimina-firewall\.service", call), call
+        assert not re.search(
+            r"lean-server-kimina-1( |$)|/srv/kimina/|kimina-firewall\.service", call
+        ), call
     assert (
         not machine.path("/srv/kimina/tls").exists()
         and not machine.path("/srv/kimina/front").exists()
@@ -435,9 +471,9 @@ def test_the_join_port_is_firewalled_and_no_join_service_runs_outside_a_window(u
     assert not any("leanpool-join" in call for call in upgraded.calls)
     settings = machine.path(f"{POOL}/pool.env").read_text()
     assert (
-        "POOL_JOIN_HOST=workstation.lan" in settings
-        and "POOL_JOIN_PORT=18110" in settings
-        and "POOL_IMAGE_GID=10001" in settings
+        "LEANPOOL_JOIN_PUBLIC_HOST=workstation.lan" in settings
+        and "LEANPOOL_JOIN_PUBLIC_PORT=18110" in settings
+        and "LEANPOOL_IMAGE_GID=10001" in settings
     )
 
 
@@ -453,7 +489,7 @@ def test_a_refresh_of_the_pool_host_makes_its_writable_server_read_only_once(poo
         "".join(
             line
             for line in env.read_text().splitlines(keepends=True)
-            if not line.startswith(("KIMINA_ROOT_READ_ONLY=", "KIMINA_READ_ONLY="))
+            if not line.startswith(("LEAN_SERVER_ROOT_READ_ONLY=", "LEAN_SERVER_READ_ONLY="))
         )
     )
     pool.path(f"{INSTANCE}/read-only.state").unlink(missing_ok=True)
@@ -473,12 +509,12 @@ def test_a_re_run_keeps_the_authority_and_the_pin_and_recreates_nothing(pool):
     containers = {
         name: pool.container_id(name)
         for name in (
-            "acme-kimina",
-            "acme-kimina-demo",
-            "acme-front-demo",
-            "acme-agent-demo",
-            "acme-proxy-demo",
-            "acme-cache-demo",
+            "lean-server-kimina-1",
+            "lean-server-demo-kimina-1",
+            "lean-server-demo-front-1",
+            "lean-server-demo-agent-1",
+            "lean-pool-demo-haproxy-1",
+            "lean-pool-demo-cache-1",
         )
     }
     result = pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES)
@@ -502,19 +538,12 @@ def test_a_re_run_keeps_the_authority_and_the_pin_and_recreates_nothing(pool):
     assert pool.recreated() == recreated
     assert {name: pool.container_id(name) for name in containers} == containers
     assert changing(calls) == [
-        "docker compose --project-name acme-kimina-demo --env-file {0}/kimina.env -f {0}/docker-compose.yml up -d".format(
-            pool.path(INSTANCE)
-        ),
         "systemctl restart kimina-firewall-demo.service",
-        "docker compose --project-name acme-front-demo --env-file {0}/kimina.env -f {0}/docker-compose.front.yml up -d".format(
-            pool.path(INSTANCE)
-        ),
-        reload_of("acme-front-demo"),
+        started(pool, "lean-server-demo", INSTANCE),
+        reload_of("lean-server-demo-front-1"),
         "systemctl restart lean-pool-firewall@agent-demo.service",
-        "docker compose --project-name acme-pool-demo --env-file {0}/pool.env -f {0}/docker-compose.pool.yml up -d".format(
-            pool.path(POOL)
-        ),
-        reload_of("acme-proxy-demo"),
+        started(pool, "lean-pool-demo", POOL),
+        reload_of("lean-pool-demo-haproxy-1"),
         "systemctl restart lean-pool-firewall@proxy-demo.service",
         "systemctl restart lean-pool-firewall@join-demo.service",
     ]
@@ -569,7 +598,7 @@ def test_a_new_front_name_makes_a_new_front_door_certificate_and_only_that(pool)
 def test_re_running_either_instance_installer_after_the_upgrade_recreates_only_a_server_whose_image_or_compose_file_changed(
     pool,
 ):
-    one = pool.container_id("acme-kimina")
+    one = pool.container_id("lean-server-kimina-1")
     before, recreated, mark = snapshot(pool.path("/srv/kimina")), pool.recreated(), pool.mark()
     result = pool.bash("install.sh", "--no-door")
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]
@@ -583,17 +612,16 @@ def test_re_running_either_instance_installer_after_the_upgrade_recreates_only_a
     assert set(after) == set(before)
     assert (
         after == before
-        and pool.container_id("acme-kimina") == one
+        and pool.container_id("lean-server-kimina-1") == one
         and pool.recreated() == recreated
     )
     # From then on a run of it changes nothing: the same container, the directory byte for byte.
-    one, before, recreated = pool.container_id("acme-kimina"), after, pool.recreated()
+    one, before, recreated = pool.container_id("lean-server-kimina-1"), after, pool.recreated()
     assert pool.bash("install.sh", "--no-door").returncode == 0
-    assert pool.container_id("acme-kimina") == one and pool.recreated() == recreated
+    assert pool.container_id("lean-server-kimina-1") == one and pool.recreated() == recreated
     assert snapshot(pool.path("/srv/kimina")) == before
-    assert (
-        "ports:" in pool.path("/srv/kimina/docker-compose.yml").read_text()
-    )  # instance 1 stays published, plain
+    # Instance 1 stays published, plain.
+    assert compose_files_of(pool, "/srv/kimina") == ["compose.yaml"]
     # The pool member stays behind its front, with the certificate and the settings it has.
     box = pool.path(f"{INSTANCE}/tls/box.pem").read_bytes()
     result = pool.bash("install.sh", "--instance", "demo", "--no-door")
@@ -603,7 +631,7 @@ def test_re_running_either_instance_installer_after_the_upgrade_recreates_only_a
     # Nothing of the instance changed since the upgrade, so the re-run makes nothing again.
     assert pool.recreated() == recreated
     assert pool.path(f"{INSTANCE}/tls/box.pem").read_bytes() == box
-    assert "ports:" not in pool.path(f"{INSTANCE}/docker-compose.yml").read_text()
+    assert "compose.tls.yaml" in compose_files_of(pool)
     assert (
         "KIMINA_FW_FRONT_ADDRESS=172.29.54.250"
         in pool.path(f"{INSTANCE}/firewall.conf").read_text()
@@ -649,9 +677,7 @@ def test_a_config_haproxy_rejects_stops_the_upgrade_before_anything_that_runs_is
     )
     assert result.returncode == 1 and "nothing that runs was changed" in result.stderr
     assert changing(machine.calls_since(mark)) == []
-    assert (
-        "ports:" in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()
-    )  # still the plain server
+    assert "compose.tls.yaml" not in compose_files_of(machine)  # still the plain server
     assert not machine.path(f"{POOL}/haproxy/haproxy.cfg").exists()
 
 
@@ -718,7 +744,7 @@ def test_add_backend_admits_through_mutual_tls_held_to_the_servers_name(pool):
         and "verifyhost laptop" in config
     )
     assert pool.calls[-1] == reload_of(
-        "acme-proxy-demo"
+        "lean-pool-demo-haproxy-1"
     )  # a reload: checks in flight are not dropped
 
 
@@ -870,7 +896,7 @@ def test_pause_keeps_the_server_listed_with_its_certificate_and_declares_it_disa
         "listen agent_tunnel_laptop" not in config and f"listen agent_tunnel_{pool.own}" in config
     )
     assert changing(pool.calls_since(mark)) == [
-        reload_of("acme-proxy-demo")
+        reload_of("lean-pool-demo-haproxy-1")
     ]  # a reload: no check in flight is dropped
     assert admissions(pool) == asked  # pausing asks the server nothing
     assert not list(pool.path(POOL).glob(".work.*"))
@@ -908,7 +934,7 @@ def test_resume_runs_the_admission_test_again_and_gives_the_pool_it_was_before_t
     assert admission[admission.index("--concurrency") + 1] == "6"
     assert pool.path(f"{POOL}/servers").read_bytes() == servers
     assert pool.path(f"{POOL}/haproxy/haproxy.cfg").read_bytes() == config
-    assert pool.calls[-1] == reload_of("acme-proxy-demo")
+    assert pool.calls[-1] == reload_of("lean-pool-demo-haproxy-1")
     assert not list(pool.path(POOL).glob(".work.*"))
 
 
@@ -1059,10 +1085,7 @@ def test_the_upgrade_wrote_the_pools_facts_beside_the_config_and_the_config_answ
         == ("root", "root", 0o644)
         == machine.owner(f"{POOL}/haproxy/haproxy.cfg")
     )
-    assert (
-        "/haproxy:/usr/local/etc/haproxy:ro"
-        in machine.path(f"{POOL}/docker-compose.pool.yml").read_text()
-    )
+    assert "./haproxy:/usr/local/etc/haproxy:ro" in machine.path(f"{POOL}/compose.yaml").read_text()
     # What it says: the one server of the list, as listed, and the last moment of each of the pool's four
     # public certificates, under the names `status` gives them.
     own, workers = machine.path(f"{POOL}/servers").read_text().splitlines()[-1].split()[0:3:2]
@@ -1181,7 +1204,7 @@ def test_a_pause_and_a_resume_leave_the_facts_agreeing_with_the_list(with_laptop
     assert (facts(pool)[laptop], facts(pool)[own]) == (0, 0)
     assert " paused" not in pool.path(f"{POOL}/servers").read_text()
     # A reload each time, after both files were in place: the facts first, then the config that names them.
-    assert pool.calls[-1] == reload_of("acme-proxy-demo") and not list(
+    assert pool.calls[-1] == reload_of("lean-pool-demo-haproxy-1") and not list(
         pool.path(POOL).glob(".work.*")
     )
 
@@ -1271,7 +1294,7 @@ def test_set_workers_changes_the_listed_count_with_one_reload_and_no_admission_t
     )
     assert checker_line(pool, pool.own) == own_line
     assert changing(pool.calls_since(mark)) == [
-        reload_of("acme-proxy-demo")
+        reload_of("lean-pool-demo-haproxy-1")
     ]  # one reload: no check is dropped
     assert admissions(pool) == asked  # the server is asked nothing
     assert pool.path(f"{POOL}/certs/servers/laptop.crt").read_text() == "a certificate"
@@ -1379,8 +1402,8 @@ def test_the_instances_own_status_shows_its_front_and_instance_one_has_none(pool
 
 # --- the Lean server has an init process, and `status` shows its zombies -------------------------------------
 
-LEAN = "acme-kimina-demo"
-AGENT = "acme-agent-demo"
+LEAN = "lean-server-demo-kimina-1"
+AGENT = "lean-server-demo-agent-1"
 
 
 def status(
@@ -1401,7 +1424,7 @@ def before_the_init_process(deploy: Path, directory: Path) -> Path:
     """The installers as they were before the init process: the Lean server's compose file without
     `init: true`."""
     directory = copy_deploy(deploy, directory)
-    compose = directory / "docker-compose.yml"
+    compose = directory.parent / "lean-server" / "compose.yaml"
     assert compose.read_text().count("\n    init: true\n") == 1
     compose.write_text(compose.read_text().replace("\n    init: true\n", "\n"))
     return directory
@@ -1438,7 +1461,7 @@ def test_status_counts_the_containers_zombies_at_the_end_of_its_usage_line(pool)
         for call in calls
     )
     assert [call for call in calls if call.startswith("docker exec")] == [
-        "docker exec -i acme-agent-demo python -"
+        "docker exec -i lean-server-demo-agent-1 python -"
     ]
     # No zombie is a number too.
     none = status(pool, "@demo", STUB_ZOMBIES="0", **this_process())
@@ -1554,8 +1577,8 @@ def test_a_pool_refresh_makes_this_hosts_lean_server_again_once_when_its_compose
     )
     assert {name: pool.container_id(name) for name in others} == others
     assert len(lean_builds(pool)) == builds  # a refresh never builds the Lean image
-    compose = pool.path(f"{INSTANCE}/docker-compose.yml").read_text()
-    assert "\n    init: true\n" in compose and "ports:" not in compose
+    compose = pool.path(f"{INSTANCE}/compose.yaml").read_text()
+    assert "\n    init: true\n" in compose and "compose.tls.yaml" in compose_files_of(pool)
     assert "--- init process: yes" in status(pool, "@demo").stdout
     # Whether this Docker can start such a container was asked first, with a container that does nothing and
     # the server's own hardening, before anything that runs was touched.
@@ -1585,7 +1608,7 @@ def test_a_docker_that_cannot_give_a_container_an_init_process_stops_both_instal
     assert pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES).returncode == 0
     pool.deploy = deploy
     lean, mark = pool.container_id(LEAN), pool.mark()
-    compose = pool.path(f"{INSTANCE}/docker-compose.yml").read_bytes()
+    compose = pool.path(f"{INSTANCE}/compose.yaml").read_bytes()
     for arguments in (
         ("--proxy", "demo", "--admit-cases", ADMIT_CASES),
         ("--instance", "demo", "--no-door"),
@@ -1605,7 +1628,7 @@ def test_a_docker_that_cannot_give_a_container_an_init_process_stops_both_instal
         and pool.container_id(LEAN) == lean
         and pool.running(LEAN)
     )
-    assert pool.path(f"{INSTANCE}/docker-compose.yml").read_bytes() == compose
+    assert pool.path(f"{INSTANCE}/compose.yaml").read_bytes() == compose
 
 
 # --- a join, over real HTTPS ------------------------------------------------------------------------------------------------
@@ -1641,10 +1664,12 @@ class Window:
         settings = machine.path(f"{self.pool}/pool.env")
         settings.write_text(
             re.sub(
-                r"(?m)^POOL_JOIN_HOST=.*$",
-                f"POOL_JOIN_HOST={join_host}",
+                r"(?m)^LEANPOOL_JOIN_PUBLIC_HOST=.*$",
+                f"LEANPOOL_JOIN_PUBLIC_HOST={join_host}",
                 re.sub(
-                    r"(?m)^POOL_JOIN_PORT=.*$", f"POOL_JOIN_PORT={self.port}", settings.read_text()
+                    r"(?m)^LEANPOOL_JOIN_PUBLIC_PORT=.*$",
+                    f"LEANPOOL_JOIN_PUBLIC_PORT={self.port}",
+                    settings.read_text(),
                 ),
             )
         )
@@ -1682,7 +1707,7 @@ class Window:
         return "\n".join(self.lines)
 
     def service_runs(self) -> bool:
-        holder = self.machine.stub / "state" / f"pid.acme-join-{self.instance}"
+        holder = self.machine.stub / "state" / f"pid.lean-pool-{self.instance}-join"
         if not holder.exists():
             return False
         try:
@@ -1856,26 +1881,26 @@ def test_a_box_joins_over_https_with_no_ssh_and_serves_under_its_own_certificate
     key_line = next(
         line
         for line in pool.path(f"{INSTANCE}/kimina.env").read_text().splitlines()
-        if line.startswith("KIMINA_API_KEY=")
+        if line.startswith("LEAN_SERVER_API_KEY=")
     )
     assert (
         box.path(f"{INSTANCE}/kimina.env").read_text().splitlines()[0] == key_line
     )  # the pool's key, once
-    assert box.path(f"{INSTANCE}/kimina.env").read_text().count("KIMINA_API_KEY=") == 1
+    assert box.path(f"{INSTANCE}/kimina.env").read_text().count("LEAN_SERVER_API_KEY=") == 1
     assert box.owner(f"{INSTANCE}/kimina.env") == ("root", "root", 0o600)
     settings = box.path(f"{INSTANCE}/kimina.env").read_text()
     assert (
-        "KIMINA_SERVER_NAME=box-a" in settings
-        and "KIMINA_MAX_REPLS=2" in settings
-        and "KIMINA_MEM_LIMIT=12g" in settings
+        "LEAN_SERVER_NAME=box-a" in settings
+        and "LEAN_SERVER_MAX_REPLS=2" in settings
+        and "LEAN_SERVER_MEM_LIMIT=12g" in settings
     )
     # The version the box computed from the bundle it unpacked is the one the pool's host computed from its
     # checkout: one installer, one version.
-    assert re.search(r"^KIMINA_INSTALLER_VERSION=[0-9a-f]{32}$", settings, re.MULTILINE)
-    assert setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION") == setting_of(
-        pool, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION"
+    assert re.search(r"^LEANPOOL_AGENT_VERSION=[0-9a-f]{32}$", settings, re.MULTILINE)
+    assert setting_of(box, f"{INSTANCE}/kimina.env", "LEANPOOL_AGENT_VERSION") == setting_of(
+        pool, f"{POOL}/pool.env", "LEANPOOL_HAPROXY_INSTALLER_VERSION"
     )
-    assert "ports:" not in box.path(f"{INSTANCE}/docker-compose.yml").read_text()
+    assert "compose.tls.yaml" in compose_files_of(box)
     assert (
         "reject unless { ssl_c_s_dn(cn) -m str lean-pool-proxy }"
         in box.path(f"{INSTANCE}/front/haproxy.cfg").read_text()
@@ -1903,7 +1928,7 @@ def test_a_join_leaves_no_secret_behind_on_either_side_and_none_on_a_command_lin
     assert "PRIVATE KEY" not in window.output + result.stdout + result.stderr
     # The window is gone: the service, the token, the spool and the copy of the front door's key.
     assert not window.service_runs() and window.left_behind() == [".join.lock"]
-    assert "docker rm -f -v acme-join-demo" in pool.calls
+    assert "docker rm -f -v lean-pool-demo-join" in pool.calls
     # The box's temporary directory (with the key copy and the pool's answer) is gone too.
     work = next(call.split(" -v ")[1].split(":/work")[0] for call in box.calls if ":/work " in call)
     assert work.startswith("/tmp") and not Path(work).exists()
@@ -2016,7 +2041,7 @@ def test_ctrl_c_closes_the_window_and_cleans_up(joining):
     assert window.service_runs()
     # The service: the pool's image as its own unprivileged user, read-only, without capabilities, one port.
     started = next(
-        call for call in pool.calls if call.startswith("docker run -d --name acme-join-demo ")
+        call for call in pool.calls if call.startswith("docker run -d --name lean-pool-demo-join ")
     )
     assert (
         "--read-only --cap-drop ALL --security-opt no-new-privileges:true" in started
@@ -2114,7 +2139,8 @@ def test_a_joined_box_is_removed_with_the_one_command_it_was_told(joining):
         for call in box.calls_since(mark)
         if call.endswith(" down")
     ]
-    assert downs == ["acme-front-demo", "acme-kimina-demo"]  # the front and its agent first
+    # The server, its agent and its front are one project, taken down at once.
+    assert downs == ["lean-server-demo"]
     assert not box.path(INSTANCE).exists()  # the box's key went with it
     assert not [
         path
@@ -2144,7 +2170,7 @@ def test_a_joined_boxs_certificate_is_in_the_pools_facts_from_the_reload_that_br
         and found['leanpool_server_paused{server="box-a"}'] == 0
     )
     assert (
-        pool.calls_since(mark).count(reload_of("acme-proxy-demo")) == 1
+        pool.calls_since(mark).count(reload_of("lean-pool-demo-haproxy-1")) == 1
     )  # one reload brought in both
     removed = control(pool, "remove-backend", "box-a")
     assert removed.returncode == 0, removed.stderr
@@ -2229,7 +2255,7 @@ def test_a_box_renews_its_certificate_by_leaving_and_joining_again(joining):
         and first.finish() == 0
     )
     old = box.path(f"{INSTANCE}/tls/box.pem").read_bytes()
-    containers, recreated = box.container_id("acme-kimina-demo"), box.recreated()
+    containers, recreated = box.container_id("lean-server-demo-kimina-1"), box.recreated()
 
     still_listed = joining.open()
     again = join(box, still_listed, "--name", "box-a", "--workers", "2")
@@ -2238,7 +2264,7 @@ def test_a_box_renews_its_certificate_by_leaving_and_joining_again(joining):
         and again.returncode == 1
         and "already in the pool; remove it first" in again.stderr
     )
-    assert pool.stopped_by_hand("acme-proxy-demo") is False
+    assert pool.stopped_by_hand("lean-pool-demo-haproxy-1") is False
     assert (
         box.path(f"{INSTANCE}/tls/box.pem").read_bytes() == old
     )  # a refused join changes nothing on the box
@@ -2258,17 +2284,19 @@ def test_a_box_renews_its_certificate_by_leaving_and_joining_again(joining):
         pool.path(f"{POOL}/servers").read_text().splitlines()[-1] == "box-a box-a.lan:18001 2 18201"
     )
     # The Lean server kept running; its front loaded the new certificate with a reload.
-    assert box.container_id("acme-kimina-demo") == containers and box.recreated() == recreated
-    assert reload_of("acme-front-demo") in box.calls_since(mark)
+    assert (
+        box.container_id("lean-server-demo-kimina-1") == containers and box.recreated() == recreated
+    )
+    assert reload_of("lean-server-demo-front-1") in box.calls_since(mark)
     # ... and that reload did not cost the front its place at the next boot.
     box.restart_daemon()
     pool.restart_daemon()
     assert (
-        box.running("acme-front-demo")
-        and box.running("acme-kimina-demo")
-        and box.running("acme-agent-demo")
+        box.running("lean-server-demo-front-1")
+        and box.running("lean-server-demo-kimina-1")
+        and box.running("lean-server-demo-agent-1")
     )
-    assert pool.running("acme-proxy-demo") and pool.running("acme-front-demo")
+    assert pool.running("lean-pool-demo-haproxy-1") and pool.running("lean-server-demo-front-1")
 
 
 # --- a box that is already in the pool takes a newer installer with `--refresh` ------------------------------
@@ -2299,7 +2327,10 @@ def joined(joining, deploy, tmp_path):
     assert window.finish() == 0 and result.returncode == 0, result.stderr + window.output
     assert "--- init process: NO" in status(box, "@demo").stdout
     assert (
-        "\n    init: true\n" not in box.path(f"{INSTANCE}/installer/docker-compose.yml").read_text()
+        "\n    init: true\n"
+        not in box.path(
+            f"{INSTANCE}/installer/lean_pool/deploy/lean-server/compose.yaml"
+        ).read_text()
     )
     pool.deploy = deploy
     assert pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES).returncode == 0
@@ -2309,7 +2340,7 @@ def joined(joining, deploy, tmp_path):
 def but_the_installers_version(settings: bytes) -> list[bytes]:
     """An instance's settings, every line but the installer's version."""
     return [
-        line for line in settings.splitlines() if not line.startswith(b"KIMINA_INSTALLER_VERSION=")
+        line for line in settings.splitlines() if not line.startswith(b"LEANPOOL_AGENT_VERSION=")
     ]
 
 
@@ -2322,11 +2353,11 @@ def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_and_
     had = SimpleNamespace(
         certificate=box.path(f"{INSTANCE}/tls/box.pem").read_bytes(),
         settings=box.path(f"{INSTANCE}/kimina.env").read_bytes(),
-        version=setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION"),
+        version=setting_of(box, f"{INSTANCE}/kimina.env", "LEANPOOL_AGENT_VERSION"),
         stamp=box.path(f"{INSTANCE}/image.built").read_bytes(),
         lean=box.container_id(LEAN),
         recreated=box.recreated(),
-        others={name: box.container_id(name) for name in ("acme-front-demo",)},
+        others={name: box.container_id(name) for name in ("lean-server-demo-front-1",)},
         builds=len(lean_builds(box)),
         servers=pool.path(f"{POOL}/servers").read_bytes(),
         config=pool.path(f"{POOL}/haproxy/haproxy.cfg").read_bytes(),
@@ -2338,15 +2369,15 @@ def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_and_
     assert "INSTALLED AND VERIFIED" in result.stdout  # the installer's own check ran
     # The box: today's compose file, in a pool member's form, and its Lean server made again, once, with an init;
     # its usage agent made again, once, for the newer installer's version.
-    compose = box.path(f"{INSTANCE}/docker-compose.yml").read_text()
-    assert "\n    init: true\n" in compose and "ports:" not in compose
+    compose = box.path(f"{INSTANCE}/compose.yaml").read_text()
+    assert "\n    init: true\n" in compose and "compose.tls.yaml" in compose_files_of(box)
     assert box.recreated() == [*had.recreated, LEAN, AGENT] and box.container_id(LEAN) not in (
         "",
         had.lean,
     )
-    version = setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    version = setting_of(box, f"{INSTANCE}/kimina.env", "LEANPOOL_AGENT_VERSION")
     assert version != had.version and version == setting_of(
-        pool, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION"
+        pool, f"{POOL}/pool.env", "LEANPOOL_HAPROXY_INSTALLER_VERSION"
     )
     assert "--- init process: yes" in status(box, "@demo").stdout
     # What it had, it has: the image (not built, not loaded) and its record, the key and every setting but the
@@ -2363,7 +2394,10 @@ def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_and_
     assert {name: box.container_id(name) for name in had.others} == had.others
     assert not any("leanpool-pki csr" in call for call in calls)  # no key was made
     # The installer copy on the box is today's.
-    assert "\n    init: true\n" in box.path(f"{INSTANCE}/installer/docker-compose.yml").read_text()
+    assert (
+        "\n    init: true\n"
+        in box.path(f"{INSTANCE}/installer/lean_pool/deploy/lean-server/compose.yaml").read_text()
+    )
     # The pool: asked for nothing. Nothing reached its spool, nothing was signed or tested, its list and its
     # configuration are byte for byte, and the window is as open as it was.
     assert not any(pool.path(POOL).glob(".join.*/spool/requests/*"))
@@ -2458,7 +2492,7 @@ def test_a_box_whose_docker_cannot_give_an_init_process_is_not_refreshed_and_its
     window = joined.open()
     lean, mark = box.container_id(LEAN), box.mark()
     compose, installer = (
-        box.path(f"{INSTANCE}/docker-compose.yml").read_bytes(),
+        box.path(f"{INSTANCE}/compose.yaml").read_bytes(),
         snapshot(box.path(f"{INSTANCE}/installer")),
     )
     failed = join(box, window, "--refresh", STUB_NO_INIT="1")
@@ -2476,7 +2510,7 @@ def test_a_box_whose_docker_cannot_give_an_init_process_is_not_refreshed_and_its
         and box.container_id(LEAN) == lean
         and box.running(LEAN)
     )
-    assert box.path(f"{INSTANCE}/docker-compose.yml").read_bytes() == compose
+    assert box.path(f"{INSTANCE}/compose.yaml").read_bytes() == compose
     assert (
         snapshot(box.path(f"{INSTANCE}/installer")) == installer
     )  # still the installer of its join
@@ -2524,13 +2558,15 @@ def test_the_stand_in_keeps_dockers_book_a_container_docker_signalled_does_not_c
     docker = str(pool.stub / "bin" / "docker")
     assert (
         subprocess.run(
-            [docker, "kill", "-s", "HUP", "acme-proxy-demo"], env=pool.environment()
+            [docker, "kill", "-s", "HUP", "lean-pool-demo-haproxy-1"], env=pool.environment()
         ).returncode
         == 0
     )
-    assert pool.running("acme-proxy-demo") and pool.stopped_by_hand("acme-proxy-demo")
+    assert pool.running("lean-pool-demo-haproxy-1") and pool.stopped_by_hand(
+        "lean-pool-demo-haproxy-1"
+    )
     pool.restart_daemon()
-    assert not pool.running("acme-proxy-demo") and pool.running("acme-cache-demo")
+    assert not pool.running("lean-pool-demo-haproxy-1") and pool.running("lean-pool-demo-cache-1")
 
 
 def test_a_reboot_brings_every_container_back_after_a_second_install_a_reload_and_an_added_server(
@@ -2540,14 +2576,14 @@ def test_a_reboot_brings_every_container_back_after_a_second_install_a_reload_an
     assert (
         pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES).returncode == 0
     )  # the second run: both HAProxys reload
-    assert pool.reloads() == ["acme-front-demo", "acme-proxy-demo"]
+    assert pool.reloads() == ["lean-server-demo-front-1", "lean-pool-demo-haproxy-1"]
     assert control(pool, "reload").returncode == 0
     assert (
         control(pool, "add-backend", "laptop", "192.168.50.44:18001", "6", "18201").returncode == 0
     )
     assert control(pool, "render").returncode == 0
     assert control(pool, "remove-backend", "laptop").returncode == 0
-    assert pool.reloads()[2:] == ["acme-proxy-demo"] * 4
+    assert pool.reloads()[2:] == ["lean-pool-demo-haproxy-1"] * 4
     assert not any(re.match(r"docker (kill|stop) ", call) for call in pool.calls_since(mark))
     assert not any(pool.stopped_by_hand(name) for name in EVERY_CONTAINER)
     pool.restart_daemon()
@@ -2558,22 +2594,23 @@ def test_a_reboot_after_a_join_brings_the_proxy_and_the_new_boxs_front_back(join
     window, box, pool = joining.open(), joining.box, joining.pool
     result = join(box, window, "--name", "box-a", "--workers", "2")
     assert window.finish() == 0 and result.returncode == 0, result.stderr + window.output
-    assert pool.reloads() == ["acme-proxy-demo"]  # the new server was loaded with a reload
+    assert pool.reloads() == ["lean-pool-demo-haproxy-1"]  # the new server was loaded with a reload
     assert not any(call.startswith("docker kill") for call in pool.calls + box.calls)
     pool.restart_daemon()
     box.restart_daemon()
     assert [name for name in EVERY_CONTAINER if not pool.running(name)] == []
     assert (
-        box.running("acme-front-demo")
-        and box.running("acme-agent-demo")
-        and box.running("acme-kimina-demo")
+        box.running("lean-server-demo-front-1")
+        and box.running("lean-server-demo-agent-1")
+        and box.running("lean-server-demo-kimina-1")
     )
 
 
 def test_a_reload_of_a_proxy_that_is_not_running_says_so(pool):
     assert (
         subprocess.run(
-            [str(pool.stub / "bin" / "docker"), "stop", "acme-proxy-demo"], env=pool.environment()
+            [str(pool.stub / "bin" / "docker"), "stop", "lean-pool-demo-haproxy-1"],
+            env=pool.environment(),
         ).returncode
         == 0
     )
@@ -2708,12 +2745,13 @@ def test_a_front_that_keeps_restarting_stops_the_upgrade_and_is_named_with_its_l
         "demo",
         "--admit-cases",
         ADMIT_CASES,
-        STUB_CRASH_LOOP="acme-front-demo",
+        STUB_CRASH_LOOP="lean-server-demo-front-1",
     )
-    assert machine.running("acme-front-demo")  # "running", as Docker reports a restart loop
+    # "running", as Docker reports a restart loop.
+    assert machine.running("lean-server-demo-front-1")
     assert result.returncode == 1 and "POOL INSTALLED" not in result.stdout
     assert (
-        "the TLS front acme-front-demo of 'workstation' does not stay up" in result.stderr
+        "the TLS front lean-server-demo-front-1 of 'workstation' does not stay up" in result.stderr
     )  # the front, by name
     assert (
         "unable to stat SSL certificate from file '/etc/leanpool/tls/box.pem' : Permission denied"
@@ -2722,7 +2760,8 @@ def test_a_front_that_keeps_restarting_stops_the_upgrade_and_is_named_with_its_l
     assert "run this again" in result.stderr
     # The pool's proxy was not switched to a config whose only server has no front.
     assert not any(
-        "acme-pool-demo" in call and call.endswith("up -d") for call in machine.calls_since(mark)
+        "--project-name lean-pool-demo " in call and call.endswith("up -d")
+        for call in machine.calls_since(mark)
     )
 
 
@@ -2730,10 +2769,10 @@ def test_a_new_boxs_front_that_keeps_restarting_is_never_reported_ready(joining)
     window, box, pool = joining.open(), joining.box, joining.pool
     servers = pool.path(f"{POOL}/servers").read_bytes()
     result = join(
-        box, window, "--name", "box-a", "--workers", "2", STUB_CRASH_LOOP="acme-front-demo"
+        box, window, "--name", "box-a", "--workers", "2", STUB_CRASH_LOOP="lean-server-demo-front-1"
     )
     assert result.returncode == 1 and "step 8 failed" in result.stderr
-    assert "the TLS front acme-front-demo of 'box-a' does not stay up" in result.stderr
+    assert "the TLS front lean-server-demo-front-1 of 'box-a' does not stay up" in result.stderr
     # The pool has signed this box's certificate by then: the box is told its window is used up.
     assert (
         "this join window is used up" in result.stderr
@@ -3333,7 +3372,7 @@ def test_build_only_builds_the_image_and_nothing_else(tmp_path, deploy):
     assert not [
         path
         for path in machine.root.rglob("*")
-        if path.is_file() and b"KIMINA_API_KEY" in path.read_bytes()
+        if path.is_file() and b"LEAN_SERVER_API_KEY" in path.read_bytes()
     ]
     # The stamp: the inputs' digest, then the image they made.
     inputs, image = machine.path(f"{INSTANCE}/image.built").read_text().split()
@@ -3629,7 +3668,7 @@ def test_a_window_says_what_it_ships_and_does_not_ship_an_export_of_an_image_the
         "a box loads it instead of building."
     ) in window.output
     started = next(
-        call for call in pool.calls if call.startswith("docker run -d --name acme-join-demo ")
+        call for call in pool.calls if call.startswith("docker run -d --name lean-pool-demo-join ")
     )
     assert f"{pool.path(EXPORT)}:/run/join-image:ro" in started and started.endswith(
         "--image-directory /run/join-image"
@@ -3644,7 +3683,7 @@ def test_a_window_says_what_it_ships_and_does_not_ship_an_export_of_an_image_the
     )
     assert "install.sh --proxy demo exports it again): a box builds its own." in window.output
     started = [
-        call for call in pool.calls if call.startswith("docker run -d --name acme-join-demo ")
+        call for call in pool.calls if call.startswith("docker run -d --name lean-pool-demo-join ")
     ][-1]
     assert "/run/join-image" not in started
     result = join(box, window, "--name", "box-a", "--workers", "2")
@@ -4001,11 +4040,11 @@ def test_the_upgrade_puts_this_hosts_lean_server_in_its_control_group_and_leaves
         if "=" in line
     )
     assert (
-        said["KIMINA_CPU_PRIORITY"] == "lowest"
-        and said["KIMINA_CGROUP_PARENT"] == "leanpool-demo.slice"
+        said["LEAN_SERVER_CPU_PRIORITY"] == "lowest"
+        and said["LEAN_SERVER_CGROUP_PARENT"] == "leanpool-demo.slice"
     )
     assert (
-        said["KIMINA_AGENT_LEAN_CPU_STAT"]
+        said["LEANPOOL_AGENT_LEAN_CPU_STAT_PATH"]
         == "/host-cgroup/leanpool.slice/leanpool-demo.slice/cpu.stat"
     )
     assert machine.control_group(LEAN) == "leanpool-demo.slice"
@@ -4020,11 +4059,11 @@ def test_the_upgrade_puts_this_hosts_lean_server_in_its_control_group_and_leaves
     started = next(
         index
         for index, call in enumerate(calls)
-        if "--project-name acme-kimina-demo" in call and call.endswith(" up -d")
+        if "--project-name lean-server-demo " in call and call.endswith(" up -d")
     )
     assert tried < started
     assert (
-        machine.control_group("acme-kimina") == "leanpool-main.slice"
+        machine.control_group("lean-server-kimina-1") == "leanpool-main.slice"
     )  # instance 1: its own, from its own install
     output = status(machine, "@demo").stdout
     assert (
@@ -4107,9 +4146,12 @@ def test_status_hands_the_listed_worker_counts_to_the_program(pool):
     (asked,) = [
         call
         for call in pool.calls_since(mark)
-        if call.startswith("docker exec -i ") and "POOL_SERVER_WORKERS=" in call
+        if call.startswith("docker run --rm -i ") and "POOL_SERVER_WORKERS=" in call
     ]
     workers = (
-        pool.path(f"{INSTANCE}/kimina.env").read_text().split("KIMINA_MAX_REPLS=")[1].split()[0]
+        pool.path(f"{INSTANCE}/kimina.env")
+        .read_text()
+        .split("LEAN_SERVER_MAX_REPLS=")[1]
+        .split()[0]
     )
     assert f"POOL_SERVER_WORKERS={listed(pool)}={workers} " in asked

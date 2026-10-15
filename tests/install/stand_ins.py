@@ -45,6 +45,15 @@ run the REAL scripts against a fake machine:
     plays `docker diff` of a Lean server that has served checks (unnamed files in /tmp, Python's byte-code cache,
     git's index of a Lake package, the mount points it was made with; STUB_DIFF_EXTRA adds lines, STUB_DIFF_FAILS fails it). `kimina-ctl check` fails against the
     container STUB_READ_ONLY_CHECK_FAILS names while that container is read-only;
+  - plays the build and the check as the installers ran them before make.sh too (`run ... --entrypoint bash
+    IMAGE -c "bash /lean-native-src/lean-native-build.sh ..."`, writing straight into the directory mounted at
+    /opt/lean-native), so the upgrade tests can install a box with an older installer;
+  - keeps named volumes (`compose up` makes a project's, `run -v NAME:/path` makes one where it is not there yet,
+    `volume inspect` and `volume rm`), each with files of its own, and copies one volume's files into another
+    for `run ... --entrypoint cp IMAGE -a /from/. /to/`;
+  - makes a project's containers without starting them for `compose up --no-start`, and the next `compose up`
+    starts those very containers; `compose down` removes the project's containers, as the real one does. A
+    container a test names in STUB_UNHEALTHY reports its health as `unhealthy`;
   - builds with the context's `Dockerfile` where no `-f` is given, as Docker does; runs an image's own command
     detached (`run -d --name NAME ... IMAGE`), as a container that is made and runs until it is removed; and
     says which image a container was made from (`inspect -f '{{.Config.Image}}'`);
@@ -266,9 +275,7 @@ def compose(args):
             (STATE / f"network.{network}").write_text(project)   # the project's networks exist while it is up
         for volume, settings in (resolved.get("volumes") or {}).items():
             if not (settings or {}).get("external"):
-                holder = STATE / f"volume.{(settings or {}).get('name') or project + '_' + volume}"
-                if not holder.exists():
-                    holder.write_text(project)
+                made_volume((settings or {}).get("name") or project + "_" + volume, project)
         for name, (service_name, service) in containers.items():
             if wanted and service_name not in wanted:
                 continue
@@ -283,7 +290,10 @@ def compose(args):
             known.write_text(digest)
             holder = STATE / f"label.{name}"
             was_running = is_running(name)
-            if changed or not was_running or (holder.exists() and holder.read_text() != project):
+            # Made by `up --no-start` and not changed since: this `up` starts that very container.
+            made_only = STATE / f"made-only.{name}"
+            as_made = made_only.exists() and not changed and holder.exists() and holder.read_text() == project
+            if not as_made and (changed or not was_running or (holder.exists() and holder.read_text() != project)):
                 (STATE / f"id.{name}").write_text(uuid.uuid4().hex)
                 (STATE / f"by-hand.{name}").unlink(missing_ok=True)      # a new container: nobody stopped it
                 (STATE / f"restarts.{name}").unlink(missing_ok=True)
@@ -295,6 +305,8 @@ def compose(args):
                 (STATE / f"memory.{name}").write_text(str(memory_bytes(str(service.get("mem_limit", "")))))
                 (STATE / f"image.{name}").write_text(image)
                 program = environment_of(service).get("LEAN_SERVER_REPL_PATH")
+                if program is None and "LEAN_SERVER_API_KEY" in environment_of(service):
+                    program = "/repl/.lake/build/bin/repl"               # a Lean image's own setting
                 if program:                                              # the program a worker is: as it was MADE
                     (STATE / f"repl-path.{name}").write_text(str(program))
                 else:
@@ -305,12 +317,15 @@ def compose(args):
                 note("recreated", name)
             holder.write_text(project)
             (STATE / f"policy.{name}").write_text(str(service.get("restart", "no")))
-            (STATE / "running" / name).write_text("")
+            if "--no-start" in args:
+                made_only.write_text("")
+            else:
+                made_only.unlink(missing_ok=True)
+                (STATE / "running" / name).write_text("")
         return 0
-    if verb == "down":
+    if verb == "down":                                       # the project's containers removed, its volumes kept
         for name in containers:
-            (STATE / "running" / name).unlink(missing_ok=True)
-            (STATE / f"label.{name}").unlink(missing_ok=True)
+            forget(name)
         (STATE / f"project.{project}").unlink(missing_ok=True)
         for network in compose_files.network_names(project, resolved).values():
             (STATE / f"network.{network}").unlink(missing_ok=True)
@@ -353,6 +368,8 @@ def run(args):
         given.setdefault(option, []).append(value)
         if option == "-v":
             host_path, container_path = value.split(":")[:2]
+            if not host_path.startswith("/"):                # a named volume, made where it is not there yet
+                host_path = str(made_volume(host_path, "run"))
             if not Path(host_path).exists():
                 fail(f"docker run: bind source {host_path} does not exist")
             mounts.append((host_path, container_path))
@@ -412,6 +429,15 @@ def run(args):
         return 0
     if entrypoint == "bash" and command[:1] == ["/lean-native-src/inside.sh"]:
         return compiled_search(image, command[1:], name, given, mount_of)
+    if entrypoint == "bash" and command[:1] == ["-c"] and "lean-native-build.sh" in command[1]:
+        return compiled_search_in_place(image, name, mount_of)
+    if entrypoint == "cp":                                   # cp -a FROM/. TO/: one volume's files into another
+        if len(command) != 3 or command[0] != "-a" or not command[1].endswith("/.") \
+                or not mount_of(command[1][:-2]) or not mount_of(command[2].rstrip("/")):
+            fail("docker run: the stand-in copies only `cp -a FROM/. TO/` from one mount into another")
+        shutil.copytree(host(command[1][:-2]), host(command[2].rstrip("/")), symlinks=True, dirs_exist_ok=True)
+        note("copies", " ".join(given["-v"]))
+        return 0
     tool, mapped = command[0], [host(argument) for argument in command[1:]]
     source = {**os.environ, "PYTHONPATH": PROJECT}
     if tool in ("leanpool-pki", "leanpool-haproxy-config"):
@@ -529,6 +555,54 @@ def run(args):
 def container_files(name):
     """A container's own file system (what `docker cp` reads), while the container exists."""
     return STATE / "containers" / name
+
+
+def volume_files(name):
+    """A named volume's files, while the volume exists."""
+    return STATE / "volumes" / name
+
+
+def made_volume(name, by):
+    """A named volume, made where it is not there yet: by a compose project, or by `run -v NAME:...`."""
+    holder = STATE / f"volume.{name}"
+    if not holder.exists():
+        holder.write_text(by)
+    volume_files(name).mkdir(parents=True, exist_ok=True)
+    return volume_files(name)
+
+
+def forget(name):
+    """What Docker keeps of a container, gone with the container."""
+    for holder in (STATE / "running" / name, STATE / f"label.{name}", STATE / f"id.{name}", STATE / f"by-hand.{name}",
+                   STATE / f"policy.{name}", STATE / f"restarts.{name}", STATE / f"init.{name}",
+                   STATE / f"cgroup-parent.{name}", STATE / f"memory.{name}", STATE / f"repl-path.{name}",
+                   STATE / f"read-only.{name}", STATE / f"mounts.{name}", STATE / f"image.{name}",
+                   STATE / f"made-only.{name}"):
+        holder.unlink(missing_ok=True)
+    shutil.rmtree(container_files(name), ignore_errors=True)
+
+
+def compiled_search_in_place(image, name, mount_of):
+    """The compiled search step as the installers built it before make.sh: one named container that builds the
+    library and checks it straight into the host directory mounted at /opt/lean-native. STUB_NATIVE as for
+    make.sh's build."""
+    out = mount_of("/opt/lean-native")
+    if out is None or not name:
+        fail("docker run: the older build writes into a mounted /opt/lean-native, in a named container")
+    out = Path(out[0])
+    note("native-builds", image)
+    outcome = os.environ.get("STUB_NATIVE", "ok")
+    if outcome == "no-c-files":
+        print("lean-native-build.sh: this image holds no C file of linarith's search step: nothing was built")
+        return 3
+    (out / "linarith-search.so").write_bytes(b"\x7fELF made for " + image.encode())
+    (out / "sources").write_text("/lean-project/lean-toolchain\n")
+    (out / "built-from").write_text(hashlib.sha256(image.encode()).hexdigest() + "\n")
+    if outcome == "check-fails":
+        print("COMPILED SEARCH STEP: FAILED - the check 'starts a program' got a different answer with the library than without")
+        return 1
+    print("COMPILED SEARCH STEP: ok - linarith's search took 11.4 s as the image runs it and 1.4 s compiled (8.4 times less)")
+    return 0
 
 
 def compiled_search(image, arguments, name, given, mount_of):
@@ -787,8 +861,8 @@ def main():
                 fail(f"Error: No such object: {name}")
             holder = STATE / f"image.{name}"
             print(holder.read_text() if holder.exists() else "")
-        elif "Health" in template:
-            print("healthy")
+        elif "Health" in template:                           # unhealthy where a test says so
+            print("unhealthy" if name in os.environ.get("STUB_UNHEALTHY", "").split(",") else "healthy")
         elif "State.Status" in template:
             print("running" if is_running(name) else "exited")
         else:
@@ -803,12 +877,7 @@ def main():
             except OSError:
                 pass
             pid_file.unlink()
-        for holder in (STATE / "running" / name, STATE / f"label.{name}", STATE / f"id.{name}", STATE / f"by-hand.{name}",
-                       STATE / f"policy.{name}", STATE / f"restarts.{name}", STATE / f"init.{name}",
-                       STATE / f"cgroup-parent.{name}", STATE / f"memory.{name}", STATE / f"repl-path.{name}",
-                       STATE / f"read-only.{name}", STATE / f"mounts.{name}", STATE / f"image.{name}"):
-            holder.unlink(missing_ok=True)
-        shutil.rmtree(container_files(name), ignore_errors=True)
+        forget(name)
         return 0
     if verb == "diff":
         # What a container changed in its writable layer: a Lean server that has served checks wrote unnamed
@@ -888,7 +957,18 @@ def main():
             fail(f"Error response from daemon: No such image: {argv[1]}")
         image_state(argv[2]).write_text(image_state(argv[1]).read_text())
         return 0
-    return 0                     # network rm, volume rm
+    if verb == "volume":                                     # volume inspect|rm NAME
+        name = argv[-1]
+        if argv[1] == "inspect":
+            if not (STATE / f"volume.{name}").exists():
+                fail(f"Error response from daemon: get {name}: no such volume")
+            return 0
+        if argv[1] == "rm":
+            note("volume-removals", name)
+            (STATE / f"volume.{name}").unlink(missing_ok=True)
+            shutil.rmtree(volume_files(name), ignore_errors=True)
+        return 0
+    return 0                     # network rm
 
 
 sys.exit(main())
@@ -1081,6 +1161,13 @@ PROJECT_FILES = (
     "deploy/Dockerfile",
     "deploy/lean-server/compiled-search",
     "deploy/lean-server/read-only-check.sh",
+    "deploy/lean-server/compose.yaml",
+    "deploy/lean-server/compose.agent.yaml",
+    "deploy/lean-server/compose.tls.yaml",
+    "deploy/lean-server/compose.compiled-search.yaml",
+    "deploy/pool/compose.yaml",
+    "deploy/pool/compose.tls.yaml",
+    "deploy/pool/compose.dns.yaml",
 )
 
 

@@ -19,7 +19,7 @@ pytestmark = [
 ]
 
 INSTANCE = "/srv/kimina-demo"
-LEAN = "acme-kimina-demo"
+LEAN = "lean-server-demo-kimina-1"
 CTL = "/usr/local/bin/kimina-ctl"
 INSTALL = ("install.sh", "--instance", "demo", "--no-door")
 GIB = 1024**3
@@ -37,7 +37,8 @@ def machine(tmp_path, deploy):
     machine = Machine(tmp_path / "host", deploy)
     installed(machine)
     assert (
-        settings(machine)["KIMINA_MEM_LIMIT"] == "36g" and machine.memory_ceiling(LEAN) == 36 * GIB
+        settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "36g"
+        and machine.memory_ceiling(LEAN) == 36 * GIB
     )
     return machine
 
@@ -74,13 +75,13 @@ def test_set_mem_writes_the_ceiling_and_makes_the_lean_server_again_and_nothing_
     assert result.returncode == 0, result.stderr
     assert "memory ceiling set to 28g" in result.stdout
     # The one setting, and every other as it was: the worker count, what one worker may take, the CPU ceiling.
-    assert settings(machine) == {**said, "KIMINA_MEM_LIMIT": "28g"}
+    assert settings(machine) == {**said, "LEAN_SERVER_MEM_LIMIT": "28g"}
     assert machine.recreated() == [*had, LEAN]  # not its usage agent
     assert machine.memory_ceiling(LEAN) == 28 * GIB and machine.running(LEAN)
     # Megabytes, and either case of the letter; the setting is kept in one form.
     assert control(machine, "set-mem", "512M").returncode == 0
     assert (
-        settings(machine)["KIMINA_MEM_LIMIT"] == "512m"
+        settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "512m"
         and machine.memory_ceiling(LEAN) == 512 * 1024**2
     )
 
@@ -89,7 +90,8 @@ def test_set_mem_goes_through_the_door(machine):
     result = machine.bash(machine.path(CTL), SSH_ORIGINAL_COMMAND="@demo set-mem 28g")
     assert result.returncode == 0, result.stderr
     assert (
-        settings(machine)["KIMINA_MEM_LIMIT"] == "28g" and machine.memory_ceiling(LEAN) == 28 * GIB
+        settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "28g"
+        and machine.memory_ceiling(LEAN) == 28 * GIB
     )
 
 
@@ -97,12 +99,13 @@ def test_a_later_run_of_the_installer_keeps_the_ceiling(machine):
     assert control(machine, "set-mem", "28g").returncode == 0
     had = machine.recreated()
     installed(machine)  # the way a refresh runs it: no --mem-limit
-    assert settings(machine)["KIMINA_MEM_LIMIT"] == "28g" and machine.recreated() == had
+    assert settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "28g" and machine.recreated() == had
     assert machine.memory_ceiling(LEAN) == 28 * GIB
     # Changing the worker count leaves it too.
     assert control(machine, "set-repls", "6").returncode == 0
     assert (
-        settings(machine)["KIMINA_MEM_LIMIT"] == "28g" and machine.memory_ceiling(LEAN) == 28 * GIB
+        settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "28g"
+        and machine.memory_ceiling(LEAN) == 28 * GIB
     )
 
 
@@ -146,13 +149,13 @@ def test_a_ceiling_docker_will_not_make_a_container_with_is_taken_back(machine):
         "".join(
             line
             for line in env.read_text().splitlines(keepends=True)
-            if not line.startswith("KIMINA_MEM_LIMIT=")
+            if not line.startswith("LEAN_SERVER_MEM_LIMIT=")
         )
     )
     assert control(machine, "set-mem", "5m").returncode == 1
-    assert "KIMINA_MEM_LIMIT" not in settings(machine) and machine.running(LEAN)
+    assert "LEAN_SERVER_MEM_LIMIT" not in settings(machine) and machine.running(LEAN)
     assert control(machine, "set-mem", "6m").returncode == 0  # the floor itself is taken
-    assert settings(machine)["KIMINA_MEM_LIMIT"] == "6m"
+    assert settings(machine)["LEAN_SERVER_MEM_LIMIT"] == "6m"
 
 
 # --- status -------------------------------------------------------------------------------------------------------

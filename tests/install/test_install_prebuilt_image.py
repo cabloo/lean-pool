@@ -23,8 +23,8 @@ pytestmark = [
 EXAMPLE = INSTALLERS / "site.example"
 REFERENCE = "projectnumina/kimina-lean-server:2.0.0"
 IMAGE = "leanpool/kimina:kimina-2.0.0"
-LEAN = "leanpool-kimina-upstream"
-AGENT = "leanpool-agent-upstream"
+LEAN = "lean-server-upstream-kimina-1"
+AGENT = "lean-server-upstream-agent-1"
 INSTANCE = "/srv/kimina-upstream"
 
 
@@ -195,7 +195,8 @@ def test_without_site_the_installer_reads_the_site_beside_it_and_site_overrides_
     assert (deploy / "site" / "site.env").is_file()
     beside = shown(deploy / "install.sh", "--instance", "demo", fake_root=tmp_path)
     assert (
-        beside["image"] == "acme/kimina:lean-demo-1" and beside["container"] == "acme-kimina-demo"
+        beside["image"] == "acme/kimina:lean-demo-1"
+        and beside["container"] == "lean-server-demo-kimina-1"
     )
     given = shown(
         deploy / "install.sh", "--site", str(EXAMPLE), "--instance", "upstream", fake_root=tmp_path

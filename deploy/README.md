@@ -50,6 +50,7 @@ the box they belong to.
 | `LEANPOOL_AGENT_LEAN_CPU_STAT_PATH` | empty | The agent's own setting: the server's `cpu.stat`, under `/host-cgroup`. |
 | `LEANPOOL_AGENT_CPU_RESERVE` | empty | The agent's own setting. |
 | `LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK` | empty | The agent's own setting: the most checks while other work is on the box. |
+| `LEANPOOL_AGENT_VERSION` | empty | The agent's own setting: the installer's version, which ends every reply. |
 | `LEAN_SERVER_FRONT_IMAGE` | `haproxy:3.0` | The TLS front's image. |
 | `LEAN_SERVER_FRONT_ADDRESS` | `172.29.53.250` | The TLS front's fixed address on the project's network. |
 | `LEANPOOL_HAPROXY_IMAGE` | `haproxy:3.0` | The pool's proxy. |
@@ -76,5 +77,6 @@ the box they belong to.
 | `LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS` | both | The renderer's own setting: the servers' `LEAN_SERVER_MAX_WAIT`. |
 | `LEANPOOL_IMAGE_GID` | `pool.env` | The group the pool's image runs as, which may read its key. |
 | `LEANPOOL_FRONT_NAMES` | `pool.env` | The names in the front door's certificate. |
-| `LEANPOOL_JOIN_HOST` | `pool.env` | The join service's own setting. |
-| `LEANPOOL_JOIN_PORT` | `pool.env` | The join service's own setting. |
+| `LEANPOOL_JOIN_PUBLIC_HOST` | `pool.env` | The host name a new box is told to fetch its join script from. |
+| `LEANPOOL_JOIN_PUBLIC_PORT` | `pool.env` | The port the join service is published on while a window is open. |
+| `LEANPOOL_HAPROXY_INSTALLER_VERSION` | `pool.env` | The renderer's own setting: the installer's version, which the pool's `GET /health` carries. |

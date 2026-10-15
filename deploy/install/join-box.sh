@@ -105,7 +105,8 @@ refresh_box() {           # INSTANCE_DIR IMAGE_TAG
     || die "--refresh is for a box that JOINED pool $JOIN_POOL, and this is the pool's own host: its Lean server is refreshed with the pool, by 'sudo bash install.sh --proxy $JOIN_POOL' from the checkout. Nothing was changed."
   [ -f "$dir/kimina.env" ] && [ -s "$dir/tls/box.pem" ] \
     || die "--refresh: this box holds no server of pool $JOIN_POOL ($dir has no settings file or no certificate), so there is nothing to refresh. To JOIN the pool, run the same command without --refresh. Nothing was changed."
-  name=$(setting_in "$dir/kimina.env" KIMINA_SERVER_NAME)
+  # Read before the installer moves the box's settings to Compose's names, on a box that has not moved yet.
+  name=$(setting_moved_in "$dir/kimina.env" LEAN_SERVER_NAME KIMINA_SERVER_NAME)
   options=(--instance "$JOIN_POOL" --no-door --keep-image)
   [ -f "$dir/firewall.conf" ] || options+=(--no-firewall)      # it joined without the firewall, and stays so
   say "3/3 Installing this window's installer over the one '$name' has (its image, key, certificate, settings and place in the pool stay)"

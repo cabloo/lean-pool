@@ -91,29 +91,35 @@ ENV_FILE=$DIR/pool.env
 [ -f "$ENV_FILE" ] || die "$ENV_FILE is missing - run install.sh --proxy $POOL"
 
 setting() { sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1; }
-IMAGE=$(setting POOL_IMAGE)
-IMAGE_GID=$(setting POOL_IMAGE_GID)
-HAPROXY_IMAGE=$(setting POOL_HAPROXY_IMAGE)
-PUBLIC_PORT=$(setting POOL_PUBLIC_PORT)
-LEAN_TIMEOUT=$(setting POOL_LEAN_TIMEOUT)
-SERVER_WAIT=$(setting POOL_SERVER_WAIT)
-MAX_REQUEST_BYTES=$(setting POOL_MAX_REQUEST_BYTES)
-JOIN_HOST=$(setting POOL_JOIN_HOST)
-JOIN_PORT=$(setting POOL_JOIN_PORT)
-INSTALLER_VERSION=$(setting POOL_INSTALLER_VERSION)
-# The site this host was installed for (written by the installer): its name prefix, which also names its helpers'
-# directory, and its LAN's domain. The compose file names the containers, network and volume with the prefix.
+# The pool's one compose project, and the files it runs (install-pool.sh writes both). A pool installed
+# before they were has its settings under older names: the installer moves it.
+PROJECT=$(setting COMPOSE_PROJECT_NAME)
+IFS=: read -r -a COMPOSE_FILES <<<"$(setting COMPOSE_FILE)"
+[ -n "$PROJECT" ] && [ "${#COMPOSE_FILES[@]}" -gt 0 ] \
+  || die "$ENV_FILE names no compose project (COMPOSE_PROJECT_NAME): pool $POOL was installed under the older names. Move it, keeping everything it holds: sudo bash install.sh --proxy $POOL"
+IMAGE=$(setting LEANPOOL_IMAGE)
+IMAGE_GID=$(setting LEANPOOL_IMAGE_GID)
+HAPROXY_IMAGE=$(setting LEANPOOL_HAPROXY_IMAGE)
+PUBLIC_PORT=$(setting LEANPOOL_HAPROXY_PUBLIC_PORT)
+LEAN_TIMEOUT=$(setting LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS)
+SERVER_WAIT=$(setting LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS)
+MAX_REQUEST_BYTES=$(setting LEANPOOL_CACHE_MAX_REQUEST_BYTES)
+JOIN_HOST=$(setting LEANPOOL_JOIN_PUBLIC_HOST)
+JOIN_PORT=$(setting LEANPOOL_JOIN_PUBLIC_PORT)
+INSTALLER_VERSION=$(setting LEANPOOL_HAPROXY_INSTALLER_VERSION)
+# The site this host was installed for (written by the installer): its name prefix, which names its images and
+# its helpers' directory, and its LAN's domain. Containers, the network and the volume have Compose's own names.
 SITE_ENV=/etc/lean-pool/site.env
 site_value() { sed -n "s/^$1=//p" "$SITE_ENV" 2>/dev/null | head -n 1; }
 SITE_PREFIX=$(site_value SITE_PREFIX)
 SITE_LAN_DOMAIN=$(site_value SITE_LAN_DOMAIN)
 [[ "$SITE_PREFIX" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] && [[ "$SITE_LAN_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$ ]] \
   || die "$SITE_ENV is missing or incomplete - re-run install.sh --proxy $POOL"
-export SITE_PREFIX
-PROXY=$SITE_PREFIX-proxy-$POOL
-CACHE=$SITE_PREFIX-cache-$POOL
-JOIN_SERVICE=$SITE_PREFIX-join-$POOL
-COMPOSE=(docker compose --project-name "$SITE_PREFIX-pool-$POOL" --env-file "$ENV_FILE" -f "$DIR/docker-compose.pool.yml")
+PROXY=$PROJECT-haproxy-1
+CACHE=$PROJECT-cache-1
+JOIN_SERVICE=$PROJECT-join
+COMPOSE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE")
+for file in "${COMPOSE_FILES[@]}"; do COMPOSE+=(-f "$DIR/$file"); done
 [ -n "$IMAGE" ] && [ -n "$HAPROXY_IMAGE" ] && [ -n "$PUBLIC_PORT" ] && [ -n "$LEAN_TIMEOUT" ] \
   || die "$ENV_FILE is incomplete - re-run install.sh --proxy $POOL"
 # The proxy's certificates (install-pool.sh): tls/ is what the proxy container reads, certs/ is public.
@@ -248,17 +254,13 @@ add_backend() {           # SERVER HOST:PORT WORKERS [AGENT_PORT [CERTIFICATE]] 
 }
 
 inside_pool() {           # run a Python program on the proxy's loopback
-  # In the cache container when it is up (it shares the proxy's network). With the cache stopped, in a
-  # throwaway container that joins the proxy's network instead: `status` and `check` are wanted most then.
-  # POOL_SERVER_WORKERS (`name=workers ...`, from the server list) is for `status` alone: HAProxy's
-  # statistics hold a server's limit as it is now, not the worker count it was listed with.
-  if container_runs "$CACHE"; then
-    docker exec -i -e POOL_PUBLIC_PORT="$PUBLIC_PORT" -e POOL_SERVER_WORKERS="${POOL_SERVER_WORKERS:-}" "$CACHE" python -
-  else
-    docker run --rm -i --network "container:$PROXY" --read-only --cap-drop ALL -e POOL_PUBLIC_PORT="$PUBLIC_PORT" \
-      -e POOL_SERVER_WORKERS="${POOL_SERVER_WORKERS:-}" \
-      -v "$DIR/api-key":/run/pool/api-key:ro -v "$DIR/certs/ca.crt":/run/pool/ca.crt:ro "$IMAGE" python -
-  fi
+  # In a throwaway container of the pool's image that joins the proxy's network, whether the cache runs or
+  # not (`status` and `check` are wanted most when it does not), with the pool's key and its authority's
+  # certificate. POOL_SERVER_WORKERS (`name=workers ...`, from the server list) is for `status` alone:
+  # HAProxy's statistics hold a server's limit as it is now, not the worker count it was listed with.
+  docker run --rm -i --network "container:$PROXY" --read-only --cap-drop ALL -e POOL_PUBLIC_PORT="$PUBLIC_PORT" \
+    -e POOL_SERVER_WORKERS="${POOL_SERVER_WORKERS:-}" \
+    -v "$DIR/api-key":/run/pool/api-key:ro -v "$DIR/certs/ca.crt":/run/pool/ca.crt:ro "$IMAGE" python -
 }
 
 show_status() {
@@ -469,7 +471,7 @@ PY
     command -v python3 >/dev/null && [ -f "$HELPER" ] || die "python3 and $HELPER are needed - re-run install.sh --proxy $POOL"
     [ -s "$DIR/join/join-box.sh" ] && [ -s "$DIR/join/bundle.b64" ] || die "the join bundle is missing - re-run install.sh --proxy $POOL"
     [[ "$JOIN_HOST" =~ ^[A-Za-z0-9.-]{1,120}$ ]] && valid_port "${JOIN_PORT:-}" && [[ "$IMAGE_GID" =~ ^[0-9]{1,10}$ ]] \
-      || die "$ENV_FILE has no usable POOL_JOIN_HOST, POOL_JOIN_PORT or POOL_IMAGE_GID - re-run install.sh --proxy $POOL"
+      || die "$ENV_FILE has no usable LEANPOOL_JOIN_PUBLIC_HOST, LEANPOOL_JOIN_PUBLIC_PORT or LEANPOOL_IMAGE_GID - re-run install.sh --proxy $POOL"
     exec 9>"$DIR/.join.lock"
     flock -n 9 || die "a join window is already open for pool $POOL (one box per window)"
     # Every way out goes through `cleanup` (the EXIT trap): Ctrl-C, a kill, a closed terminal or door.
@@ -525,7 +527,7 @@ PY
     image_mount=(); image_flag=()
     ships="no image (this host has exported none): a box builds its own"
     if [ -s "$image_dir/manifest.json" ]; then
-      lean_image_id=$(docker image inspect -f '{{.Id}}' "$SITE_PREFIX/kimina:$(setting POOL_PIN)" 2>/dev/null || true)
+      lean_image_id=$(docker image inspect -f '{{.Id}}' "$SITE_PREFIX/kimina:$(setting LEANPOOL_CACHE_PIN)" 2>/dev/null || true)
       if exported=$(python3 "$HELPER" image-export --manifest "$image_dir/manifest.json" --directory "$image_dir" \
             --image-id "${lean_image_id:-none}" 2>&1); then
         image_mount=(-v "$image_dir":/run/join-image:ro); image_flag=(--image-directory /run/join-image)

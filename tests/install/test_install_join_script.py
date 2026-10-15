@@ -973,7 +973,7 @@ def in_the_pool(box: Box, firewall: bool = True) -> Path:
     (instance / "tls").mkdir(parents=True)
     (instance / "installer").mkdir()
     (instance / "kimina.env").write_text(
-        f"KIMINA_API_KEY={API_KEY}\nKIMINA_SERVER_NAME=lap-top\nKIMINA_MAX_REPLS=3\n"
+        f"LEAN_SERVER_API_KEY={API_KEY}\nLEAN_SERVER_NAME=lap-top\nLEAN_SERVER_MAX_REPLS=3\n"
     )
     (instance / "tls" / "box.pem").write_text(CERTIFICATE + FAKE_KEY)
     (instance / "installer" / "install.sh").write_text("# the installer of this box's own join\n")
@@ -1009,7 +1009,7 @@ def test_a_refresh_runs_this_windows_installer_as_the_join_ran_it_and_asks_the_p
     assert not any(stat.S_IMODE(path.stat().st_mode) & 0o022 for path in kept.rglob("*"))
     # What the box had, it has; and what was unpacked is gone.
     assert (instance / "tls" / "box.pem").read_text() == CERTIFICATE + FAKE_KEY
-    assert (instance / "kimina.env").read_text().splitlines()[0] == f"KIMINA_API_KEY={API_KEY}"
+    assert (instance / "kimina.env").read_text().splitlines()[0] == f"LEAN_SERVER_API_KEY={API_KEY}"
     assert not Path(box.read("installer-ran-from").strip()).parent.parent.exists()
     assert "REFRESHED: 'lap-top'" in result.stdout and "this window is still open" in result.stdout
     assert "sudo kimina-ctl @demo status" in result.stdout
@@ -1123,9 +1123,6 @@ def test_the_bundle_holds_the_instance_installer_and_everything_it_asks_for(pack
         "kimina-firewall",
         "kimina-ctl",
         "join_helper.py",
-        "docker-compose.yml",
-        "docker-compose.agent.yml",
-        "docker-compose.front.yml",
         "site/site.env",
         "site/instances/demo.env",
         "lean_pool/pyproject.toml",
@@ -1135,6 +1132,15 @@ def test_the_bundle_holds_the_instance_installer_and_everything_it_asks_for(pack
         "lean_pool/leanpool/pki/cli.py",
         "lean_pool/leanpool/haproxy/box.py",
         "lean_pool/leanpool/agent/cli.py",
+        *(
+            f"lean_pool/deploy/lean-server/{name}"
+            for name in (
+                "compose.yaml",
+                "compose.agent.yaml",
+                "compose.tls.yaml",
+                "compose.compiled-search.yaml",
+            )
+        ),
         *(
             f"lean_pool/deploy/lean-server/compiled-search/{name}"
             for name in ("build.sh", "check.py", "inside.sh", "make.sh", "modules", "repl-native")
@@ -1222,7 +1228,9 @@ def test_a_box_computes_from_its_bundle_the_version_the_pool_computes_from_the_c
     "member",
     [
         "kimina-ctl",
-        "docker-compose.front.yml",
+        "lean_pool/deploy/lean-server/compose.agent.yaml",
+        "lean_pool/deploy/lean-server/compiled-search/make.sh",
+        "lean_pool/deploy/lean-server/read-only-check.sh",
         "site/site.env",
         "site/instances/demo.env",
         "lean_pool/leanpool/agent/cli.py",

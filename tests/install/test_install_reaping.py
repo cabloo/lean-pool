@@ -10,7 +10,7 @@ zombie, and a zombie holds a process slot under the container's `pids_limit` unt
 again. The count only grows, by one for each worker the server closes, and at 4096 every check is answered
 500 while `/health` still passes.
 
-With `init: true` (docker-compose.yml) Docker's init is the first process and the server its child, and an
+With `init: true` (deploy/lean-server/compose.yaml) Docker's init is the first process and the server its child, and an
 init collects whatever is handed to it.
 
 The mechanism needs neither Docker nor Lean, so it runs here. A process takes the first process's role with
