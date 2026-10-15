@@ -928,26 +928,9 @@ install_tls_front() {
   [ -z "$holder" ] || [ "$holder" = "$front" ] \
     || die "$address on network $network is in use by $holder: set LEAN_SERVER_FRONT_ADDRESS in $env to a free address"
 
-  # Render, then let the real HAProxy image judge the config AS ITS OWN USER, with the certificate files
-  # mounted where the config says they are. mktemp -d is root-only, so the candidate gets the modes the
-  # installed config has (0755 directory, 0644 file; it holds no secret). The front reaches the server and
-  # the agent by their service names, on the ports they listen on inside the project.
-  work=$(mktemp -d)
-  docker run --rm --network none "$LEAN_POOL_IMAGE" leanpool-haproxy-config render-box \
-      --tls-server-pem "$LEAN_POOL_TLS_MOUNT/box.pem" --tls-ca-file "$LEAN_POOL_TLS_MOUNT/ca.crt" \
-      --proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME" \
-      --lean-upstream kimina:8000 --agent-upstream agent:18200 \
-      --lean-port 8000 --agent-port 18200 \
-      --lean-timeout "$lean_timeout" --server-wait "$server_wait" > "$work/haproxy.cfg" \
-    || { rm -rf "$work"; die "could not render the TLS front's config; no container was changed"; }
-  chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"
-  docker run --rm --network none -v "$work":/cfg:ro -v "$dir/tls":"$LEAN_POOL_TLS_MOUNT":ro \
-      "$LEAN_POOL_HAPROXY_IMAGE" haproxy -c -f /cfg/haproxy.cfg >/dev/null \
-    || { rm -rf "$work"; die "HAProxy rejected the TLS front's config, or cannot read its certificate; no container was changed"; }
-  install -d -o root -g root -m 0755 "$dir/front"
-  install -o root -g root -m 0644 "$work/haproxy.cfg" "$dir/front/haproxy.cfg.new"
+  render_tls_front "$dir" "$LEAN_POOL_IMAGE" "$LEAN_POOL_HAPROXY_IMAGE" "$lean_timeout" "$server_wait" \
+    "$dir/front/haproxy.cfg.new"
   mv -f "$dir/front/haproxy.cfg.new" "$dir/front/haproxy.cfg"
-  rm -rf "$work"
 
   set_env_in "$env" LEAN_SERVER_NAME "$name"
   set_env_in "$env" LEAN_SERVER_FRONT_IMAGE "$LEAN_POOL_HAPROXY_IMAGE"
@@ -993,6 +976,31 @@ install_tls_front() {
     warn "no firewall rule for the usage port $agent_port (the TLS front still requires the pool proxy's certificate)"
   fi
   echo "TLS front $front at $address: the Lean server and the usage agent are no longer published themselves"
+}
+
+# render_tls_front INSTANCE_DIR POOL_IMAGE HAPROXY_IMAGE LEAN_TIMEOUT SERVER_WAIT OUT : the front's config,
+# rendered by the pool's tools (POOL_IMAGE), then judged by the real HAProxy (HAPROXY_IMAGE) AS ITS OWN USER,
+# with the certificate files mounted where the config says they are, and installed at OUT (0644: it holds no
+# secret). mktemp -d is root-only, so the candidate gets the modes of the installed config. The front reaches
+# the server and the agent by their service names, on the ports they listen on inside the project. Either
+# failing stops the installer with no container changed.
+render_tls_front() {
+  local dir=$1 pool_image=$2 haproxy_image=$3 lean_timeout=$4 server_wait=$5 out=$6 work
+  work=$(mktemp -d)
+  docker run --rm --network none "$pool_image" leanpool-haproxy-config render-box \
+      --tls-server-pem "$LEAN_POOL_TLS_MOUNT/box.pem" --tls-ca-file "$LEAN_POOL_TLS_MOUNT/ca.crt" \
+      --proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME" \
+      --lean-upstream kimina:8000 --agent-upstream agent:18200 \
+      --lean-port 8000 --agent-port 18200 \
+      --lean-timeout "$lean_timeout" --server-wait "$server_wait" > "$work/haproxy.cfg" \
+    || { rm -rf "$work"; die "could not render the TLS front's config; no container was changed"; }
+  chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"
+  docker run --rm --network none -v "$work":/cfg:ro -v "$dir/tls":"$LEAN_POOL_TLS_MOUNT":ro \
+      "$haproxy_image" haproxy -c -f /cfg/haproxy.cfg >/dev/null \
+    || { rm -rf "$work"; die "HAProxy rejected the TLS front's config, or cannot read its certificate; no container was changed"; }
+  install -d -o root -g root -m 0755 "$dir/front"
+  install -o root -g root -m 0644 "$work/haproxy.cfg" "$out"
+  rm -rf "$work"
 }
 
 # ------------------------------------------------------------------------------------ the join bundle
@@ -1154,4 +1162,362 @@ export_join_image() {
   chmod 0640 "$out/$file" "$out/manifest.json"
   echo "exported $image: $(awk -v bytes="$bytes" 'BEGIN {printf "%.1f GB", bytes / 1e9}') in $(( $(date +%s) - started )) s (docker save $(( saved - started )) s, SHA-256 $(( $(date +%s) - saved )) s) to $out/$file"
   echo "a joining $machine box loads it instead of building; it is exported again only when this host's image changes"
+}
+
+# ------------------------------------------------------------------------ moving a box to Compose's names
+# Installers before this one ran an instance as up to three compose projects of their own files (the server,
+# its usage agent and its TLS front) and a pool as one, named after the site's prefix, with settings under names
+# of their own. Now an instance is ONE project of the lean-pool project's files and a pool likewise (the compose
+# files, above), and every setting has the name of what reads it. kimina-ctl is one program for every instance
+# of a box, so the box moves whole: at the end of an installer's pre-flight, before the installer changes
+# anything else, each instance and then each pool comes down under its older names and starts under the new
+# ones. One that does not come up healthy and pass its check is taken down again and comes back as it was, and
+# the installer stops; those that moved before it stay moved. A box that has moved has nothing to move.
+# What a move replaced is kept beside it, with the ending .before-compose-names:
+#   <instance dir>/kimina.env.*   the settings as they were (0600)     <pool dir>/pool.env.*   likewise
+#   <instance dir>/docker-compose*.yml.*  front/haproxy.cfg.*           <pool dir>/docker-compose.pool.yml.*
+# Those files put back, with the new projects down, are what an older installer runs again. A move changes no
+# host port, subnet, front address, firewall rule, control group, server list, certificate or key.
+MOVED=before-compose-names
+# The settings an older installer wrote, OLD=NEW. An empty NEW is a setting nothing reads any more. Every other
+# line stays as it is, in its place.
+MOVED_INSTANCE_SETTINGS=(
+  KIMINA_API_KEY=LEAN_SERVER_API_KEY KIMINA_MAX_REPLS=LEAN_SERVER_MAX_REPLS
+  KIMINA_MAX_REPL_USES=LEAN_SERVER_MAX_REPL_USES KIMINA_MAX_REPL_MEM=LEAN_SERVER_MAX_REPL_MEM
+  KIMINA_MAX_WAIT=LEAN_SERVER_MAX_WAIT KIMINA_LOG_LEVEL=LEAN_SERVER_LOG_LEVEL KIMINA_IMAGE_TAG=LEAN_SERVER_IMAGE
+  KIMINA_PORT=LEAN_SERVER_PUBLISHED_PORT KIMINA_AGENT_PORT=LEAN_SERVER_AGENT_PORT KIMINA_SUBNET=LEAN_SERVER_SUBNET
+  KIMINA_CPUS=LEAN_SERVER_CPUS KIMINA_MEM_LIMIT=LEAN_SERVER_MEM_LIMIT KIMINA_CGROUP_PARENT=LEAN_SERVER_CGROUP_PARENT
+  KIMINA_CPU_PRIORITY=LEAN_SERVER_CPU_PRIORITY KIMINA_ROOT_READ_ONLY=LEAN_SERVER_ROOT_READ_ONLY
+  KIMINA_READ_ONLY=LEAN_SERVER_READ_ONLY KIMINA_COMPILED_SEARCH=LEAN_SERVER_COMPILED_SEARCH
+  KIMINA_SERVER_NAME=LEAN_SERVER_NAME KIMINA_AGENT_IMAGE=LEAN_SERVER_AGENT_IMAGE
+  KIMINA_FRONT_IMAGE=LEAN_SERVER_FRONT_IMAGE KIMINA_FRONT_ADDRESS=LEAN_SERVER_FRONT_ADDRESS
+  KIMINA_AGENT_BESIDE_OTHER_WORK=LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK
+  KIMINA_AGENT_LEAN_CPU_STAT=LEANPOOL_AGENT_LEAN_CPU_STAT_PATH KIMINA_AGENT_CPU_RESERVE=LEANPOOL_AGENT_CPU_RESERVE
+  KIMINA_FRONT_LEAN_TIMEOUT=LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS
+  KIMINA_FRONT_SERVER_WAIT=LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS KIMINA_INSTALLER_VERSION=LEANPOOL_AGENT_VERSION
+  KIMINA_REPL_PATH= KIMINA_CONTAINER= KIMINA_PROJECT= KIMINA_NETWORK= KIMINA_AGENT_CONTAINER= KIMINA_FRONT_CONTAINER=
+)
+# What the older compose file used where a setting was not written: written out, so that no default of the
+# compose files of deploy/ changes a box.
+MOVED_INSTANCE_DEFAULTS=(
+  LEAN_SERVER_MAX_REPLS=12 LEAN_SERVER_MAX_REPL_USES=200 LEAN_SERVER_MAX_REPL_MEM=8G LEAN_SERVER_MAX_WAIT=120
+  LEAN_SERVER_LOG_LEVEL=WARNING LEAN_SERVER_PUBLISHED_PORT=18000 LEAN_SERVER_MEM_LIMIT=36g LEAN_SERVER_CPUS=16
+  LEAN_SERVER_SUBNET=172.29.53.0/24 LEAN_SERVER_ROOT_READ_ONLY=false
+)
+MOVED_POOL_SETTINGS=(
+  POOL_PIN=LEANPOOL_CACHE_PIN POOL_CACHE_MAX_BYTES=LEANPOOL_CACHE_MAX_BYTES
+  POOL_CACHE_UPSTREAM_TIMEOUT=LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS
+  POOL_MAX_REQUEST_BYTES=LEANPOOL_CACHE_MAX_REQUEST_BYTES POOL_PUBLIC_PORT=LEANPOOL_HAPROXY_PUBLIC_PORT
+  POOL_LEAN_TIMEOUT=LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS POOL_SERVER_WAIT=LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS
+  POOL_JOIN_PORT=LEANPOOL_JOIN_PUBLIC_PORT POOL_JOIN_HOST=LEANPOOL_JOIN_PUBLIC_HOST POOL_IMAGE=LEANPOOL_IMAGE
+  POOL_HAPROXY_IMAGE=LEANPOOL_HAPROXY_IMAGE POOL_IMAGE_GID=LEANPOOL_IMAGE_GID POOL_SUBNET=LEANPOOL_SUBNET
+  POOL_DNS=LEANPOOL_DNS POOL_FRONT_NAMES=LEANPOOL_FRONT_NAMES
+  POOL_INSTALLER_VERSION=LEANPOOL_HAPROXY_INSTALLER_VERSION POOL_NAME=
+)
+MOVED_POOL_DEFAULTS=(
+  LEANPOOL_HAPROXY_PUBLIC_PORT=18100 LEANPOOL_CACHE_MAX_BYTES=4294967296 LEANPOOL_CACHE_MAX_REQUEST_BYTES=262144
+  LEANPOOL_SUBNET=172.29.55.0/24
+)
+LEAN_NATIVE_LAUNCHER=/opt/lean-native/repl-native     # what an older installer's settings named as the worker
+# Set by old_instance: the instance's older names, and what of it runs.
+OLD_INSTANCE="" OLD_SERVER="" OLD_PROJECT="" OLD_NETWORK="" OLD_AGENT="" OLD_FRONT=""
+OLD_RAN=0 OLD_WITH_AGENT=0 OLD_WITH_FRONT=0
+
+# moved_settings FILE PAIRS... : FILE's lines, with each OLD key of PAIRS (OLD=NEW) renamed, or dropped where NEW
+# is empty. KIMINA_IMAGE_TAG becomes the whole image reference, under the site's prefix. No value is ever put
+# on a command line (the API key is one of them).
+moved_settings() {
+  local file=$1
+  shift
+  awk -v pairs="$*" -v prefix="$SITE_PREFIX" '
+    BEGIN {
+      n = split(pairs, list, " ")
+      for (i = 1; i <= n; i++) { at = index(list[i], "="); renamed[substr(list[i], 1, at - 1)] = substr(list[i], at + 1) }
+    }
+    /^[A-Za-z_][A-Za-z0-9_]*=/ {
+      key = substr($0, 1, index($0, "=") - 1)
+      if (key in renamed) {
+        if (renamed[key] == "") next
+        value = substr($0, length(key) + 2)
+        if (key == "KIMINA_IMAGE_TAG") value = prefix "/kimina:" value
+        print renamed[key] "=" value
+        next
+      }
+    }
+    { print }' "$file"
+}
+
+# with_defaults FILE PAIRS... : each KEY=VALUE of PAIRS whose KEY FILE does not set yet, added to FILE.
+with_defaults() {
+  local file=$1 pair
+  shift
+  for pair in "$@"; do
+    grep -q "^${pair%%=*}=" "$file" || echo "$pair" >> "$file"
+  done
+}
+
+container_exists() { docker inspect -f '{{.Id}}' "$1" >/dev/null 2>&1; }
+image_here() { docker image inspect -f '{{.Id}}' "$1" >/dev/null 2>&1; }
+
+# became_healthy CONTAINER : its health check passed within five minutes.
+became_healthy() {
+  local state
+  for _ in $(seq 1 60); do
+    state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$1" 2>/dev/null || true)
+    [ "$state" = healthy ] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+# old_instance DIR : an instance an older installer set up, into OLD_*: its names (its settings', else the ones
+# that installer gave), and what of it runs (OLD_RAN: its server; OLD_WITH_AGENT, OLD_WITH_FRONT). Where its
+# server is not there (taken down by hand), its agent and front are taken as its settings name them.
+old_instance() {
+  local env=$1/kimina.env
+  OLD_INSTANCE=${1##*/kimina}; OLD_INSTANCE=${OLD_INSTANCE#-}
+  OLD_SERVER=$(setting_in "$env" KIMINA_CONTAINER)
+  OLD_SERVER=${OLD_SERVER:-$SITE_PREFIX-kimina${OLD_INSTANCE:+-$OLD_INSTANCE}}
+  OLD_PROJECT=$(setting_in "$env" KIMINA_PROJECT); OLD_PROJECT=${OLD_PROJECT:-$OLD_SERVER}
+  OLD_NETWORK=$(setting_in "$env" KIMINA_NETWORK); OLD_NETWORK=${OLD_NETWORK:-$OLD_PROJECT}
+  OLD_AGENT=$(setting_in "$env" KIMINA_AGENT_CONTAINER)
+  OLD_FRONT=$(setting_in "$env" KIMINA_FRONT_CONTAINER)
+  OLD_RAN=0; OLD_WITH_AGENT=0; OLD_WITH_FRONT=0
+  if container_exists "$OLD_SERVER"; then OLD_RAN=1; fi
+  if [ -n "$OLD_FRONT" ] && { container_exists "$OLD_FRONT" || [ "$OLD_RAN" -eq 0 ]; }; then
+    OLD_WITH_FRONT=1; OLD_WITH_AGENT=1                 # a front always had its agent behind it
+  elif [ -n "$OLD_AGENT" ] && { container_exists "$OLD_AGENT" || [ "$OLD_RAN" -eq 0 ]; }; then
+    OLD_WITH_AGENT=1
+  fi
+}
+
+# old_compose ENV FILE PROJECT ARGS... : `docker compose` as an older installer ran one of its files, which read
+# the site's prefix and the server's names from the environment.
+old_compose() {
+  local env=$1 file=$2 project=$3
+  shift 3
+  SITE_PREFIX=$SITE_PREFIX KIMINA_CONTAINER=$OLD_SERVER KIMINA_NETWORK=$OLD_NETWORK \
+    docker compose --project-name "$project" --env-file "$env" -f "$file" "$@"
+}
+
+# old_instance_down DIR : an instance's older projects down: the front (and the agent behind it), the agent,
+# then the server, whose network goes with it.
+old_instance_down() {
+  local dir=$1 env=$1/kimina.env
+  if [ -n "$OLD_FRONT" ] && [ -f "$dir/docker-compose.front.yml" ]; then
+    old_compose "$env" "$dir/docker-compose.front.yml" "$OLD_FRONT" down || return 1
+  fi
+  if [ -n "$OLD_AGENT" ] && [ -f "$dir/docker-compose.agent.yml" ]; then
+    old_compose "$env" "$dir/docker-compose.agent.yml" "$OLD_AGENT" down || return 1
+  fi
+  old_compose "$env" "$dir/docker-compose.yml" "$OLD_PROJECT" down
+}
+
+# old_instance_up DIR : what of the instance ran, back under its older projects: the server, then its front
+# (which brings the agent behind it) or its agent.
+old_instance_up() {
+  local dir=$1 env=$1/kimina.env
+  old_compose "$env" "$dir/docker-compose.yml" "$OLD_PROJECT" up -d || return 1
+  if [ "$OLD_WITH_FRONT" -eq 1 ]; then
+    old_compose "$env" "$dir/docker-compose.front.yml" "$OLD_FRONT" up -d
+  elif [ "$OLD_WITH_AGENT" -eq 1 ]; then
+    old_compose "$env" "$dir/docker-compose.agent.yml" "$OLD_AGENT" up -d
+  fi
+}
+
+# can_move_instance DIR : what moving the instance needs is there: its settings, its images, its older files.
+can_move_instance() {
+  local dir=$1 env=$1/kimina.env key image
+  old_instance "$dir"
+  for key in KIMINA_API_KEY KIMINA_IMAGE_TAG; do
+    [ -n "$(setting_in "$env" "$key")" ] || die "$env has no $key, so it cannot be moved to Compose's names. Nothing was changed."
+  done
+  [ -f "$dir/docker-compose.yml" ] || die "$dir/docker-compose.yml is missing, so the server cannot be taken down under its older name. Nothing was changed."
+  image=$SITE_PREFIX/kimina:$(setting_in "$env" KIMINA_IMAGE_TAG)
+  image_here "$image" || die "$image (the server's image) is not on this box. Nothing was changed."
+  [ "$OLD_WITH_AGENT" -eq 0 ] && return 0
+  for key in KIMINA_AGENT_IMAGE KIMINA_AGENT_PORT; do
+    [ -n "$(setting_in "$env" "$key")" ] || die "$env has no $key, so its usage agent cannot be moved. Nothing was changed."
+  done
+  image_here "$(setting_in "$env" KIMINA_AGENT_IMAGE)" \
+    || die "$(setting_in "$env" KIMINA_AGENT_IMAGE) (the usage agent's image) is not on this box. Nothing was changed."
+  [ "$OLD_WITH_FRONT" -eq 0 ] && return 0
+  for key in KIMINA_FRONT_IMAGE KIMINA_SERVER_NAME KIMINA_FRONT_ADDRESS; do
+    [ -n "$(setting_in "$env" "$key")" ] || die "$env has no $key, so its TLS front cannot be moved. Nothing was changed."
+  done
+  [ -f "$dir/docker-compose.front.yml" ] && [ -s "$dir/tls/box.pem" ] \
+    || die "$dir has no docker-compose.front.yml or no tls/box.pem, so its TLS front cannot be moved. Nothing was changed."
+  image_here "$(setting_in "$env" KIMINA_FRONT_IMAGE)" \
+    || die "$(setting_in "$env" KIMINA_FRONT_IMAGE) (the TLS front's image) is not on this box. Nothing was changed."
+}
+
+# move_instance DIR : one instance, from an older installer's names and files to today's; as it was if it
+# does not come up (move_instance_back).
+move_instance() {
+  local dir=$1 env=$1/kimina.env next=$1/kimina.env.next instance project files=compose.yaml file
+  old_instance "$dir"
+  instance=$OLD_INSTANCE
+  project=$(lean_server_project "$instance")
+  [ "$OLD_WITH_AGENT" -eq 0 ] || files+=:compose.agent.yaml
+  [ "$OLD_WITH_FRONT" -eq 0 ] || files+=:compose.tls.yaml
+  [ "$(setting_in "$env" KIMINA_REPL_PATH)" != "$LEAN_NATIVE_LAUNCHER" ] || files+=:$LEAN_NATIVE_OVERLAY
+  say "Moving ${instance:-instance 1} to Compose's names: the compose project $project ($files)"
+  ( umask 077; moved_settings "$env" "${MOVED_INSTANCE_SETTINGS[@]}" > "$next" )
+  with_defaults "$next" "${MOVED_INSTANCE_DEFAULTS[@]}"
+  printf 'COMPOSE_PROJECT_NAME=%s\nCOMPOSE_FILE=%s\n' "$project" "$files" >> "$next"
+  chown root:root "$next"; chmod 0600 "$next"
+  # The front's config for the services' names, judged by HAProxy before any container changes.
+  if [ "$OLD_WITH_FRONT" -eq 1 ]; then
+    render_tls_front "$dir" "$(setting_in "$env" KIMINA_AGENT_IMAGE)" "$(setting_in "$env" KIMINA_FRONT_IMAGE)" \
+      "$(setting_in "$env" KIMINA_FRONT_LEAN_TIMEOUT)" "$(setting_in "$env" KIMINA_FRONT_SERVER_WAIT)" \
+      "$dir/front/haproxy.cfg.next"
+  fi
+  cp -p "$env" "$env.$MOVED"
+  [ ! -f "$dir/front/haproxy.cfg" ] || cp -p "$dir/front/haproxy.cfg" "$dir/front/haproxy.cfg.$MOVED"
+  install_compose_files "$dir" server
+  old_instance_down "$dir" || move_instance_back "$dir" "its older projects did not all come down"
+  mv -f "$next" "$env"
+  [ "$OLD_WITH_FRONT" -eq 0 ] || mv -f "$dir/front/haproxy.cfg.next" "$dir/front/haproxy.cfg"
+  for file in docker-compose.yml docker-compose.agent.yml docker-compose.front.yml; do
+    [ ! -f "$dir/$file" ] || mv -f "$dir/$file" "$dir/$file.$MOVED"
+  done
+  if [ "$OLD_RAN" -eq 0 ]; then
+    echo "moved ${instance:-instance 1}: its server was not running, and nothing was started"
+    return 0
+  fi
+  compose_in "$env" up -d || move_instance_back "$dir" "its project did not start"
+  became_healthy "$project-kimina-1" || move_instance_back "$dir" "its Lean server did not become healthy in 5 minutes"
+  if [ "$OLD_WITH_FRONT" -eq 1 ] && ! container_is_steady "$project-front-1"; then
+    move_instance_back "$dir" "its TLS front does not stay up"
+  fi
+  # shellcheck disable=SC2086  # no prefix for instance 1
+  /usr/local/bin/kimina-ctl ${instance:+@$instance} check || move_instance_back "$dir" "its check failed"
+  echo "moved ${instance:-instance 1}: $project runs, and its check passed"
+}
+
+# move_instance_back DIR REASON : the instance as it was before its move began: the new project down, the older
+# files back, the older projects up. Then the installer stops with REASON.
+move_instance_back() {
+  local dir=$1 env=$1/kimina.env file
+  if [ -n "$(setting_in "$env" COMPOSE_PROJECT_NAME)" ]; then compose_in "$env" down || true; fi
+  [ ! -f "$env.$MOVED" ] || mv -f "$env.$MOVED" "$env"
+  for file in docker-compose.yml docker-compose.agent.yml docker-compose.front.yml front/haproxy.cfg; do
+    [ ! -f "$dir/$file.$MOVED" ] || mv -f "$dir/$file.$MOVED" "$dir/$file"
+  done
+  rm -f "$env.next" "$dir/front/haproxy.cfg.next"
+  for file in "${LEAN_SERVER_COMPOSE_FILES[@]}"; do rm -f "$dir/$file"; done
+  if [ "$OLD_RAN" -eq 1 ]; then
+    old_instance_up "$dir" || warn "its older projects did not all start again: docker compose's words are above"
+  fi
+  die "could not move ${OLD_INSTANCE:-instance 1} to Compose's names: $2. It is back under its older names and files, as it was; fix what the lines above say, then run this again"
+}
+
+# can_move_pool DIR : what moving the pool needs is there: its settings, its images, its older file.
+can_move_pool() {
+  local dir=$1 env=$1/pool.env key
+  for key in POOL_IMAGE POOL_HAPROXY_IMAGE POOL_PIN POOL_DNS POOL_CACHE_UPSTREAM_TIMEOUT; do
+    [ -n "$(setting_in "$env" "$key")" ] || die "$env has no $key, so it cannot be moved to Compose's names. Nothing was changed."
+  done
+  [ -f "$dir/docker-compose.pool.yml" ] \
+    || die "$dir/docker-compose.pool.yml is missing, so the pool cannot be taken down under its older name. Nothing was changed."
+  # deploy/pool always runs TLS: a pool set up before TLS has no certificates to run it with.
+  [ -s "$dir/tls/front.pem" ] && [ -s "$dir/tls/proxy-client.pem" ] && [ -s "$dir/tls/ca.crt" ] \
+    || die "$dir has no certificates (the pool was set up before TLS), and only a pool with TLS can be moved. Nothing was changed."
+  for key in POOL_IMAGE POOL_HAPROXY_IMAGE; do
+    image_here "$(setting_in "$env" "$key")" || die "$(setting_in "$env" "$key") is not on this box. Nothing was changed."
+  done
+}
+
+# move_pool DIR : one pool, from an older installer's names and files to today's, its cache's data
+# copied into the new project's volume while nothing runs; as it was if it does not come up (move_pool_back).
+move_pool() {
+  local dir=$1 env=$1/pool.env next=$1/pool.env.next pool project old_project old_volume new_volume image ran=0
+  local checked=0
+  pool=${dir##*/lean-pool-}
+  project=lean-pool-$pool
+  old_project=$SITE_PREFIX-pool-$pool
+  old_volume=$SITE_PREFIX-cache-$pool
+  new_volume=${project}_cache-data
+  image=$(setting_in "$env" POOL_IMAGE)
+  if container_exists "$SITE_PREFIX-proxy-$pool"; then ran=1; fi
+  say "Moving pool $pool to Compose's names: the compose project $project, its cache's data into $new_volume"
+  ( umask 077; moved_settings "$env" "${MOVED_POOL_SETTINGS[@]}" > "$next" )
+  with_defaults "$next" "${MOVED_POOL_DEFAULTS[@]}"
+  printf 'COMPOSE_PROJECT_NAME=%s\nCOMPOSE_FILE=%s\n' "$project" "$(IFS=:; echo "${LEAN_POOL_COMPOSE_FILES[*]}")" >> "$next"
+  chown root:root "$next"; chmod 0600 "$next"
+  cp -p "$env" "$env.$MOVED"
+  install_compose_files "$dir" pool
+  old_compose "$env" "$dir/docker-compose.pool.yml" "$old_project" down || move_pool_back "$dir" "its older project did not come down"
+  mv -f "$next" "$env"
+  mv -f "$dir/docker-compose.pool.yml" "$dir/docker-compose.pool.yml.$MOVED"
+  # Made, not started: the new volume is there, and empty, while nothing runs.
+  compose_in "$env" up --no-start || move_pool_back "$dir" "its project could not be made"
+  if docker volume inspect "$old_volume" >/dev/null 2>&1; then
+    docker run --rm --network none --user 0:0 -v "$old_volume":/from:ro -v "$new_volume":/to \
+        --entrypoint cp "$image" -a /from/. /to/ \
+      || move_pool_back "$dir" "the cache's data could not be copied from $old_volume into $new_volume"
+  fi
+  if [ "$ran" -eq 0 ]; then
+    compose_in "$env" down || true
+    echo "moved pool $pool: it was not running, so nothing was started or checked; its cache's data is in $new_volume, and $old_volume is kept as it was: remove it once the pool has run (docker volume rm $old_volume)"
+    return 0
+  fi
+  compose_in "$env" up -d || move_pool_back "$dir" "its project did not start"
+  container_is_steady "$project-haproxy-1" || move_pool_back "$dir" "its proxy does not stay up"
+  # Five minutes, as the pool's installer allows: a Lean server behind it may just have started again.
+  for _ in $(seq 1 30); do
+    if /usr/local/sbin/lean-pool-ctl "$pool" check; then checked=1; break; fi
+    sleep 10
+  done
+  [ "$checked" -eq 1 ] || move_pool_back "$dir" "its check through the pool failed"
+  docker volume rm "$old_volume" >/dev/null 2>&1 \
+    || warn "could not remove $old_volume, which nothing reads any more: docker volume rm $old_volume"
+  echo "moved pool $pool: $project runs with its cache's data, and its check passed"
+}
+
+# move_pool_back DIR REASON : the pool as it was before its move began: the new project down and its volume
+# removed, the older files back, the older project up (its volume was never changed). Then the installer stops.
+move_pool_back() {
+  local dir=$1 env=$1/pool.env pool file
+  pool=${dir##*/lean-pool-}
+  if [ -n "$(setting_in "$env" COMPOSE_PROJECT_NAME)" ]; then
+    compose_in "$env" down || true
+    docker volume rm "lean-pool-${pool}_cache-data" >/dev/null 2>&1 || true
+  fi
+  [ ! -f "$env.$MOVED" ] || mv -f "$env.$MOVED" "$env"
+  [ ! -f "$dir/docker-compose.pool.yml.$MOVED" ] || mv -f "$dir/docker-compose.pool.yml.$MOVED" "$dir/docker-compose.pool.yml"
+  rm -f "$env.next"
+  for file in "${LEAN_POOL_COMPOSE_FILES[@]}"; do rm -f "$dir/$file"; done
+  old_compose "$env" "$dir/docker-compose.pool.yml" "$SITE_PREFIX-pool-$pool" up -d \
+    || warn "its older project did not start again: docker compose's words are above"
+  die "could not move pool $pool to Compose's names: $2. It is back under its older names and files, with its cache, as it was; fix what the lines above say, then run this again"
+}
+
+# move_to_compose_names : every instance and every pool of this box that an older installer set up, moved (see
+# above). Asked once at the end of each installer's pre-flight; a box that has moved passes straight through.
+move_to_compose_names() {
+  local dir instances=() pools=()
+  for dir in /srv/kimina /srv/kimina-*; do
+    if [ -f "$dir/kimina.env" ] && [ -z "$(setting_in "$dir/kimina.env" COMPOSE_PROJECT_NAME)" ]; then instances+=("$dir"); fi
+  done
+  for dir in /srv/lean-pool-*; do
+    if [ -f "$dir/pool.env" ] && [ -z "$(setting_in "$dir/pool.env" COMPOSE_PROJECT_NAME)" ]; then pools+=("$dir"); fi
+  done
+  [ "${#instances[@]}" -gt 0 ] || [ "${#pools[@]}" -gt 0 ] || return 0
+  say "This box runs under an older installer's names: moving all of it to the lean-pool project's compose files and names first"
+  # Nothing changes unless every one of them can move.
+  compose_source server >/dev/null
+  [ "${#pools[@]}" -eq 0 ] || compose_source pool >/dev/null
+  for dir in ${instances[@]+"${instances[@]}"}; do can_move_instance "$dir"; done
+  for dir in ${pools[@]+"${pools[@]}"}; do can_move_pool "$dir"; done
+  [ -f "$SRC/kimina-ctl" ] || die "missing $SRC/kimina-ctl - run this from the repo checkout"
+  [ "${#pools[@]}" -eq 0 ] || [ -f "$SRC/lean-pool-ctl" ] || die "missing $SRC/lean-pool-ctl - run this from the repo checkout"
+  # The control programs that read the new names: they refuse an instance or a pool that has not moved. And the
+  # site's names, which lean-pool-ctl reads in a pool's check: a box can be older than the file.
+  install -o root -g root -m 0755 "$SRC/kimina-ctl" /usr/local/bin/kimina-ctl
+  [ "${#pools[@]}" -eq 0 ] || install -o root -g root -m 0755 "$SRC/lean-pool-ctl" /usr/local/sbin/lean-pool-ctl
+  install_site_env
+  for dir in ${instances[@]+"${instances[@]}"}; do move_instance "$dir"; done
+  for dir in ${pools[@]+"${pools[@]}"}; do move_pool "$dir"; done
+  echo "MOVED TO COMPOSE'S NAMES: what each move replaced is kept beside it, ending in .$MOVED"
 }

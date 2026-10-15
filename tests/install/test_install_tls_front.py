@@ -425,14 +425,18 @@ def test_the_fronts_config_is_judged_by_haproxy_itself_before_any_container_chan
     root-only, so it is given the installed config's modes before HAProxy's own user reads it, with the
     certificate directory mounted where the config names it. Only after that do containers change."""
     body = front_function()
-    validate = body.index("haproxy -c -f /cfg/haproxy.cfg")
-    assert body.index('chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"') < validate
-    assert '-v "$work":/cfg:ro -v "$dir/tls":"$LEAN_POOL_TLS_MOUNT":ro' in body
+    install = body[: body.index("render_tls_front() {")]
+    render = body[body.index("render_tls_front() {") :]
+    validate = render.index("haproxy -c -f /cfg/haproxy.cfg")
+    assert render.index('chmod 0755 "$work"; chmod 0644 "$work/haproxy.cfg"') < validate
+    assert '-v "$work":/cfg:ro -v "$dir/tls":"$LEAN_POOL_TLS_MOUNT":ro' in render
+    assert validate < render.index('install -o root -g root -m 0644 "$work/haproxy.cfg" "$out"')
+    rendered = install.index("render_tls_front ")
     for change in ("set_overlay", "systemctl restart", 'compose_in "$env" up -d'):
-        assert validate < body.index(change), change
+        assert rendered < install.index(change), change
     # The front is rendered with the POOL's durations, so it never cuts a check the pool still waits for.
-    assert '--lean-timeout "$lean_timeout" --server-wait "$server_wait"' in body
-    assert '--proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME"' in body
+    assert '--lean-timeout "$lean_timeout" --server-wait "$server_wait"' in render
+    assert '--proxy-client-name "$LEAN_POOL_PROXY_CLIENT_NAME"' in render
 
 
 def test_the_firewall_knows_the_front_before_the_one_start_and_nothing_is_forced_to_restart():

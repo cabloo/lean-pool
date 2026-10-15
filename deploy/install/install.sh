@@ -11,6 +11,9 @@
 # What it does, in order (each step is safe to repeat):
 #   1. pre-flight: docker present, disk space, port free, CPU microcode reported; a missing docker compose
 #      plugin is installed at its end (package manager, else a pinned release binary)
+#   1b. a box an older installer set up is first moved, all of it, to the compose files of deploy/ under
+#      Compose's names, each setting under its new name (pool-lib.sh's move_to_compose_names); the files
+#      each instance and pool held are kept beside them as *.before-compose-names
 #   2. copies the build + compose files into /srv/kimina (/srv/kimina-NAME for an instance; root-owned);
 #      writes kimina.env (0600) with a generated API key - an existing key and existing settings are KEPT
 #      (the port and the image tag are written on every run; the instance's workers, worker memory, CPUs
@@ -39,7 +42,7 @@
 # `--tls-dir` turns that on (a join script passes it); once on, a re-run keeps it. Instance 1 is never
 # fronted: it stays plain HTTP.
 #
-# It does NOT touch any other container.
+# Apart from step 1b's one-time move, it does NOT touch any other container.
 set -euo pipefail
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -332,8 +335,14 @@ other_instances_remain() {   # any OTHER installed instance still has a kimina.e
 # ------------------------------------------------------------------------------------------- uninstall
 if [ "$UNINSTALL" -eq 1 ]; then
   say "Uninstalling ${INSTANCE:-instance 1}"
-  # The instance's one project: the server, and beside a named instance its usage agent and TLS front.
-  if [ -f "$DIR/kimina.env" ] && [ -n "$(setting_in "$DIR/kimina.env" COMPOSE_PROJECT_NAME)" ]; then compose down || true; fi
+  # The instance's one project: the server, and beside a named instance its usage agent and TLS front. On a
+  # box an older installer set up, its older projects.
+  if [ -f "$DIR/kimina.env" ] && [ -n "$(setting_in "$DIR/kimina.env" COMPOSE_PROJECT_NAME)" ]; then
+    compose down || true
+  elif [ -f "$DIR/kimina.env" ]; then
+    old_instance "$DIR"
+    old_instance_down "$DIR" || true
+  fi
   if declare -F remove_lan_firewall >/dev/null; then remove_lan_firewall "agent${INSTANCE:+-$INSTANCE}"; fi
   if [ -x /usr/local/sbin/kimina-firewall ]; then /usr/local/sbin/kimina-firewall remove $INSTANCE || true; fi
   systemctl disable --now "$FW_UNIT" 2>/dev/null || true
@@ -554,15 +563,19 @@ echo "memory: $(free -g | awk '/^Mem:/ {print $2" GB total, "$7" GB available"}'
 echo "cpu microcode: $(grep -m1 microcode /proc/cpuinfo | awk '{print $3}')"
 
 # The port may be held by this instance's own server, or by its TLS front; by anything else it is taken.
+# On a box an older installer set up, they run under their older names until the move below.
 # (Asked of Docker for one container: a listing piped into `grep -q` can fail under pipefail.)
 runs() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = true ]; }
-if ! runs "$CONTAINER" && ! runs "$FRONT_CONTAINER"; then
+if [ -f "$DIR/kimina.env" ] && [ -z "$(setting_in "$DIR/kimina.env" COMPOSE_PROJECT_NAME)" ]; then old_instance "$DIR"; fi
+if ! runs "$CONTAINER" && ! runs "$FRONT_CONTAINER" && ! runs "${OLD_SERVER:-$CONTAINER}" \
+   && ! runs "${OLD_FRONT:-$FRONT_CONTAINER}"; then
   if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
     die "port $PORT is already in use; pass --port N"
   fi
 fi
 # The usage port likewise: held by this instance's own agent or front, or free.
-if [ "$AGENT" -eq 1 ] && ! runs "$AGENT_CONTAINER" && ! runs "$FRONT_CONTAINER"; then
+if [ "$AGENT" -eq 1 ] && ! runs "$AGENT_CONTAINER" && ! runs "$FRONT_CONTAINER" \
+   && ! runs "${OLD_AGENT:-$AGENT_CONTAINER}" && ! runs "${OLD_FRONT:-$FRONT_CONTAINER}"; then
   if ss -ltnH "sport = :$AGENT_PORT" 2>/dev/null | grep -q .; then
     die "port $AGENT_PORT (the usage agent's: the Lean port + 200) is already in use; pass --port N to move both"
   fi
@@ -575,7 +588,8 @@ if [ -f "$DIR/kimina.env" ]; then
   wanted_net=${wanted_net:-$DEFAULT_NET}
 fi
 if { ip -4 route show 2>/dev/null || true; } | awk '{print $1}' | grep -qx "$wanted_net" \
-   && ! docker network inspect "${PROJECT}_default" >/dev/null 2>&1; then
+   && ! docker network inspect "${PROJECT}_default" >/dev/null 2>&1 \
+   && ! docker network inspect "${OLD_NETWORK:-${PROJECT}_default}" >/dev/null 2>&1; then
   die "the host already routes $wanted_net, which this server's own network would use; put LEAN_SERVER_SUBNET=<a free /24> in $DIR/kimina.env (make the file if it is not there), then run this again"
 fi
 
@@ -624,6 +638,9 @@ if [ "$COMPOSE_MISSING" -eq 1 ]; then
   ensure_compose_plugin \
     || die "the docker compose plugin is not installed and could not be added: $COMPOSE_PLUGIN_FAILURE. Nothing else was installed."
 fi
+# A box an older installer set up moves to Compose's names now, all of it (pool-lib.sh), before this run
+# changes anything else. A box that has moved passes straight through.
+move_to_compose_names
 
 # ------------------------------------------------------------------------------- files and settings
 say "Installing files into $DIR"
@@ -786,13 +803,7 @@ fi
 
 # -------------------------------------------------------------------------------------------- verify
 say "Waiting for the server to become healthy"
-healthy=0
-for _ in $(seq 1 60); do
-  state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)
-  [ "$state" = healthy ] && { healthy=1; break; }
-  sleep 5
-done
-[ "$healthy" -eq 1 ] || { compose logs --tail 40 >&2 || true; die "the server did not become healthy in 5 minutes"; }
+became_healthy "$CONTAINER" || { compose logs --tail 40 >&2 || true; die "the server did not become healthy in 5 minutes"; }
 
 say "Verifying: one valid and one invalid proof through the live server (the first check imports Mathlib)"
 verdict="INSTALLED AND VERIFIED"

@@ -359,9 +359,12 @@ def test_the_pools_verify_loop_gives_the_lean_server_five_minutes():
         ) :
     ]
     assert "for _ in $(seq 1 30); do" in verify and "sleep 10" in verify and "seq 1 12" not in text
-    assert (
-        "for _ in $(seq 1 60); do" in (INSTALLERS / "install.sh").read_text()
-    )  # install.sh: 60 x 5 s for the same server
+    # install.sh: 60 x 5 s for the same server, in pool-lib.sh's became_healthy
+    assert 'became_healthy "$CONTAINER"' in (INSTALLERS / "install.sh").read_text()
+    library = (INSTALLERS / "pool-lib.sh").read_text()
+    start = library.index("became_healthy() {")
+    waits = library[start : library.index("\n}\n", start)]
+    assert "for _ in $(seq 1 60); do" in waits and "sleep 5" in waits
 
 
 def test_text_from_a_join_request_is_made_printable_before_it_is_shown_or_sent():

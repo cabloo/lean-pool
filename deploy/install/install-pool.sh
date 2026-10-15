@@ -7,11 +7,14 @@
 #
 # ALL of the pool's traffic is TLS, with the pool's own certificate authority: clients reach the
 # front door over HTTPS, the proxy reaches every Lean server over mutual TLS, and a new server joins over
-# HTTPS with a pinned key. Running this on a pool that was installed plain moves it to TLS.
+# HTTPS with a pinned key.
 #
 # What it does, in order (each step is safe to repeat; a re-run keeps the authority and every certificate):
 #   1. pre-flight: docker, the instance, the LAN subnet and resolver; pulls the pinned HAProxy image and
 #      stops, with nothing of the pool changed, if it was built without its Prometheus exporter
+#   1b. a box an older installer set up is first moved, all of it, to the compose files of deploy/ under
+#      Compose's names, each setting under its new name (pool-lib.sh's move_to_compose_names); the files
+#      each instance and pool held are kept beside them as *.before-compose-names
 #   2. builds the lean-pool image (cache, usage agent, join service, tools)
 #   3. /srv/lean-pool-NAME (root-owned): the compose files, pool.env, the pool key (readable by root and the pool
 #      image's group), the server list (this box's server first), the admission cases, the join bundle, and
@@ -26,8 +29,8 @@
 #   8. firewall: the pool port and the join port (18110) from the LAN subnet and the docker bridges only
 #   9. verifies: a valid and an invalid proof THROUGH the pool, over HTTPS
 #
-# It never touches instance 1 (/srv/kimina, the instance with no name): not its container, its settings, its
-# compose file or its firewall rules.
+# Apart from step 1b's one-time move, it never touches instance 1 (/srv/kimina, the instance with no name): not
+# its container, its settings, its compose files or its firewall rules.
 set -euo pipefail
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -89,11 +92,17 @@ compose() { compose_in "$DIR/pool.env" "$@"; }
 if [ "$UNINSTALL" -eq 1 ]; then
   say "Uninstalling the $POOL pool's front door (the Lean servers stay)"
   docker rm -f -v "$PROJECT-join" >/dev/null 2>&1 || true
-  if [ -f "$DIR/pool.env" ] && [ -n "$(setting_in "$DIR/pool.env" COMPOSE_PROJECT_NAME)" ]; then compose down || true; fi
+  if [ -f "$DIR/pool.env" ] && [ -n "$(setting_in "$DIR/pool.env" COMPOSE_PROJECT_NAME)" ]; then
+    compose down || true
+  elif [ -f "$DIR/pool.env" ]; then           # a pool an older installer set up, under its older names
+    docker rm -f -v "$SITE_PREFIX-join-$POOL" >/dev/null 2>&1 || true
+    old_compose "$DIR/pool.env" "$DIR/docker-compose.pool.yml" "$SITE_PREFIX-pool-$POOL" down || true
+  fi
   remove_lan_firewall "proxy-$POOL"
   remove_lan_firewall "join-$POOL"
   if [ "$PURGE" -eq 1 ]; then
     docker volume rm "${PROJECT}_cache-data" 2>/dev/null || true
+    docker volume rm "$SITE_PREFIX-cache-$POOL" 2>/dev/null || true     # an older installer's
     rm -rf "$DIR"
     echo "removed $DIR (the pool's certificate authority with it: every certificate it signed is void) and the cache volume"
   else
@@ -119,13 +128,16 @@ compose_source server >/dev/null
 [ -n "$ADMIT_CASES" ] || die "--admit-cases DIR is needed: the cases a server must verify and reject before it may join pool '$POOL'"
 [ -d "$ADMIT_CASES" ] && [ -n "$(ls -A "$ADMIT_CASES" 2>/dev/null)" ] || die "--admit-cases: $ADMIT_CASES is not a directory of cases"
 instance_setting() { setting_in "$INSTANCE_DIR/kimina.env" "$1"; }
-INSTANCE_PORT=$(instance_setting LEAN_SERVER_PUBLISHED_PORT)
-INSTANCE_WORKERS=$(instance_setting LEAN_SERVER_MAX_REPLS)
-INSTANCE_WAIT=$(instance_setting LEAN_SERVER_MAX_WAIT)
+# Under their older names on a box an older installer set up, which moves at the end of this pre-flight.
+before_move() { setting_moved_in "$INSTANCE_DIR/kimina.env" "$1" "$2"; }
+INSTANCE_PORT=$(before_move LEAN_SERVER_PUBLISHED_PORT KIMINA_PORT)
+INSTANCE_WORKERS=$(before_move LEAN_SERVER_MAX_REPLS KIMINA_MAX_REPLS)
+INSTANCE_WAIT=$(before_move LEAN_SERVER_MAX_WAIT KIMINA_MAX_WAIT)
 LEAN_IMAGE=$(instance_setting LEAN_SERVER_IMAGE)
+[ -n "$LEAN_IMAGE" ] || LEAN_IMAGE=$SITE_PREFIX/kimina:$(instance_setting KIMINA_IMAGE_TAG)
 # The cache's pin names the servers' Lean and Mathlib: the tag of the server's image, as it always was.
 PIN=${LEAN_IMAGE##*:}
-[ -n "$INSTANCE_PORT" ] && [ -n "$INSTANCE_WORKERS" ] && [ -n "$LEAN_IMAGE" ] && [ "$PIN" != "$LEAN_IMAGE" ] \
+[ -n "$INSTANCE_PORT" ] && [ -n "$INSTANCE_WORKERS" ] && [ -n "$PIN" ] && [ "$PIN" != "$LEAN_IMAGE" ] \
   || die "$INSTANCE_DIR/kimina.env is incomplete"
 AGENT_PORT=$((INSTANCE_PORT + 200))
 SERVER_WAIT=${INSTANCE_WAIT:-120}
@@ -160,6 +172,9 @@ haproxy_has_exporter "$HAPROXY_IMAGE" || die "$(exporter_missing "$HAPROXY_IMAGE
 # A missing compose plugin is added, not reported: here, once every other check has passed.
 ensure_compose_plugin \
   || die "the docker compose plugin is not installed and could not be added: $COMPOSE_PLUGIN_FAILURE. Nothing else was installed."
+# A box an older installer set up moves to Compose's names now, all of it (pool-lib.sh), before this run
+# changes anything else. A box that has moved passes straight through.
+move_to_compose_names
 
 # --------------------------------------------------------------------------------------------- images
 build_lean_pool_image
