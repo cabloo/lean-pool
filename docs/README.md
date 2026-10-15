@@ -5,9 +5,9 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 
 **Setting up and running**
 
-* [Deploying a pool](deployment.md): from nothing to a running pool, and how to operate it.
+* [Deploying a pool](deployment.md): the installers, from nothing to a running pool, and how to operate it.
 * [TLS](tls.md): the pool's own certificate authority; what is encrypted and who holds which key.
-* [Joining over the network](joining.md): letting a new box request its certificate over HTTPS.
+* [Joining over the network](joining.md): what happens when a new box joins, and the rules the join service keeps.
 * [Admission](admission.md): testing a Lean server alone before it joins.
 * [Compiled search for linarith](compiled-search.md): an optional step on each Lean server
   box that makes Lean itself faster on the proofs that take it longest.

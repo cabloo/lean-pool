@@ -14,8 +14,13 @@ of Lean time instead of 608 s, and no verdict changed.
 
 ## Turning it on
 
-On the Lean server box, in the clone, once the box runs (step 2 of
-[deploying a pool](deployment.md#2-on-each-lean-server-box-kimina-and-the-usage-agent)):
+A named instance the [installers](deployment.md) set up has it already: the installer runs
+`make.sh` for the instance's image, and starts the workers through the library where its check
+passed. `sudo kimina-ctl @NAME compiled-search off` turns it off and `on` turns it back on; each
+makes the Lean server again and nothing else.
+
+On a box that runs the compose files of [`deploy/lean-server`](../deploy/lean-server) without the
+installers, in the clone, once the box runs:
 
 ```sh
 cd deploy/lean-server

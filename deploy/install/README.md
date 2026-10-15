@@ -1,76 +1,32 @@
 # Installers
 
 Scripts that install a whole pool on Linux hosts with Docker: the Lean servers, the pool's front
-door, and new boxes joining it. A deployment keeps its own values in a site directory and passes
-it with `--site`. The other files in [`deploy/`](../README.md) are a manual walk-through of the same
-pieces.
+door, and new boxes joining it, TLS throughout. They run the compose files of
+[`deploy/`](../README.md) exactly as they are there. A deployment keeps its own values in a site
+directory and passes it with `--site`. [Deploying a pool](../../docs/deployment.md) walks through
+them.
 
 | File | What it is |
 |---|---|
 | [`install.sh`](install.sh) | Installs one Kimina Lean Server on this host: the image, the container, its firewall rules and the operator's door. With `--proxy NAME`, it runs the pool installer. |
-| [`install-pool.sh`](install-pool.sh) | Installs the pool's front door (HAProxy and the cache) in front of instance NAME, which is TLS throughout. |
+| [`install-pool.sh`](install-pool.sh) | Installs the pool's front door (HAProxy and the cache) in front of instance NAME. |
 | [`kimina-ctl`](kimina-ctl) | The operator's commands for the Lean servers on a host, installed to `/usr/local/bin`. |
 | [`lean-pool-ctl`](lean-pool-ctl) | The operator's commands for a pool (servers, admission, join windows), installed to `/usr/local/sbin`. |
 | [`join-box.sh`](join-box.sh) | The body of the join script that `lean-pool-ctl NAME join-open` serves to a new box. |
+| [`join_helper.py`](join_helper.py) | Every decision of a join, as pure functions, for both sides of it. |
 | [`kimina-firewall`](kimina-firewall) | The firewall rules of one Lean server, re-applied at boot by a systemd unit. |
-| [`pool-lib.sh`](pool-lib.sh) | What the scripts above share. |
-| `docker-compose*.yml` | The compose files the installers copy into `/srv`. |
-| [`site.example/`](site.example) | An example site: copy it and change its values. |
+| [`pool-lib.sh`](pool-lib.sh) | What the scripts above share, among it the move of a box an older version set up. |
+| [`site.example/`](site.example/site.env) | An example site: copy it and change its values. Its two files document every key. |
 
-Each script describes what it does, in order, at its top, and `bash install.sh --help` lists every option.
+Each script describes what it does, in order, at its top, and `bash install.sh --help` lists every
+option. Every step is safe to run again.
 
-## The site directory
-
-The installers take their values from a site directory, never from the scripts:
-
-```
-site/
-  site.env              SITE_PREFIX, SITE_LABEL, SITE_DOOR_KEY_MARKER, SITE_LAN_DOMAIN
-  instances/
-    default.env         instance 1, the instance with no name (optional)
-    NAME.env            a named instance: install.sh --instance NAME (1-16 lower-case
-                        letters and digits; not `default` or `main`)
-  Dockerfile ...        the image recipes the instance files name, if any
-```
-
-[`site.example/site.env`](site.example/site.env) and
-[`site.example/instances/upstream.env`](site.example/instances/upstream.env) document every
-key. The installers read these files and never run them, and `install.sh` checks every value
-for its shape before it installs anything.
-
-An instance's workers, worker memory, CPUs and subnet only fill in settings that its
-`kimina.env` does not have yet. After the first install, change them there (or with
-`kimina-ctl set-repls N` and `set-cpus N`). Its port and image tag are written on every run.
-
-An instance's image comes from one of two places:
-
-- **Pulled.** `INSTANCE_IMAGE=projectnumina/kimina-lean-server:2.0.0` names an image to pull. A
-  reference with a digest pins it exactly. The installer pulls it and tags it as
-  `<SITE_PREFIX>/kimina:<INSTANCE_IMAGE_TAG>`. A later run does not pull it again while the
-  reference and the tag are unchanged and the image is still under that tag.
-- **Built.** `INSTANCE_DOCKERFILE` and `INSTANCE_BUILD_FILES` name a recipe in the site
-  directory, and the installer builds it. For a named instance, a re-run builds again only when
-  one of those files, the tag or `--build-jobs` changed, or the image under the tag is gone.
-  Instance 1 calls `docker build` on every run, and Docker's cache makes an unchanged build
-  quick.
-
-An instance file names one or the other, never both.
-
-## Installing a pool
-
-On the pool's host, as root:
-
-```
-sudo bash install.sh --site ~/my-site --instance upstream
-sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases
-sudo lean-pool-ctl upstream join-open
-```
-
-1. The first command installs the Lean server.
-2. The second installs the pool in front of it. A server joins only after it passes the admission cases ([admission](../../docs/admission.md)); the pool host's own server is listed without them. Every install of the pool needs `--admit-cases DIR` (an uninstall does not), and it replaces the pool's copy of the cases.
-3. The third lets one new box join. It prints a `curl ... | sudo bash` command to run on that box. The box then downloads the image from the pool, or else builds it (or pulls it, for an instance that names an `INSTANCE_IMAGE`), and installs its server behind a TLS front that only the pool's proxy can pass.
-
-Every step is safe to run again. A re-run keeps the pool's certificate authority, its key and its server list.
+- [The site directory](../../docs/deployment.md#a-site-directory)
+- [Installing the pool's host](../../docs/deployment.md#the-pools-host) and
+  [joining a box](../../docs/deployment.md#joining-a-box)
+- [A box set up by an older installer](../../docs/deployment.md#a-box-set-up-by-an-older-installer):
+  the first run of these installers moves it, and the steps back
+- [Removing](../../docs/deployment.md#removing)
 
 ## The Docker Compose plugin
 

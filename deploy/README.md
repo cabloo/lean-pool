@@ -30,38 +30,47 @@ the box they belong to.
 
 ### What the compose files read
 
-| Variable | Default | What it sets |
-|---|---|---|
-| `LEAN_SERVER_IMAGE` | `projectnumina/kimina-lean-server:2.0.0` | The Lean server's image: your Lean and Mathlib, the same on every box of a pool. |
-| `LEAN_SERVER_API_KEY` | required | The pool's API key, which the server asks of every check. |
-| `LEAN_SERVER_MAX_REPLS` | required | How many checks the box runs at once: its worker count. |
-| `LEAN_SERVER_MAX_REPL_USES` | `200` | How many checks a worker runs before it is replaced. |
-| `LEAN_SERVER_MAX_REPL_MEM` | `8G` | Each worker's address-space limit. |
-| `LEAN_SERVER_MAX_WAIT` | `60` | Seconds a check waits for a free worker before the server answers 429. |
-| `LEAN_SERVER_LOG_LEVEL` | `WARNING` | Kimina's log level. |
-| `LEAN_SERVER_PUBLISHED_PORT` | `8000` | The host port of the Lean server (or of its TLS front). |
-| `LEAN_SERVER_MEM_LIMIT` | `0` (none) | The server container's memory ceiling, with no swap beyond it. |
-| `LEAN_SERVER_CPUS` | `0` (none) | The server container's CPU ceiling. |
-| `LEAN_SERVER_CGROUP_PARENT` | empty | The control group the server is started in. |
-| `LEAN_SERVER_ROOT_READ_ONLY` | `false` | Whether the server's root filesystem is read-only. |
-| `LEAN_SERVER_SUBNET` | `172.29.53.0/24` | The project's network. |
-| `LEAN_SERVER_AGENT_IMAGE` | `lean-pool` | The usage agent's image. |
-| `LEAN_SERVER_AGENT_PORT` | `18200` | The host port of the usage agent (or of its side of the TLS front). |
-| `LEANPOOL_AGENT_LEAN_CPU_STAT_PATH` | empty | The agent's own setting: the server's `cpu.stat`, under `/host-cgroup`. |
-| `LEANPOOL_AGENT_CPU_RESERVE` | empty | The agent's own setting. |
-| `LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK` | empty | The agent's own setting: the most checks while other work is on the box. |
-| `LEANPOOL_AGENT_VERSION` | empty | The agent's own setting: the installer's version, which ends every reply. |
-| `LEAN_SERVER_FRONT_IMAGE` | `haproxy:3.0` | The TLS front's image. |
-| `LEAN_SERVER_FRONT_ADDRESS` | `172.29.53.250` | The TLS front's fixed address on the project's network. |
-| `LEANPOOL_HAPROXY_IMAGE` | `haproxy:3.0` | The pool's proxy. |
-| `LEANPOOL_HAPROXY_PUBLIC_PORT` | `18100` | The renderer's own setting: the one port clients know. |
-| `LEANPOOL_IMAGE` | `lean-pool` | The cache's image. |
-| `LEANPOOL_CACHE_PIN` | required | The cache's own setting: names the servers' Lean and Mathlib. |
-| `LEANPOOL_CACHE_MAX_BYTES` | `4294967296` | The cache's own setting. |
-| `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` | `1800` | The cache's own setting. |
-| `LEANPOOL_CACHE_MAX_REQUEST_BYTES` | `16777216` | The cache's own setting. |
-| `LEANPOOL_SUBNET` | `172.29.55.0/24` | The pool's network. |
-| `LEANPOOL_DNS` | required by `compose.dns.yaml` | The proxy's DNS server. |
+| Variable | File | Default | What it sets |
+|---|---|---|---|
+| `LEAN_SERVER_IMAGE` | `kimina.env` | `projectnumina/kimina-lean-server:2.0.0` | The Lean server's image: your Lean and Mathlib, the same on every box of a pool. |
+| `LEAN_SERVER_API_KEY` | `kimina.env` | required | The pool's API key, which the server asks of every check. |
+| `LEAN_SERVER_MAX_REPLS` | `kimina.env` | required | How many checks the box runs at once: its worker count. |
+| `LEAN_SERVER_MAX_REPL_USES` | `kimina.env` | `200` | How many checks a worker runs before it is replaced. |
+| `LEAN_SERVER_MAX_REPL_MEM` | `kimina.env` | `8G` | Each worker's address-space limit. |
+| `LEAN_SERVER_MAX_WAIT` | `kimina.env` | `60` | Seconds a check waits for a free worker before the server answers 429. |
+| `LEAN_SERVER_LOG_LEVEL` | `kimina.env` | `WARNING` | Kimina's log level. |
+| `LEAN_SERVER_PUBLISHED_PORT` | `kimina.env` | `8000` | The host port of the Lean server (or of its TLS front). |
+| `LEAN_SERVER_MEM_LIMIT` | `kimina.env` | `0` (none) | The server container's memory ceiling, with no swap beyond it. |
+| `LEAN_SERVER_CPUS` | `kimina.env` | `0` (none) | The server container's CPU ceiling. |
+| `LEAN_SERVER_CGROUP_PARENT` | `kimina.env` | empty | The control group the server is started in. |
+| `LEAN_SERVER_ROOT_READ_ONLY` | `kimina.env` | `false` | Whether the server's root filesystem is read-only. |
+| `LEAN_SERVER_SUBNET` | `kimina.env` | `172.29.53.0/24` | The project's network. |
+| `LEAN_SERVER_AGENT_IMAGE` | `kimina.env` | `lean-pool` | The usage agent's image. |
+| `LEAN_SERVER_AGENT_PORT` | `kimina.env` | `18200` | The host port of the usage agent (or of its side of the TLS front). |
+| `LEANPOOL_AGENT_LEAN_CPU_STAT_PATH` | `kimina.env` | empty | The agent's own setting: the server's `cpu.stat`, under `/host-cgroup`. |
+| `LEANPOOL_AGENT_CPU_RESERVE` | `kimina.env` | empty | The agent's own setting. |
+| `LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK` | `kimina.env` | empty | The agent's own setting: the most checks while other work is on the box. |
+| `LEANPOOL_AGENT_VERSION` | `kimina.env` | empty | The agent's own setting: the installer's version, which ends every reply. |
+| `LEAN_SERVER_FRONT_IMAGE` | `kimina.env` | `haproxy:3.0` | The TLS front's image. |
+| `LEAN_SERVER_FRONT_ADDRESS` | `kimina.env` | `172.29.53.250` | The TLS front's fixed address on the project's network. |
+| `LEANPOOL_HAPROXY_IMAGE` | `pool.env` | `haproxy:3.0` | The pool's proxy. |
+| `LEANPOOL_HAPROXY_PUBLIC_PORT` | `pool.env` | `18100` | The renderer's own setting: the one port clients know. |
+| `LEANPOOL_IMAGE` | `pool.env` | `lean-pool` | The cache's image. |
+| `LEANPOOL_CACHE_PIN` | `pool.env` | required | The cache's own setting: names the servers' Lean and Mathlib. |
+| `LEANPOOL_CACHE_MAX_BYTES` | `pool.env` | `4294967296` | The cache's own setting. |
+| `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` | `pool.env` | `1800` | The cache's own setting. |
+| `LEANPOOL_CACHE_MAX_REQUEST_BYTES` | `pool.env` | `16777216` | The cache's own setting. |
+| `LEANPOOL_SUBNET` | `pool.env` | `172.29.55.0/24` | The pool's network. |
+| `LEANPOOL_DNS` | `pool.env` | required by `compose.dns.yaml` | The proxy's DNS server. |
+
+The defaults are the compose files' own, for a box run by hand. The installers write some of these
+settings with values of their own: `LEAN_SERVER_MAX_WAIT` 120, `LEAN_SERVER_MEM_LIMIT` 36g,
+`LEAN_SERVER_MAX_REPLS`, `LEAN_SERVER_MAX_REPL_MEM`, `LEAN_SERVER_CPUS` and `LEAN_SERVER_SUBNET` from
+the instance file, `LEAN_SERVER_FRONT_ADDRESS` the `.250` of the instance's subnet,
+`LEANPOOL_CACHE_MAX_REQUEST_BYTES` 262144, `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` what the
+proxy's rendered configuration needs (from the Lean timeout and the servers' wait), and
+`LEANPOOL_AGENT_VERSION` the installer's own version
+([the installer's version](../docs/usage-agent.md#the-installers-version)).
 
 ### What the installer's programs also keep
 
@@ -76,7 +85,7 @@ the box they belong to.
 | `LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS` | both | The renderer's own setting: the slowest check, for the front and the proxy. |
 | `LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS` | both | The renderer's own setting: the servers' `LEAN_SERVER_MAX_WAIT`. |
 | `LEANPOOL_IMAGE_GID` | `pool.env` | The group the pool's image runs as, which may read its key. |
-| `LEANPOOL_FRONT_NAMES` | `pool.env` | The names in the front door's certificate. |
+| `LEANPOOL_FRONT_NAMES` | `pool.env` | The names given with `--front-name`, which the front door's certificate holds besides the host's own. |
 | `LEANPOOL_JOIN_PUBLIC_HOST` | `pool.env` | The host name a new box is told to fetch its join script from. |
 | `LEANPOOL_JOIN_PUBLIC_PORT` | `pool.env` | The port the join service is published on while a window is open. |
 | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | `pool.env` | The renderer's own setting: the installer's version, which the pool's `GET /health` carries. |

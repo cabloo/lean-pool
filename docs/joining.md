@@ -1,21 +1,20 @@
 # Joining over the network (`leanpool-join`)
 
 With [TLS](tls.md), a new Lean server box needs a certificate signed by the pool's authority
-before the pool will speak to it. Carrying a signing request to the pool's host and a
-certificate back by hand is fine for one box. `leanpool-join` does the carrying for a box that
-can reach the pool's host. For one join window it serves a script and passes four messages
-between the new box and a spool directory.
+before the pool will speak to it. `leanpool-join` carries the box's signing request to the pool's
+host and its certificate back, for a box that can reach the pool's host. For one join window it
+serves a script and passes four messages between the new box and a spool directory.
 
-**It executes nothing.** Whoever watches the spool on the pool's host (an operator, or a script
-of yours) decides: validates what the box sent, signs with `leanpool-pki sign-csr`, runs
-`leanpool-admit` against the box alone, adds it to the server list. The service only moves the
-files, so it can run as an unprivileged, read-only container that holds no authority key.
+**It executes nothing.** Whatever watches the spool on the pool's host decides: validates what
+the box sent, signs with `leanpool-pki sign-csr`, runs `leanpool-admit` against the box alone,
+adds it to the server list. The service only moves the files, so it runs as an unprivileged,
+read-only container that holds no authority key.
 
-**The service is one half of a join.** The other half is the script a new box runs, and
-whatever acts on the spool on the pool's host. Both are a handful of this project's commands,
-shown [below](#one-join-step-by-step). The [installers](../deploy/install/README.md) are one
-way to run that half: `lean-pool-ctl NAME join-open` opens a window, serves the script a box
-runs (`join-box.sh`) and acts on the spool. A pool set up by hand runs the commands below.
+**The installers are both other halves.** `lean-pool-ctl NAME join-open` on the pool's host
+opens a window, serves the script a box runs, and acts on the spool; the script it serves is
+[`join-box.sh`](../deploy/install/join-box.sh), with the installers and the site behind it.
+[Deploying a pool](deployment.md#joining-a-box) says how to run a join; this page is what
+happens in one, and the rules the service keeps.
 
 ## A join window
 
@@ -46,9 +45,9 @@ back in the same window.
 
 ### The command a new box runs
 
-It is one line. The box does not have the pool's authority yet, so it cannot check the
-certificate's chain (`-k`). It checks the front door's public key instead, against a pin that
-`leanpool-pki pin` prints on the pool's host. (This pin is a fingerprint of a key. It has
+It is one line, which `join-open` prints. The box does not have the pool's authority yet, so it
+cannot check the certificate's chain (`-k`). It checks the front door's public key instead,
+against a pin of that key (`leanpool-pki pin`). (This pin is a fingerprint of a key. It has
 nothing to do with the cache's pin, which names Lean and Mathlib versions.)
 
 ```sh
@@ -56,9 +55,9 @@ curl -fsSk --pinnedpubkey 'sha256//...' https://pool.example:18110/j/<token> | s
 ```
 
 curl compares the server's key with the pin before it sends anything, and exits 90 if they
-differ. Pin every later request of the join script the same way: the script, the box's signing
-request, its certificate and the pool's API key then all travel inside TLS to the machine that
-holds the front door's key, and to no other.
+differ. The join script pins every later request the same way: the script, the box's signing
+request, its certificate and the pool's API key all travel inside TLS to the machine that holds
+the front door's key, and to no other.
 
 ### The rules it keeps
 
@@ -91,35 +90,18 @@ holds the front door's key, and to no other.
 
 ## One join, step by step
 
-`URL` is `https://pool.example:18110/j/<token>` and `PIN` is the front door's pin. Every
-request of the box is `curl -fsSk --pinnedpubkey "$PIN"`.
+`URL` is `https://pool-host.lan:18110/j/<token>`. Every request of the box is
+`curl -fsSk --pinnedpubkey <pin>`.
 
-| | On the pool's host | On the new box |
+| | On the pool's host: `lean-pool-ctl NAME join-open` | On the new box: `join-box.sh` |
 |---|---|---|
-| 1 | Make a token and an empty spool directory, start `leanpool-join`, and print the front door's pin ([the commands](#opening-a-window)). | |
-| 2 | | Run the one-line command. The script it fetches does the rest. |
-| 3 | | Make the box's key and signing request, `leanpool-pki csr --out-dir tls --name NAME`, and `POST URL/csr` with `{name, lean_port, agent_port, workers, csr}`. The key never leaves the box. |
-| 4 | `requests/csr.json` appears. Decide whether this box may join under this name. Sign: `leanpool-pki sign-csr --ca-dir pki/ca --csr ... --out ... --allow-dns NAME`. Write `responses/certificate.json` with `{certificate, ca}`, or `{reason}` to refuse. | |
-| 5 | | Poll `GET URL/certificate` until it is no longer 204. It carries the certificate, the authority's certificate and the pool's API key. Join certificate and key into `box.pem`, start the Lean server, the usage agent and the [TLS front](tls.md#setting-it-up), then `POST URL/ready`. |
-| 6 | `requests/ready.json` appears. Test the box alone, as the proxy will reach it: `leanpool-admit --server https://ADDRESS:PORT ... --tls-server-name NAME` ([admission](admission.md#through-a-boxs-tls-front)). If it passes: `leanpool-haproxy-config add`, `render`, validate, reload ([adding a server](deployment.md#adding-and-removing-a-server)). Write `responses/verdict.json` with `{admitted, detail}`. | |
-| 7 | Stop `leanpool-join`. The window is over. | Poll `GET URL/verdict` and report it. |
+| 1 | Makes a token and an empty spool, starts `leanpool-join`, and prints the command for the box. | |
+| 2 | | Checks Docker and runs the installer's own pre-flight, then gets the Lean server's image: from `URL/image` where the pool ships one, its SHA-256 checked before it is loaded, else built here. It asks the pool only for what any holder of the token may read (`/image.json` and the image), so a box that fails here has not used the window. |
+| 3 | | Makes the box's key and a signing request for its name, and sends `POST URL/csr` with `{name, lean_port, agent_port, workers, csr}`. The key never leaves the box. |
+| 4 | `requests/csr.json` appears. Refuses a name that is not one DNS label, one of the pool's own names, or a name or address already in the server list; else signs for exactly that name and writes `responses/certificate.json` with `{certificate, ca}`, or `{reason}` to refuse. | |
+| 5 | | Polls `GET URL/certificate` until it is no longer 204. It carries the certificate, the authority's certificate and the pool's API key. Installs the Lean server, the usage agent and the [TLS front](tls.md#how-the-installers-set-it-up), then `POST URL/ready`. |
+| 6 | `requests/ready.json` appears. Tests the box alone, as the proxy will reach it ([admission](admission.md#through-a-boxs-tls-front)). If it passes, adds it to the server list, validates and reloads. Writes `responses/verdict.json` with `{admitted, detail}`. | |
+| 7 | Stops `leanpool-join`. The window is over. | Polls `GET URL/verdict`, reports it, and prints the command that removes the box. |
 
 A failure at any step leaves the pool as it was: nothing is added before step 6 has passed, and
 a box that was refused holds a certificate that proves only its own name.
-
-### Opening a window
-
-Step 1, on the pool's host, in the directory that holds `pki/` and `api-key.txt`
-(`deploy/pool`, if you followed [TLS](tls.md)), with your join script as `join.sh`:
-
-```sh
-mkdir -m 0700 spool
-(umask 077 && openssl rand -hex 16 > token.txt)
-leanpool-pki pin pki/proxy/front.crt
-leanpool-join --script join.sh --token-file token.txt --tls-pem pki/proxy/front.pem \
-    --spool spool --api-key-file api-key.txt
-```
-
-The second-to-last command prints the pin for the new box's `curl`; the last one serves the
-window on port 18110 until it is stopped. The token is the last part of the window's address,
-`https://pool.example:18110/j/<token>`.

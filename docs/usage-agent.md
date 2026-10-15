@@ -138,9 +138,10 @@ reply    = "ready up N% maxconn:S"   S open slots, 1 or more
 
 ### Giving the agent what it needs
 
-Both settings are the box's to arrange, and the compose files in
-[`deploy/lean-server/`](../deploy/lean-server) do not
-arrange them: an agent started from those answers with a weight alone.
+Both are the box's to arrange. The compose files in [`deploy/lean-server/`](../deploy/lean-server)
+take them as settings: `compose.yaml` starts the server in `LEAN_SERVER_CGROUP_PARENT`, and
+`compose.agent.yaml` mounts the box's control groups read-only and passes the agent the worker
+count and `LEANPOOL_AGENT_LEAN_CPU_STAT_PATH`. Left empty, the agent answers with a weight alone.
 
 * **A control group for the Lean server alone.** With Docker under systemd, start the Lean
   server's container in a slice of its own (Compose: `cgroup_parent: leanpool-main.slice`). Its

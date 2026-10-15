@@ -69,14 +69,13 @@ cases.
 * the documentation: every flag and environment variable a command accepts is in the
   [configuration reference](configuration.md) and none is named there that does not exist; the
   directives, timeouts and messages these pages quote are the ones the code produces; every
-  link between the pages leads somewhere; and the [TLS](tls.md) page's recipe is followed
-  command by command, in one directory for the pool box and one for a Lean server box, up to
-  the certificates and configurations the compose files mount (what needs Docker, root or a
-  Lean server is not run);
+  link between the pages leads somewhere;
 * the examples: the [demo](../examples/demo)'s stand-in Lean server, and what the real cache
   stores of its answers; that the demo's committed `haproxy.cfg` is what `render` writes for
-  its server list; that every compose file builds this project, publishes no port that must
-  stay inside the proxy, and quotes commands that exist; the
+  its server list; that every image a compose file builds is this project's, that none
+  publishes a port that must stay inside the proxy, that each quotes commands that exist, and
+  that the TLS configurations those commands render use the certificates where the files mount
+  them; the
   [example client](../examples/pool_client.py)'s sizing, retries and verdicts;
 * the [compiled search step](compiled-search.md): that the launcher loads the library only
   when it was made from the files that are there, and starts the plain REPL in each other
@@ -91,9 +90,14 @@ cases.
   container's user could not make. A host with two Lean servers, the pool put in front of one,
   the control commands,
   joins over real HTTPS with the real join service, refreshes, the compose plugin's install,
-  the firewall rules, uninstalls; every refusal before root is asked for; and an instance whose
-  image is pulled by name instead of built. They need a user who is not root, and are skipped
-  when run as root.
+  the firewall rules, uninstalls; every refusal before root is asked for; an instance whose
+  image is pulled by name instead of built; and a box set up by the installers of an older
+  version, made by those installers themselves, moved to the compose files of `deploy/` with
+  every setting and the cache's results kept, put back as it was when a server does not come
+  up, and taken back to the older installers by the steps
+  [Deploying a pool](deployment.md#a-box-set-up-by-an-older-installer) gives. Every compose
+  command they run names the files of `deploy/`, byte for byte. They need a user who is not
+  root, and are skipped when run as root.
 
 ### Tests that run only where `haproxy` is installed
 
@@ -308,19 +312,19 @@ address. Its single and its batched requests were answered, and repeats came fro
 * The address-change test replaces one line of the generated configuration,
   `parse-resolv-conf`, with a test name server: HAProxy always reads `/etc/resolv.conf` for that
   directive, and a test cannot replace that file.
-* **The compose files in `deploy/` have not been run as they are written here.** They are
-  adapted from the deployment's own, which differ in names, paths and limits. Docker validates
-  them in CI; only the demo's compose file is started there.
+* **The compose files in `deploy/` have not run on a real host yet.** They are what the
+  installers run, and the installers' tests run them on the fake machine; Docker validates every
+  combination of them in CI, where only the demo's compose file is started.
 * **Kimina's published image has not been used.** The deployment builds Kimina from source at
   one commit. The fakes and the stand-in follow Kimina's interface as read from that source.
   The installers' example site names that image, and pulling it has run only on the fake
   machine.
-* **The installers in `deploy/install/` are the deployment's own**, but the deployment runs
-  them with a site of its own and builds its images from recipes. `site.example/` has not
-  been installed on a real host.
-* **The compiled search step's `make.sh` and compose file have not been run as written.**
-  The deployment ran the same build, check and launcher through the installers;
-  here those three have been run as written against a real Lean, outside Docker. And the
+* **The installers in `deploy/install/` are the deployment's own, in an earlier version**: it
+  last ran them before they took the compose files of `deploy/`, with a site of its own, and it
+  builds its images from recipes. `site.example/` has not been installed on a real host.
+* **The compiled search step's `make.sh` has run only on the fake machine.** The installers
+  run it; the deployment ran the same build, check and launcher through its earlier installers,
+  and here those three have been run as written against a real Lean, outside Docker. And the
   check compares three proofs: it does not show that the compiled search and the
   interpreted one agree on every input
   ([why that cannot let a wrong proof pass](compiled-search.md#what-it-cannot-change-and-what-it-does)).
@@ -334,6 +338,6 @@ address. Its single and its batched requests were answered, and repeats came fro
   Docker's `restart: unless-stopped`, taken on trust.
 * **A real Lean server of the wrong version** has not been refused in the deployment. The
   admission test's rules are covered by unit tests only.
-* **The join service** is tested as a service. The joins of the deployment were carried out
-  by its own scripts on both sides, which this project does not ship
+* **The join service** is tested as a service, and through the installers on the fake
+  machine. The deployment's joins were carried out by these installers
   ([joining](joining.md)).

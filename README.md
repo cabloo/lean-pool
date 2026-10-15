@@ -126,69 +126,43 @@ Everything else in the demo is what a real pool runs. Stop it with
 
 ## Run a real pool
 
-You need:
-
-* Linux and Docker with compose on every machine, and a clone of this repository on each;
-* [uv](https://docs.astral.sh/uv/) on the machine that will be the pool box, to run the
-  commands below from the clone;
-* a Kimina Lean Server image with your Lean and Mathlib, the same on every machine. The compose
-  file uses Kimina's published image unless you name another.
-
-On the pool box, make the pool's API key:
+The [installers](deploy/install/README.md) set up a pool on Linux machines with Docker and root,
+TLS throughout. Copy the [example site](deploy/install/site.example), which names the Lean server
+image every box runs, and on the pool's host, in a clone of this repository:
 
 ```sh
-cd deploy/pool
-openssl rand -hex 32 > api-key.txt && chmod 0644 api-key.txt
+cd deploy/install
+sudo bash install.sh --site ~/my-site --instance upstream
+sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases
 ```
 
-On each Lean server box, start Kimina and the usage agent beside it. The last number is how
-many checks this box runs at once:
+The first line installs a Lean server, the second the pool in front of it. Each further box
+joins with one command, which `sudo lean-pool-ctl upstream join-open` prints for it.
+[docs/deployment.md](docs/deployment.md) is the guide: the site directory, joining, operating,
+upgrading, sizing, and what to watch.
 
-```sh
-cd deploy/lean-server
-printf 'LEAN_SERVER_API_KEY=%s\nLEAN_SERVER_MAX_REPLS=%s\n' 'PASTE-THE-KEY-HERE' 4 > .env
-docker compose up -d --build
-```
-
-Back on the pool box, list the servers, render HAProxy's configuration and start the pool:
-
-```sh
-cd deploy/pool
-uv run leanpool-haproxy-config add --servers servers lean-a lean-a.example:8000 4
-uv run leanpool-haproxy-config add --servers servers lean-b lean-b.example:8000 8
-mkdir -p haproxy
-uv run leanpool-haproxy-config render --servers servers > haproxy/haproxy.cfg
-echo 'LEANPOOL_CACHE_PIN=kimina-lean-server-2.0.0' > .env    # names your Lean and Mathlib
-docker compose up -d --build
-curl -s http://localhost:18100/health
-```
-
-That is the short form. [docs/deployment.md](docs/deployment.md) is the guide: testing each
-server before it joins, one machine for both roles, adding and removing servers, reloading
-without dropping a check, sizing, and what to watch.
-
-Two things to know before you start. **Whoever holds the API key can run code on every Lean
-server box**, because checking Lean code runs it, and this short form is plain HTTP:
-[SECURITY.md](SECURITY.md) and [docs/tls.md](docs/tls.md) are the next read. And the compose
-files in `deploy/` are adapted from a running pool and validated by Docker in CI, but have not
-been started exactly as written here; the demo is what CI starts.
+**Whoever holds the API key can run code on every Lean server box**, because checking Lean code
+runs it: [SECURITY.md](SECURITY.md) is the next read.
 
 ## Use it
 
-Exactly like a single Kimina server:
+Exactly like a single Kimina server. A pool the installers set up answers over HTTPS under its
+own authority, whose certificate `sudo lean-pool-ctl upstream ca > ca.crt` prints:
 
 ```sh
-curl -s http://pool.example:18100/api/check \
+curl -s --cacert ca.crt https://pool.example:18100/api/check \
     -H "Authorization: Bearer $(cat api-key.txt)" -H 'Content-Type: application/json' \
     -d '{"snippets": [{"id": "attempt-1", "code": "theorem two : 1 + 1 = 2 := by rfl"}], "timeout": 60}'
 ```
 
-Kimina's own Python client works unchanged, pointed at the pool:
+Kimina's own Python client works unchanged, pointed at the pool; here the
+[demo](examples/demo)'s, which is plain HTTP ([TLS](docs/tls.md#clients) says what a Python
+client needs for an HTTPS pool):
 
 ```python
 from kimina_client import KiminaClient
 
-client = KiminaClient(api_url="http://pool.example:18100", api_key="...")
+client = KiminaClient(api_url="http://localhost:18100", api_key="...")
 client.check("theorem two : 1 + 1 = 2 := by rfl")
 ```
 
@@ -208,8 +182,8 @@ the cache's counters, and each certificate's last day
 |---|---|
 | [Deploying a pool](docs/deployment.md) | From nothing to a running pool, and how to operate it. |
 | [Using a pool](docs/clients.md) | The API, how to read each reply, priorities, the pool's stated size. |
-| [TLS](docs/tls.md) | The pool's own certificate authority, step by step; what is encrypted and who holds which key. |
-| [Joining over the network](docs/joining.md) | Letting a new box request its certificate over HTTPS. |
+| [TLS](docs/tls.md) | The pool's own certificate authority: what is encrypted and who holds which key. |
+| [Joining over the network](docs/joining.md) | What happens when a new box joins, and the rules the join service keeps. |
 | [Cache semantics](docs/cache.md) | The key, what is stored and what never is, bypass, single flight. |
 | [The usage agent](docs/usage-agent.md) | The weight formula, what HAProxy does with it, and open slots for a box that also does other work. |
 | [The generated HAProxy configuration](docs/haproxy.md) | Pausing a server, the health check, failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus. |

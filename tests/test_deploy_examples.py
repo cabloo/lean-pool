@@ -224,6 +224,8 @@ def test_the_render_command_the_pools_tls_file_quotes_is_a_real_one(
     config = capsys.readouterr().out
     assert "bind :18100 ssl crt /etc/leanpool/tls/front.pem" in config
     assert "ca-file /etc/leanpool/tls/ca.crt crt /etc/leanpool/tls/proxy-client.pem" in config
+    # Each server is held to its name in the list, whatever address it is dialled at.
+    assert "verifyhost lean-a" in config
 
 
 def test_the_render_command_the_plain_pool_file_quotes_is_a_real_one(
@@ -247,8 +249,14 @@ def test_the_front_the_tls_box_file_tells_the_reader_to_render_matches_its_servi
     assert "server lean kimina:8000" in config
     assert "server agent agent:18200" in config
     assert {"kimina", "agent", "front"} <= set(box)
-    assert "./tls:/etc/leanpool/tls:ro" in box["front"]["volumes"]
+    assert box["front"]["volumes"] == [
+        "./front:/usr/local/etc/haproxy:ro",
+        "./tls:/etc/leanpool/tls:ro",
+    ]
     assert "crt /etc/leanpool/tls/box.pem" in config
+    # Only a certificate of the pool's authority, and of those only the proxy's, is let in.
+    assert "ca-file /etc/leanpool/tls/ca.crt" in config
+    assert "-m str lean-pool-proxy" in config
 
 
 def test_every_setting_the_compose_files_read_is_in_the_table_and_nothing_else() -> None:

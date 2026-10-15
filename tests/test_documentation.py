@@ -46,6 +46,7 @@ PAGES = [
     PROJECT / "CHANGELOG.md",
     *sorted((PROJECT / "docs").glob("*.md")),
     PROJECT / "deploy" / "README.md",
+    PROJECT / "deploy" / "install" / "README.md",
     PROJECT / "examples" / "demo" / "README.md",
     PROJECT / "examples" / "admission-cases" / "README.md",
 ]

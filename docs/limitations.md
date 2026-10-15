@@ -4,8 +4,9 @@ What the pool does not do, and where it can surprise. Nothing here is hidden beh
 item follows from a rule described on another page.
 
 * The [installers](../deploy/install/README.md) are for Linux hosts with Docker and systemd,
-  and run as root. Anywhere else, a pool is set up and changed with the commands and compose
-  files described in [Deploying a pool](deployment.md).
+  and run as root. Anywhere else, the compose files of `deploy/` run as each one's header says,
+  with this project's commands; no page walks through that
+  ([without the installers](deployment.md#without-the-installers)).
 * The pool speaks Kimina's interface and nothing else. It does not run Lean, and it does not
   build or manage the Lean servers.
 * The pool box is a single point of failure: while it is down the pool is down, although each
