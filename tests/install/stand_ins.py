@@ -218,7 +218,7 @@ def compose_project(args):
     env.update(os.environ)                                       # the shell's environment comes first, as for compose
     try:
         resolved = compose_files.resolve(files, env)
-    except compose_files.MissingSetting as error:
+    except compose_files.MissingSettingError as error:
         fail(str(error))
     project = project or env.get("COMPOSE_PROJECT_NAME") or resolved.get("name") or files[0].parent.name
     return args, project, resolved, files
@@ -1080,6 +1080,7 @@ PROJECT_FILES = (
     "leanpool",
     "deploy/Dockerfile",
     "deploy/lean-server/compiled-search",
+    "deploy/lean-server/read-only-check.sh",
 )
 
 

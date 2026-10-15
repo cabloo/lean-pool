@@ -57,7 +57,7 @@ _Loader.add_constructor("!reset", _reset)
 _Loader.add_constructor("!override", _override)
 
 
-class MissingSetting(ValueError):
+class MissingSettingError(ValueError):
     """A `${NAME:?message}` whose NAME is not set (or empty): Compose refuses the project."""
 
 
@@ -88,7 +88,7 @@ def interpolate(text: str, env: Mapping[str, str]) -> str:
         if how == "-":
             return word if given is None else str(given)
         if (how == ":?" and unset_or_empty) or (how == "?" and given is None):
-            raise MissingSetting(f"required variable {name} is missing a value: {word}")
+            raise MissingSettingError(f"required variable {name} is missing a value: {word}")
         return "" if given is None else str(given)
 
     return _VARIABLE.sub(value, text)

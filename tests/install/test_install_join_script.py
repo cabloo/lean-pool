@@ -1139,6 +1139,7 @@ def test_the_bundle_holds_the_instance_installer_and_everything_it_asks_for(pack
             f"lean_pool/deploy/lean-server/compiled-search/{name}"
             for name in ("build.sh", "check.py", "inside.sh", "make.sh", "modules", "repl-native")
         ),
+        "lean_pool/deploy/lean-server/read-only-check.sh",
     ):
         assert f"join/{name}" in members, name
     recipe = (

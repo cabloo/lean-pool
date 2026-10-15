@@ -361,36 +361,10 @@ install_compiled_search() {
 #   <instance dir>/read-only.state    one line: `on`, or `off REASON` when the installer turned it off
 #   <instance dir>/read-only.diff     what `docker diff` said of the running server at the last reading
 #   <instance dir>/read-only.outside  of that, every path a read-only root would have refused (when any was)
+# The reading is the lean-pool project's read-only-check.sh, which says what it counts and why.
+LEAN_READ_ONLY_CHECK=deploy/lean-server/read-only-check.sh     # in the lean-pool project
 READ_ONLY_INSTALLED=""     # set once install_read_only_root has run in this process
 READ_ONLY_SAID=""          # its one line, for the installer's last lines
-
-# read_only_writes DIFF_FILE ALLOWED... : the paths of `docker diff` output a read-only root would have refused:
-# not one of ALLOWED nor under one, not Python's byte-code cache (Python goes on quietly when it cannot write
-# that), and not git's index of a Lake package (`.lake/packages/NAME/.git/index`). Every worker starts with
-# `lake env`, which runs `git diff HEAD --exit-code` in each package, and git saves the index it refreshed only
-# when it can: unsaved, it re-reads the package's files at each start and answers the same (measured on a
-# first reading). A directory listed only because something under it is listed is
-# not counted: `docker diff` marks every directory above a change as changed, and the change itself is judged.
-read_only_writes() {
-  local diff=$1
-  shift
-  awk -v allowed="$*" '
-    BEGIN { kept = split(allowed, keep, " ") }
-    /^[ACD] \// {
-      path = substr($0, 3); listed[path] = 1
-      parent = path
-      while (sub(/\/[^\/]*$/, "", parent) && parent != "") above[parent] = 1
-    }
-    END {
-      for (path in listed) {
-        if (path in above || path ~ /\/__pycache__(\/|$)/ || path ~ /\.pyc$/) continue
-        if (path ~ /\/\.lake\/packages\/[^\/]+\/\.git\/index$/) continue
-        fine = 0
-        for (i = 1; i <= kept; i++) if (path == keep[i] || index(path, keep[i] "/") == 1) fine = 1
-        if (!fine) print path
-      }
-    }' "$diff" | LC_ALL=C sort
-}
 
 # read_only_off INSTANCE_DIR REASON : the server is made writable, as it was before the read-only root, and the box says why.
 read_only_off() {
@@ -402,7 +376,7 @@ read_only_off() {
 # install_read_only_root INSTANCE_DIR INSTANCE : decide, BEFORE the Lean server's container is (re)made, whether
 # its root filesystem is read-only, and write that into the instance's settings. Nothing here stops an install.
 install_read_only_root() {
-  local dir=$1 instance=$2 env=$1/kimina.env container made writes reason="" hint
+  local dir=$1 instance=$2 env=$1/kimina.env container made writes reason="" hint project checked=0 said
   READ_ONLY_INSTALLED=1
   container=$(setting_in "$env" KIMINA_CONTAINER)
   container=${container:-$SITE_PREFIX-kimina}
@@ -426,14 +400,12 @@ install_read_only_root() {
     # A server that has served checks with a writable root: every file it changed is in its writable layer.
     say "Reading what the running Lean server has written since it was made (docker diff)"
     rm -f "$dir/read-only.outside"
-    if docker diff "$container" > "$dir/read-only.diff" 2>&1; then
-      chmod 0644 "$dir/read-only.diff"
-      # Allowed: /tmp, the container's volumes, and what Docker itself mounts into every container (its init,
-      # with `init: true`, and the three name files), none of which is in the root filesystem. `.Mounts`
-      # does not list /usr/sbin/docker-init, so it is named here.
-      # shellcheck disable=SC2046  # one word per mount point
-      writes=$(read_only_writes "$dir/read-only.diff" /tmp /sbin/docker-init /usr/sbin/docker-init /etc/hosts /etc/hostname /etc/resolv.conf \
-        $(docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$container" 2>/dev/null || true))
+    project=$(lean_pool_source) && [ -f "$project/$LEAN_READ_ONLY_CHECK" ] \
+      || die "missing $LEAN_READ_ONLY_CHECK: $LEAN_POOL_SOURCE_MISSING"
+    said=$(mktemp)
+    writes=$(bash "$project/$LEAN_READ_ONLY_CHECK" --diff "$dir/read-only.diff" "$container" 2>"$said") || checked=$?
+    [ ! -f "$dir/read-only.diff" ] || chmod 0644 "$dir/read-only.diff"
+    if [ "$checked" -le 1 ]; then
       if [ -n "$writes" ]; then
         # Every one of them, for `kimina-ctl status` (the reason below holds the first few).
         printf '%s\n' "$writes" > "$dir/read-only.outside"
@@ -443,8 +415,9 @@ install_read_only_root() {
       fi
       echo "docker diff: $(grep -c . "$dir/read-only.diff") lines, $(printf '%s' "$writes" | grep -c .) outside /tmp, the mount points (Docker's own too), Python's byte-code cache and git's index of each Lake package (in $dir/read-only.diff)"
     else
-      reason="could not read what the running server writes (docker diff: $(last_line_of "$dir/read-only.diff"))"
+      reason="could not read what the running server writes ($(last_line_of "$said"))"
     fi
+    rm -f "$said"
   fi
   if [ -n "$reason" ]; then
     reason=$(printf '%s' "$reason" | tr -d '\n' | tr -c '[:print:]' ' ' | cut -c 1-400)
@@ -993,7 +966,7 @@ remove_tls_front() {
 # directory `join/`: the instance installer and everything it needs; `join/site/`, the site's values for INSTANCE
 # alone (site.env, instances/INSTANCE.env and that instance's image recipe), which the installer reads when it is
 # given no --site; and `join/lean_pool/`, the lean-pool project's source (the box builds the pool's image from
-# it, and makes the compiled search step with it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
+# it, and makes the compiled search step and reads its server with it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
 pack_join_bundle() {
   local out=$1 instance=$2 stage source file recipe
   source=$(lean_pool_source) || die "$LEAN_POOL_SOURCE_MISSING"
@@ -1009,10 +982,10 @@ pack_join_bundle() {
     [ -f "$SITE/$file" ] || { rm -rf "$stage"; die "missing $SITE/$file - the site's values for instance '$instance'"; }
     cp "$SITE/$file" "$stage/join/site/$file"
   done
-  # Only what the image build reads (see the project's .dockerignore), and the compiled search step: no tests, no
-  # environment, no caches.
+  # Only what the image build reads (see the project's .dockerignore), the compiled search step and the read-only
+  # check: no tests, no environment, no caches.
   tar -cf - -C "$source" --exclude=__pycache__ pyproject.toml README.md LICENSE leanpool deploy/Dockerfile \
-      deploy/lean-server/compiled-search \
+      deploy/lean-server/compiled-search "$LEAN_READ_ONLY_CHECK" \
     | tar -xf - -C "$stage/join/lean_pool" || { rm -rf "$stage"; die "could not copy the lean-pool project"; }
   tar -czf - -C "$stage" --owner=0 --group=0 join | base64 > "$out" \
     || { rm -rf "$stage"; die "could not pack the join bundle"; }
