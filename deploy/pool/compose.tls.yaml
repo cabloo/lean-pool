@@ -1,24 +1,20 @@
-# TLS for the pool box: used on top of compose.yaml,
+# TLS for the pool box, added after compose.yaml:
 #
 #   docker compose -f compose.yaml -f compose.tls.yaml up -d
 #
-# with haproxy/haproxy.cfg rendered in TLS mode. docs/tls.md walks through it (step 6):
+# with haproxy/haproxy.cfg rendered in TLS mode:
 #
 #   leanpool-haproxy-config render --servers servers \
 #       --tls-front-door-pem /etc/leanpool/tls/front.pem \
 #       --tls-ca-file /etc/leanpool/tls/ca.crt \
 #       --tls-client-pem /etc/leanpool/tls/proxy-client.pem > haproxy/haproxy.cfg
 #
-# ./pki/proxy is where that page has leanpool-pki write front.pem (the front door's certificate
-# and key), proxy-client.pem (what the proxy shows every Lean server) and ca.crt. The two .pem
-# files hold private keys: let the group HAProxy's image runs as read them, and nobody else:
-#
-#   gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
-#   sudo chgrp "$gid" pki/proxy pki/proxy/*.pem && chmod 0750 pki/proxy && chmod 0640 pki/proxy/*.pem
-#
-# The authority's own key is in ./pki/ca, which no container mounts.
+# ./tls holds front.pem (the front door's certificate and key), proxy-client.pem (what the proxy shows every
+# Lean server) and ca.crt (the pool authority's certificate). The two .pem files hold private keys: the
+# directory and they belong to the group HAProxy's image runs as, and nobody else may read them. The
+# authority's own key is kept elsewhere, in a directory no container mounts. docs/tls.md says who holds which.
 
 services:
   haproxy:
     volumes:
-      - ./pki/proxy:/etc/leanpool/tls:ro
+      - ./tls:/etc/leanpool/tls:ro

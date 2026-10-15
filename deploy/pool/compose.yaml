@@ -1,43 +1,46 @@
-# The pool box: HAProxy (the one address clients know) and the result cache behind it.
-# The Lean servers run on their own boxes (../lean-server) and are named in ./servers.
+# The pool box: HAProxy (the one address clients know) and the result cache behind it. The Lean servers run
+# on their own boxes (../lean-server). The installer (deploy/install/) runs exactly this file, with the
+# overlays after it:
 #
-# docs/deployment.md walks through setting it up. This file expects, beside it:
+#   compose.tls.yaml   the proxy's certificates: HTTPS for clients, mutual TLS to every Lean server
+#   compose.dns.yaml   a DNS server for the proxy, when the Lean servers are named on a LAN
 #
-#   api-key.txt            the pool's API key, readable by uid 10001 (the cache's user)
-#   .env                   LEANPOOL_CACHE_PIN=<a name for your servers' Lean and Mathlib>
-#   servers                the server list
-#   haproxy/haproxy.cfg    HAProxy's configuration, rendered from the list:
+# The installer copies them into the pool's directory and writes their list (COMPOSE_FILE), the project's
+# name (COMPOSE_PROJECT_NAME) and every setting into pool.env there. deploy/README.md lists the settings.
+#
+# Without the installer, this file expects, beside it:
+#
+#   api-key               the pool's API key, readable by the cache's user (uid 10001) and nobody else
+#   .env                  LEANPOOL_CACHE_PIN=<a name for your servers' Lean and Mathlib>
+#   haproxy/haproxy.cfg   HAProxy's configuration, rendered from the server list:
 #
 #   leanpool-haproxy-config render --servers servers > haproxy/haproxy.cfg
 #
-# Then `docker compose up -d --build`, and clients send every check to
-# http://<this box>:18100/api/check. For TLS add the second file:
-# docker compose -f compose.yaml -f compose.tls.yaml up -d
+# then `docker compose up -d`, and clients send every check to http://<this box>:18100/api/check. The cache's
+# image is this repository's (deploy/Dockerfile): `docker build -t lean-pool -f deploy/Dockerfile .`
 
 name: lean-pool
 
 services:
   haproxy:
-    image: haproxy:3.0
+    image: "${LEANPOOL_HAPROXY_IMAGE:-haproxy:3.0}"
     restart: unless-stopped
     ports:
-      - "18100:18100" # the one address clients know
+      # The one address clients know. IPv4 only, as the Lean servers' ports.
+      - "0.0.0.0:${LEANPOOL_HAPROXY_PUBLIC_PORT:-18100}:${LEANPOOL_HAPROXY_PUBLIC_PORT:-18100}"
     volumes:
-      # The directory, not the file: a new haproxy.cfg can then be moved into place and HAProxy
-      # told to reload from inside the container,
+      # The directory, not the file: a new haproxy.cfg can then be moved into place and HAProxy told to reload
+      # from inside the container,
       #     docker compose exec haproxy sh -c 'kill -HUP 1'
-      # Do not reload with `docker compose kill -s HUP`: Docker counts a container it has
-      # signalled as stopped by hand, and `restart: unless-stopped` then no longer brings it
-      # back after a crash or a reboot.
+      # Do not reload with `docker compose kill -s HUP`: Docker counts a container it has signalled as stopped
+      # by hand, and `restart: unless-stopped` then no longer brings it back after a crash or a reboot.
       - ./haproxy:/usr/local/etc/haproxy:ro
     read_only: true
-    tmpfs:
-      - /tmp
-      - /run
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    tmpfs: ["/tmp", "/run"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 2
     logging:
       driver: json-file
       options:
@@ -45,44 +48,49 @@ services:
         max-file: "5"
 
   cache:
-    image: lean-pool
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile
+    image: "${LEANPOOL_IMAGE:-lean-pool}"
     restart: unless-stopped
     command: ["leanpool-cache"]
-    # The cache shares the proxy's network namespace. The proxy reaches it on 127.0.0.1:18102,
-    # and it reaches the proxy's loopback-only listener on 127.0.0.1:18101; neither port is
-    # reachable from outside.
+    # The cache shares the proxy's network namespace. The proxy reaches it on 127.0.0.1:18102, and it reaches
+    # the proxy's loopback-only listener on 127.0.0.1:18101; neither port is reachable from outside.
     network_mode: "service:haproxy"
-    depends_on:
-      - haproxy
+    depends_on: [haproxy]
     environment:
-      # Names the Lean and Mathlib versions of the pool's servers. It is part of every cache
-      # key: change it whenever the servers' image changes, and old entries stop matching.
-      LEANPOOL_CACHE_PIN: "${LEANPOOL_CACHE_PIN:?set LEANPOOL_CACHE_PIN in .env to name your Lean and Mathlib versions}"
+      # Names the Lean and Mathlib versions of the pool's servers. It is part of every cache key: change it
+      # whenever the servers' image changes, and old entries stop matching.
+      LEANPOOL_CACHE_PIN: "${LEANPOOL_CACHE_PIN:?set LEANPOOL_CACHE_PIN to name your Lean and Mathlib versions}"
       LEANPOOL_CACHE_API_KEY_FILE: /run/secrets/pool_api_key
       LEANPOOL_CACHE_MAX_BYTES: "${LEANPOOL_CACHE_MAX_BYTES:-4294967296}"
+      # Must cover the proxy's queue wait plus the slowest check: the rendered haproxy.cfg states the minimum.
+      LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS: "${LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS:-1800}"
+      LEANPOOL_CACHE_MAX_REQUEST_BYTES: "${LEANPOOL_CACHE_MAX_REQUEST_BYTES:-16777216}"
     secrets:
       - pool_api_key
     volumes:
       - cache-data:/var/lib/leanpool
     read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    cpus: 2
     logging:
       driver: json-file
       options:
         max-size: "20m"
         max-file: "5"
 
+networks:
+  default:
+    # A fixed subnet, so the proxy reaches a Lean server on this same box at the gateway's address: an IPv4
+    # literal, because HAProxy's run-time resolver cannot see /etc/hosts names such as host.docker.internal.
+    ipam:
+      config:
+        - subnet: "${LEANPOOL_SUBNET:-172.29.55.0/24}"
+
 volumes:
   cache-data:
 
 secrets:
   pool_api_key:
-    file: ./api-key.txt
+    file: ./api-key

@@ -104,16 +104,35 @@ jobs:
         run: |
           docker compose -f examples/demo/compose.yaml config --quiet
           cd deploy/pool
-          touch api-key.txt
-          LEANPOOL_CACHE_PIN=ci docker compose -f compose.yaml config --quiet
-          LEANPOOL_CACHE_PIN=ci docker compose -f compose.yaml -f compose.tls.yaml config --quiet
+          touch api-key
+          export LEANPOOL_CACHE_PIN=ci LEANPOOL_DNS=192.0.2.53
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.tls.yaml config --quiet
+          docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml config --quiet
           cd ../lean-server
           export LEAN_SERVER_API_KEY=ci LEAN_SERVER_MAX_REPLS=2
-          docker compose -f compose.yaml config --quiet
-          docker compose -f compose.tls.yaml config --quiet
           mkdir -p native
-          docker compose -f compose.yaml -f compose.compiled-search.yaml config --quiet
-          docker compose -f compose.tls.yaml -f compose.compiled-search.yaml config --quiet
+          for files in "compose.yaml" \
+                       "compose.yaml compose.agent.yaml" \
+                       "compose.yaml compose.agent.yaml compose.tls.yaml" \
+                       "compose.yaml compose.compiled-search.yaml" \
+                       "compose.yaml compose.agent.yaml compose.compiled-search.yaml" \
+                       "compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml"; do
+            docker compose $(printf -- '-f %s ' $files) config --quiet
+          done
+      - name: Docker merges the overlays as the tests' model of Compose does
+        working-directory: deploy/lean-server
+        env:
+          LEAN_SERVER_API_KEY: ci
+          LEAN_SERVER_MAX_REPLS: "2"
+          LEAN_SERVER_PUBLISHED_PORT: "18001"
+        run: |
+          docker compose -f compose.yaml -f compose.agent.yaml -f compose.tls.yaml config --format json > tls.json
+          # With TLS the front alone publishes, and the ports inside stay fixed.
+          test "$(jq -c '.services.kimina.ports // []' tls.json)" = "[]"
+          test "$(jq -c '.services.agent.ports // []' tls.json)" = "[]"
+          test "$(jq -r '.services.front.ports[] | "\(.published):\(.target)"' tls.json | sort | tr '\n' ' ')" = "18001:8000 18200:18200 "
+          test "$(jq -r '.name' tls.json)" = "lean-server"
       - name: Start the demo
         run: docker compose -f examples/demo/compose.yaml up --build -d
       - name: Walk through it

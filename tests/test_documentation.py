@@ -101,6 +101,9 @@ def test_the_documentation_and_the_compose_files_name_no_variable_that_does_not_
     known: set[str] = set()
     for command, prefix in COMMANDS:
         known |= set(re.findall(r"LEANPOOL_[A-Z_]+", help_text(command, prefix, capsys)))
+    # The pool box's own settings, which no command reads: deploy/README.md lists them with the rest.
+    settings = (PROJECT / "deploy" / "README.md").read_text(encoding="utf-8").split("## Settings", 1)[1]
+    known |= set(re.findall(r"^\| `(LEANPOOL_[A-Z_]+)` \|", settings, flags=re.MULTILINE))
     compose_files = [*PROJECT.glob("deploy/**/*.yaml"), *PROJECT.glob("examples/**/*.yaml")]
     written = DOCUMENTATION + "\n".join(path.read_text(encoding="utf-8") for path in compose_files)
     assert set(re.findall(r"LEANPOOL_[A-Z_]+", written)) <= known

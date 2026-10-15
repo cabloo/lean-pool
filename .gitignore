@@ -17,8 +17,10 @@ dist/
 # was rendered from them.
 .env
 api-key.txt
+deploy/pool/api-key
 deploy/pool/servers
 deploy/pool/haproxy/
+deploy/pool/tls/
 deploy/pool/pki/
 deploy/pool/spool/
 deploy/pool/join.sh

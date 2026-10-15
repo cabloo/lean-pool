@@ -1,0 +1,45 @@
+# The lean-pool usage agent beside the Lean server, for a box in a pool: added after compose.yaml,
+#
+#   docker compose -f compose.yaml -f compose.agent.yaml up -d
+#
+# The pool's proxy asks it every few seconds how much CPU and memory headroom this box has, and how many
+# checks fit beside the box's other work (docs/usage-agent.md). /proc/stat and /proc/meminfo are the host's
+# inside a container, so it needs no privilege and no access to Docker; its one host mount is the box's
+# control groups, read-only. Its image is this repository's (deploy/Dockerfile):
+#
+#   docker build -t lean-pool -f deploy/Dockerfile .
+
+services:
+  agent:
+    image: "${LEAN_SERVER_AGENT_IMAGE:-lean-pool}"
+    restart: unless-stopped
+    command: ["leanpool-agent"]
+    environment:
+      LEANPOOL_AGENT_HOST: 0.0.0.0
+      LEANPOOL_AGENT_PORT: "18200"
+      # The server's worker count, and the cpu.stat of the control group it runs in (as the agent sees the
+      # host's /sys/fs/cgroup, under /host-cgroup): with both, the agent states how many checks fit beside the
+      # box's other work. Empty: its replies leave the open slots out.
+      LEANPOOL_AGENT_WORKERS: "${LEAN_SERVER_MAX_REPLS:-}"
+      LEANPOOL_AGENT_LEAN_CPU_STAT_PATH: "${LEANPOOL_AGENT_LEAN_CPU_STAT_PATH:-}"
+      LEANPOOL_AGENT_CPU_RESERVE: "${LEANPOOL_AGENT_CPU_RESERVE:-}"
+      # The most checks while other work is on the box, a number measured for the box. Empty: no such limit.
+      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: "${LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK:-}"
+    volumes:
+      # The whole tree, because the server's group is made again whenever its container is.
+      - /sys/fs/cgroup:/host-cgroup:ro
+    ports:
+      # HAProxy asks here. IPv4 only, as the server's port.
+      - "0.0.0.0:${LEAN_SERVER_AGENT_PORT:-18200}:18200"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

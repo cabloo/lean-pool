@@ -1,62 +1,89 @@
-# One Lean server box: a Kimina Lean Server and the lean-pool usage agent beside it.
-# docs/deployment.md walks through it (step 2). This file expects, beside it, a file .env:
+# One Lean server: a Kimina Lean Server, hardened. The installer (deploy/install/) runs exactly this file,
+# with the overlays a box needs after it:
+#
+#   compose.agent.yaml            the lean-pool usage agent beside the server, for a box in a pool
+#   compose.tls.yaml              a TLS front on both ports; the server and the agent are then not published
+#   compose.compiled-search.yaml  linarith's search step as compiled code (docs/compiled-search.md)
+#
+# The installer copies them into the instance's directory and writes their list (COMPOSE_FILE), the project's
+# name (COMPOSE_PROJECT_NAME) and every setting into kimina.env there. deploy/README.md lists the settings.
+#
+# Without the installer, put a file .env beside this one with at least
 #
 #   LEAN_SERVER_API_KEY=<the pool's API key>
 #   LEAN_SERVER_MAX_REPLS=<how many checks this box runs at once>
 #
-# The second is the WORKERS number of this box's line in the pool's server list. Then
-# `docker compose up -d --build`.
-#
-# Kimina is not part of lean-pool. This runs the image its own compose.yaml runs; use the image
-# that carries YOUR Lean and Mathlib (KIMINA_IMAGE in .env, see Kimina's README), and the same
-# one on every box of a pool. The admission test (docs/admission.md) checks that before a box
-# is added.
-#
-# This file is plain HTTP. With TLS use compose.tls.yaml instead.
+# then `docker compose up -d`. Kimina is not part of lean-pool: LEAN_SERVER_IMAGE names an image that
+# carries YOUR Lean and Mathlib, the same one on every box of a pool.
 
 name: lean-server
 
 services:
   kimina:
-    image: "${KIMINA_IMAGE:-projectnumina/kimina-lean-server:2.0.0}"
+    image: "${LEAN_SERVER_IMAGE:-projectnumina/kimina-lean-server:2.0.0}"
     restart: unless-stopped
     environment:
-      LEAN_SERVER_API_KEY: "${LEAN_SERVER_API_KEY:?set LEAN_SERVER_API_KEY in .env to the pool's API key}"
-      LEAN_SERVER_MAX_REPLS: "${LEAN_SERVER_MAX_REPLS:?set LEAN_SERVER_MAX_REPLS in .env to this box's worker count}"
-      # How long a check waits for a free worker before Kimina answers 429. The pool proxy is
-      # rendered for this value (--server-wait, 60 by default).
+      LEAN_SERVER_API_KEY: "${LEAN_SERVER_API_KEY:?set LEAN_SERVER_API_KEY to the pool's API key}"
+      # How many checks run at once: the WORKERS of this box's line in the pool's server list. Size it from
+      # the memory one worker takes under load.
+      LEAN_SERVER_MAX_REPLS: "${LEAN_SERVER_MAX_REPLS:?set LEAN_SERVER_MAX_REPLS to this box's worker count}"
+      # Finite on purpose: the REPL keeps every command's state, so a worker's memory grows with use until it
+      # is recycled.
+      LEAN_SERVER_MAX_REPL_USES: "${LEAN_SERVER_MAX_REPL_USES:-200}"
+      # Each worker's ADDRESS-SPACE limit (RLIMIT_AS), not its resident memory.
+      LEAN_SERVER_MAX_REPL_MEM: "${LEAN_SERVER_MAX_REPL_MEM:-8G}"
+      # Seconds a check waits for a free worker before the server answers 429. The pool's proxy is rendered
+      # for this value (--server-wait).
       LEAN_SERVER_MAX_WAIT: "${LEAN_SERVER_MAX_WAIT:-60}"
+      # INFO logs every snippet and every reply.
+      LEAN_SERVER_LOG_LEVEL: "${LEAN_SERVER_LOG_LEVEL:-WARNING}"
     ports:
-      - "8000:8000" # the HOST:PORT of this box's line in the pool's server list
-    # Checking Lean code runs it. Give the Lean server no more than it needs: no capabilities,
-    # no way to gain privileges, a bound on its processes. Add a memory limit that fits the box
-    # (mem_limit), and block new outbound connections from this container in your firewall:
-    # Lean needs no network while it checks.
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+      # The HOST:PORT of this box's line in the pool's server list. IPv4 only, on purpose: an IPv6 listener
+      # is served by Docker's userland proxy, whose connections reach the container from the bridge's gateway
+      # address, and a firewall rule that names the source address would let them all in.
+      - "0.0.0.0:${LEAN_SERVER_PUBLISHED_PORT:-8000}:8000"
+    # A hard memory ceiling for the whole container, and no swap beyond it. 0: none.
+    mem_limit: "${LEAN_SERVER_MEM_LIMIT:-0}"
+    memswap_limit: "${LEAN_SERVER_MEM_LIMIT:-0}"
+    # A CPU ceiling, so other work on the box always keeps the rest. Each worker runs on one core, so this also
+    # bounds how many checks make progress at once. 0: none.
+    cpus: "${LEAN_SERVER_CPUS:-0}"
+    # A control group of the server's own (empty: where Docker puts every container). The installer makes one
+    # whose CPU weight is the lowest there is, so other work on the box gets a contended CPU first.
+    cgroup_parent: "${LEAN_SERVER_CGROUP_PARENT:-}"
     pids_limit: 4096
-
-  agent:
-    image: lean-pool
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile
-    restart: unless-stopped
-    command: ["leanpool-agent"]
-    ports:
-      - "18200:18200" # HAProxy asks here, every 5 seconds, how much headroom this box has
-    # /proc/stat and /proc/meminfo are the host's inside a container, so the agent needs no
-    # privilege, no host mount and no access to Docker.
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
-    mem_limit: 128m
+    # Docker's init as the first process. The server closes a worker by killing its process group and
+    # waiting for its parent alone; the orphaned REPL goes to the first process, and a server that IS the first
+    # process never collects it. The zombies hold slots under pids_limit until every check fails.
+    init: true
+    # Checking Lean code runs it (`#eval`): give the server nothing it does not need.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The root filesystem read-only: a check can then change neither Lean, Mathlib nor the REPL for the checks
+    # after it, nor fill the host's disk. The installer turns it on only where the running server was seen to
+    # write nothing else (read-only-check.sh) and a real check then passed.
+    read_only: "${LEAN_SERVER_ROOT_READ_ONLY:-false}"
+    tmpfs:
+      # Kimina writes its workers' error output here. In memory, counted against the ceiling above: filling it
+      # costs this server memory, not the host its disk. Nothing in it runs.
+      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev
+    healthcheck:
+      # Liveness only: /health does not exercise a worker. The installer's `kimina-ctl check` runs a real check.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
+
+networks:
+  default:
+    # A fixed subnet, so a firewall can name this project's traffic: the installer's kimina-firewall drops every
+    # connection that STARTS from it. The server only answers; Lean needs no network while it checks.
+    ipam:
+      config:
+        - subnet: "${LEAN_SERVER_SUBNET:-172.29.53.0/24}"

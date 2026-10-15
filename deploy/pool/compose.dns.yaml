@@ -1,0 +1,11 @@
+# A DNS server for the pool's proxy, added after the other files:
+#
+#   docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml up -d
+#
+# For Lean servers named on a LAN (lean-a.lan) that Docker's own resolver does not know: the proxy looks every
+# server name up again every few seconds, so a box whose address changes is followed (docs/haproxy.md).
+
+services:
+  haproxy:
+    dns:
+      - "${LEANPOOL_DNS:?set LEANPOOL_DNS to a DNS server that knows the Lean servers' names}"

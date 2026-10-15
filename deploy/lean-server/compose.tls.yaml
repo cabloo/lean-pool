@@ -1,10 +1,13 @@
-# One Lean server box with TLS: the Kimina Lean Server and the usage agent publish nothing
-# themselves. A TLS front (HAProxy in TCP mode, the same image as the pool's proxy) stands on
-# their two ports, lets in only the pool proxy's client certificate, and passes what it accepts
-# to them unchanged. docs/tls.md walks through it (steps 2 to 4). This file expects, beside it:
+# A Lean server box with TLS, added after compose.yaml and compose.agent.yaml:
 #
-#   .env                  as for compose.yaml
-#   tls/box.pem           this box's certificate followed by its private key
+#   docker compose -f compose.yaml -f compose.agent.yaml -f compose.tls.yaml up -d
+#
+# The server and the usage agent then publish nothing themselves. A TLS front (HAProxy in TCP mode, the same
+# image as the pool's proxy) stands on their two ports, lets in only the pool proxy's client certificate, and
+# passes what it accepts to them unchanged over this project's own network. docs/tls.md says who holds which
+# key. This file expects, beside it:
+#
+#   tls/box.pem           this box's certificate followed by its private key, readable by HAProxy's group only
 #   tls/ca.crt            the pool authority's certificate
 #   front/haproxy.cfg     the front's configuration:
 #
@@ -12,74 +15,44 @@
 #       --tls-server-pem /etc/leanpool/tls/box.pem --tls-ca-file /etc/leanpool/tls/ca.crt \
 #       --proxy-client-name lean-pool-proxy \
 #       --lean-upstream kimina:8000 --agent-upstream agent:18200 > front/haproxy.cfg
-#
-# box.pem holds a private key: let the group HAProxy's image runs as read it, and nobody else:
-#
-#   gid=$(docker run --rm --network none --entrypoint id haproxy:3.0 -g)
-#   sudo chgrp "$gid" tls tls/box.pem && chmod 0750 tls && chmod 0640 tls/box.pem
-#
-# Then `docker compose -f compose.tls.yaml up -d --build`.
-
-name: lean-server
 
 services:
+  kimina:
+    # Not published: between the front and the server, checks are plain, so that hop stays on this project's
+    # own network.
+    ports: !reset []
+
+  agent:
+    ports: !reset []
+
   front:
-    image: haproxy:3.0
+    image: "${LEAN_SERVER_FRONT_IMAGE:-haproxy:3.0}"
     restart: unless-stopped
     ports:
-      - "8000:8000" # the Lean server, to the pool proxy only
-      - "18200:18200" # the usage agent, to the pool proxy only
+      # The ports the server and the agent would publish themselves. IPv4 only, as theirs.
+      - "0.0.0.0:${LEAN_SERVER_PUBLISHED_PORT:-8000}:8000"
+      - "0.0.0.0:${LEAN_SERVER_AGENT_PORT:-18200}:18200"
     volumes:
-      # Directories, not files: see the note on reloading in ../pool/compose.yaml.
+      # Directories, not files: a new config or certificate is moved into place and HAProxy told to reload
+      # from inside the container (`kill -HUP 1`). Never `docker kill -s HUP`: Docker counts a container it
+      # signalled as stopped by hand, and `restart: unless-stopped` would then not bring it back after a reboot.
       - ./front:/usr/local/etc/haproxy:ro
       - ./tls:/etc/leanpool/tls:ro
-    depends_on:
-      - kimina
-      - agent
+    depends_on: [kimina, agent]
+    networks:
+      default:
+        # Fixed: a firewall that blocks connections starting from this network can let this one address out,
+        # to the server and the agent beside it. The server still starts none.
+        ipv4_address: "${LEAN_SERVER_FRONT_ADDRESS:-172.29.53.250}"
     read_only: true
-    tmpfs:
-      - /tmp
-      - /run
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    tmpfs: ["/tmp", "/run"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 2
+    pids_limit: 256
     logging:
       driver: json-file
       options:
         max-size: "20m"
         max-file: "5"
-
-  kimina:
-    image: "${KIMINA_IMAGE:-projectnumina/kimina-lean-server:2.0.0}"
-    restart: unless-stopped
-    environment:
-      LEAN_SERVER_API_KEY: "${LEAN_SERVER_API_KEY:?set LEAN_SERVER_API_KEY in .env to the pool's API key}"
-      LEAN_SERVER_MAX_REPLS: "${LEAN_SERVER_MAX_REPLS:?set LEAN_SERVER_MAX_REPLS in .env to this box's worker count}"
-      LEAN_SERVER_MAX_WAIT: "${LEAN_SERVER_MAX_WAIT:-60}"
-    # No ports: between the front and the Lean server checks are plain, so that hop stays on
-    # this compose project's own network.
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
-    pids_limit: 4096
-
-  agent:
-    image: lean-pool
-    build:
-      context: ../..
-      dockerfile: deploy/Dockerfile
-    restart: unless-stopped
-    command: ["leanpool-agent"]
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - "no-new-privileges:true"
-    mem_limit: 128m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
