@@ -7,7 +7,7 @@ establishes.
 ## The test suite
 
 Two kinds of tests, neither of which needs Docker, the network or a Lean server. Lean servers
-are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 1,500 test
+are in-process fakes that speak Kimina's interface. `uv run pytest` runs about 2,200 test
 cases.
 
 ### Tests that always run
@@ -84,7 +84,16 @@ cases.
   library that is not loaded, answers differently, is handed to a program a tactic starts,
   or is not 3 times faster; and what `make.sh` installs over a stand-in for Docker, when
   the check passes and when anything fails. The real build and check need a Lean with
-  Mathlib and are not part of the suite.
+  Mathlib, and run only where one is present;
+* the [installers](../deploy/install/README.md) (`tests/install/`), on a fake machine: copies
+  whose host paths point into a fake root directory, and stand-ins for Docker, systemd, the
+  firewall's tools and the package managers, whose Docker refuses a file read that a
+  container's user could not make. A host with two Lean servers, the pool put in front of one,
+  the control commands,
+  joins over real HTTPS with the real join service, refreshes, the compose plugin's install,
+  the firewall rules, uninstalls; every refusal before root is asked for; and an instance whose
+  image is pulled by name instead of built. They need a user who is not root, and are skipped
+  when run as root.
 
 ### Tests that run only where `haproxy` is installed
 
@@ -201,8 +210,9 @@ run.
 ## The deployment's record
 
 lean-pool has been in use since 3 October 2026 in the deployment it was written for. That
-deployment installs and operates the pool with scripts of its own, which are not part of this
-project; what it runs are this project's commands, this project's image and the configuration
+deployment installs and operates the pool with this project's
+[installers](../deploy/install/README.md) and a site directory of its own; what it runs are
+this project's commands, this project's image and the configuration
 this project generates, on the official `haproxy:3.0` image, in front of Kimina Lean Servers
 built from Kimina's source (commit `fb2393d`) with Lean 4.27. These are observations of one
 deployment, each made once unless it says otherwise. They are not benchmarks.
@@ -303,8 +313,13 @@ address. Its single and its batched requests were answered, and repeats came fro
   them in CI; only the demo's compose file is started there.
 * **Kimina's published image has not been used.** The deployment builds Kimina from source at
   one commit. The fakes and the stand-in follow Kimina's interface as read from that source.
+  The installers' example site names that image, and pulling it has run only on the fake
+  machine.
+* **The installers in `deploy/install/` are the deployment's own**, but the deployment runs
+  them with a site of its own and builds its images from recipes. `site.example/` has not
+  been installed on a real host.
 * **The compiled search step's `make.sh` and compose file have not been run as written.**
-  The deployment ran the same build, check and launcher through an installer of its own;
+  The deployment ran the same build, check and launcher through the installers;
   here those three have been run as written against a real Lean, outside Docker. And the
   check compares three proofs: it does not show that the compiled search and the
   interpreted one agree on every input

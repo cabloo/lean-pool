@@ -236,9 +236,9 @@ configuration.
 | `leanpool-pki` | The pool's certificate authority: issues, signs and inspects certificates. |
 | `leanpool-join` | An HTTPS service that carries a new box's signing request to the pool and its certificate back. It executes nothing: the script a box runs and whatever acts on a request are yours. |
 
-The code is typed (`mypy --strict`), linted, and held to about 1,500 test cases, among them
+The code is typed (`mypy --strict`), linted, and held to about 2,200 test cases, among them
 ones that run a real HAProxy on the generated configuration and take servers and the cache away
-under load.
+under load, and ones that run the installers on a fake machine.
 
 ## Status
 
