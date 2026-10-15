@@ -126,6 +126,9 @@ import time
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, "__TESTS__")                              # tests/compose_files.py: how Compose reads a project
+import compose_files  # noqa: E402
+
 STUB = Path(os.environ["STUB"])
 STATE = STUB / "state"
 PROJECT = os.environ["STUB_LEAN_POOL"]
@@ -188,15 +191,53 @@ def is_running(name):
     return (STATE / "running" / name).exists()
 
 
-def substitute(text, env):
-    def value(match):
-        name, default = match.group(1), match.group(3)
-        if env.get(name):
-            return env[name]
-        if match.group(2) == ":?":
-            fail(f"required variable {name} is missing a value: {default}")
-        return default or ""
-    return re.sub(r"\$\{([A-Z_]+)(?:(:-|:\?)([^}]*))?\}", value, text)
+def compose_project(args):
+    """The options of a `docker compose` call, and the project its files make: (verb arguments, project name,
+    the resolved project, its files). Compose's own rules: `-p` first, then COMPOSE_PROJECT_NAME, then the
+    files' `name:`; the env file's values below the shell's."""
+    project = env_file = None
+    files = []
+    while args and args[0].startswith("-"):
+        if args[0] in ("--project-name", "-p"):
+            project = args[1]
+        elif args[0] == "--env-file":
+            env_file = Path(args[1])
+        elif args[0] == "-f":
+            files.append(Path(args[1]))
+        else:
+            fail(f"docker compose: unknown option {args[0]}")
+        args = args[2:]
+    for needed in (env_file, *files):
+        if needed is None or not needed.is_file():
+            fail(f"docker compose: {needed}: no such file")
+    if not files:
+        fail("docker compose: no configuration file provided: not found")
+    env = dict(line.split("=", 1) for line in env_file.read_text().splitlines() if "=" in line and not line.startswith("#"))
+    env.update(os.environ)                                       # the shell's environment comes first, as for compose
+    try:
+        resolved = compose_files.resolve(files, env)
+    except compose_files.MissingSetting as error:
+        fail(str(error))
+    project = project or env.get("COMPOSE_PROJECT_NAME") or resolved.get("name") or files[0].parent.name
+    return args, project, resolved, files
+
+
+def made_of(project, resolved):
+    """Each container the project makes, by its name: the service's name and settings."""
+    return {compose_files.container_name(project, name, service): (name, service)
+            for name, service in (resolved.get("services") or {}).items()}
+
+
+def environment_of(service):
+    environment = service.get("environment") or {}
+    if isinstance(environment, list):
+        environment = dict(item.split("=", 1) for item in environment if "=" in item)
+    return environment
+
+
+def mount_targets(service):
+    """Where a container's volumes are mounted inside it."""
+    return [compose_files._volume_target(volume) for volume in service.get("volumes") or []]
 
 
 def compose(args):
@@ -207,41 +248,34 @@ def compose(args):
         fail("docker: 'compose' is not a docker command.")
     if args == ["version"]:
         return 0
-    project = env_file = compose_file = None
-    while args and args[0].startswith("-"):
-        if args[0] == "--project-name":
-            project = args[1]
-        elif args[0] == "--env-file":
-            env_file = Path(args[1])
-        elif args[0] == "-f":
-            compose_file = Path(args[1])
-        else:
-            fail(f"docker compose: unknown option {args[0]}")
-        args = args[2:]
-    for needed in (env_file, compose_file):
-        if needed is None or not needed.is_file():
-            fail(f"docker compose: {needed}: no such file")
-    env = dict(line.split("=", 1) for line in env_file.read_text().splitlines() if "=" in line and not line.startswith("#"))
-    env.update(os.environ)                                       # the shell's environment comes first, as for compose
-    resolved = substitute("\n".join(line for line in compose_file.read_text().splitlines() if not line.lstrip().startswith("#")), env)
-    services = restart_policies(resolved)                        # container name -> its `restart:` policy
-    with_init = containers_with_init(resolved)                   # the containers whose service says `init: true`
-    made_from = {service["name"]: service for service in service_settings(resolved)}
+    args, project, resolved, files = compose_project(args)
+    containers = made_of(project, resolved)
     verb = args[0] if args else ""
     if verb == "up":
+        wanted = [argument for argument in args[1:] if not argument.startswith("-")]
         # Docker makes no container with a memory ceiling under 6 MB, and says so before it makes any.
-        for service in made_from.values():
-            if 0 < memory_bytes(service.get("mem_limit", "")) < 6 * 1024 ** 2:
+        for _, service in containers.values():
+            if 0 < memory_bytes(str(service.get("mem_limit", ""))) < 6 * 1024 ** 2:
                 fail("Error response from daemon: Minimum memory limit allowed is 6MB")
-        (STATE / f"project.{project}").write_text("up")          # the project (and its network) exists
-        (STATE / f"resolved.{project}.{compose_file.name}").write_text(resolved)    # what compose made it from
-        for name, policy in services.items():
+        (STATE / f"project.{project}").write_text("up")
+        (STATE / f"resolved.{project}").write_text(json.dumps(resolved, sort_keys=True, indent=1))   # what compose made it from
+        (STATE / f"files.{project}").write_text("\n".join(str(path) for path in files))
+        for network in compose_files.network_names(project, resolved).values():
+            (STATE / f"network.{network}").write_text(project)   # the project's networks exist while it is up
+        for volume, settings in (resolved.get("volumes") or {}).items():
+            if not (settings or {}).get("external"):
+                holder = STATE / f"volume.{(settings or {}).get('name') or project + '_' + volume}"
+                if not holder.exists():
+                    holder.write_text(project)
+        for name, (service_name, service) in containers.items():
+            if wanted and service_name not in wanted:
+                continue
             # A service is made again when ITS OWN settings changed (or its image was built again), not
-            # when another service of the same file did: the real compose compares each service's config.
-            digest = hashlib.sha256(made_from[name]["text"].encode()).hexdigest()
-            for image in re.findall(r"image: (\S+)", made_from[name]["text"]):
-                mark = STATE / ("built." + image.replace("/", "_").replace(":", "_"))
-                digest = hashlib.sha256((digest + (mark.read_text() if mark.exists() else "")).encode()).hexdigest()
+            # when another service of the project did: the real compose compares each service's config.
+            digest = hashlib.sha256(json.dumps(service, sort_keys=True).encode()).hexdigest()
+            image = str(service.get("image", ""))
+            mark = STATE / ("built." + image.replace("/", "_").replace(":", "_"))
+            digest = hashlib.sha256((digest + (mark.read_text() if mark.exists() else "")).encode()).hexdigest()
             known = STATE / f"service.{project}.{name}"
             changed = "--force-recreate" in args or not known.exists() or known.read_text() != digest
             known.write_text(digest)
@@ -251,36 +285,39 @@ def compose(args):
                 (STATE / f"id.{name}").write_text(uuid.uuid4().hex)
                 (STATE / f"by-hand.{name}").unlink(missing_ok=True)      # a new container: nobody stopped it
                 (STATE / f"restarts.{name}").unlink(missing_ok=True)
-                if name in with_init:                                    # how it was made: asked of `inspect` later
+                if service.get("init") in (True, "true"):                # how it was made: asked of `inspect` later
                     (STATE / f"init.{name}").write_text("")
                 else:
                     (STATE / f"init.{name}").unlink(missing_ok=True)
-                (STATE / f"cgroup-parent.{name}").write_text(made_from[name].get("cgroup_parent", ""))
-                (STATE / f"memory.{name}").write_text(str(memory_bytes(made_from[name].get("mem_limit", ""))))
-                program = re.search(r"LEAN_SERVER_REPL_PATH: *(\S+)", made_from[name]["text"])
+                (STATE / f"cgroup-parent.{name}").write_text(str(service.get("cgroup_parent") or ""))
+                (STATE / f"memory.{name}").write_text(str(memory_bytes(str(service.get("mem_limit", "")))))
+                (STATE / f"image.{name}").write_text(image)
+                program = environment_of(service).get("LEAN_SERVER_REPL_PATH")
                 if program:                                              # the program a worker is: as it was MADE
-                    (STATE / f"repl-path.{name}").write_text(program.group(1))
+                    (STATE / f"repl-path.{name}").write_text(str(program))
                 else:
                     (STATE / f"repl-path.{name}").unlink(missing_ok=True)
                 # Whether its root filesystem is read-only, and where its volumes are mounted inside it.
-                read_only = re.search(r"\n    read_only: *(\S+)", "\n" + made_from[name]["text"])
-                (STATE / f"read-only.{name}").write_text(read_only.group(1) if read_only else "false")
-                (STATE / f"mounts.{name}").write_text(" ".join(re.findall(r"\n      - [^:\n]+:(/[^:\s]*)", made_from[name]["text"])))
+                (STATE / f"read-only.{name}").write_text(str(service.get("read_only", False)).lower())
+                (STATE / f"mounts.{name}").write_text(" ".join(mount_targets(service)))
                 note("recreated", name)
             holder.write_text(project)
-            (STATE / f"policy.{name}").write_text(policy)
+            (STATE / f"policy.{name}").write_text(str(service.get("restart", "no")))
             (STATE / "running" / name).write_text("")
         return 0
     if verb == "down":
-        for name in services:
+        for name in containers:
             (STATE / "running" / name).unlink(missing_ok=True)
             (STATE / f"label.{name}").unlink(missing_ok=True)
         (STATE / f"project.{project}").unlink(missing_ok=True)
-        for known in [*STATE.glob(f"service.{project}.*"), *STATE.glob(f"resolved.{project}.*")]:
-            known.unlink()
+        for network in compose_files.network_names(project, resolved).values():
+            (STATE / f"network.{network}").unlink(missing_ok=True)
+        for known in [*STATE.glob(f"service.{project}.*"), STATE / f"resolved.{project}", STATE / f"files.{project}"]:
+            known.unlink(missing_ok=True)
+        note("downs", project)
         return 0
     if verb == "ps":
-        for name in services:
+        for name in containers:
             print(f"{name}   {'Up' if is_running(name) else 'Exited'}")
         return 0
     return 0
@@ -290,47 +327,6 @@ def memory_bytes(size):
     """A compose size (`28g`, `512m`) in bytes; 0 for none."""
     match = re.fullmatch(r"([0-9]+)([gGmM])", size)
     return int(match.group(1)) * (1024 ** 3 if match.group(2) in "gG" else 1024 ** 2) if match else 0
-
-
-def restart_policies(resolved):
-    """Each service's container name and `restart:` policy, from a resolved compose file."""
-    return {service["name"]: service["policy"] for service in service_settings(resolved)}
-
-
-def containers_with_init(resolved):
-    """The container names of the services that ask for an init process (`init: true`)."""
-    return {service["name"] for service in service_settings(resolved) if service.get("init")}
-
-
-def service_settings(resolved):
-    """What the stand-in reads of each service that names its container: the name, `restart:`, `init:`, the
-    control group it is started in (`cgroup_parent:`), its memory ceiling (`mem_limit:`), and the service's
-    own lines (`text`)."""
-    found, current, inside = [], None, False
-    for line in resolved.splitlines():
-        if line.startswith("services:"):
-            inside = True
-            continue
-        if inside and line and not line.startswith(" "):
-            inside = False
-        if not inside:
-            continue
-        if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", line):
-            current = {"policy": "no", "text": ""}
-            found.append(current)
-        if current is not None:
-            current["text"] += line + "\n"
-        if current is not None and re.fullmatch(r"    cgroup_parent: *(\S*)\s*", line):
-            current["cgroup_parent"] = re.fullmatch(r"    cgroup_parent: *(\S*)\s*", line).group(1)
-        elif current is not None and re.match(r"    container_name: (\S+)", line):
-            current["name"] = re.match(r"    container_name: (\S+)", line).group(1)
-        elif current is not None and re.match(r"    restart: (\S+)", line):
-            current["policy"] = re.match(r"    restart: (\S+)", line).group(1)
-        elif current is not None and re.fullmatch(r"    init: true\s*", line):
-            current["init"] = True
-        elif current is not None and re.fullmatch(r"    mem_limit: *(\S*)\s*", line):
-            current["mem_limit"] = re.fullmatch(r"    mem_limit: *(\S*)\s*", line).group(1)
-    return [service for service in found if "name" in service]
 
 
 def crash_loops(name):
@@ -847,8 +843,8 @@ def main():
         if argv[2] == "bridge":
             print(os.environ.get("STUB_BRIDGE", "172.17.0.1"))
             return 0
-        # A network exists once the compose project that makes it has been brought up (they share a name here).
-        if not (STATE / f"project.{argv[2]}").exists():
+        # A network exists while the compose project that makes it is up.
+        if not (STATE / f"network.{argv[2]}").exists():
             fail(f"Error response from daemon: network {argv[2]} not found")
         return 0
     if verb == "stats":                                      # stats --no-stream --format TEMPLATE NAME: one line
@@ -1143,7 +1139,7 @@ class Machine:
         def real(text: str) -> str:  # the real tools, by where they really are
             for name in ("install", "mv", "id", "sleep", "date", "uname", "ps"):
                 text = text.replace(f"__REAL_{name}__", shutil.which(name) or name)
-            return text.replace("__PYTHON__", python)
+            return text.replace("__PYTHON__", python).replace("__TESTS__", str(Path(__file__).resolve().parents[1]))
 
         (self.stub / "bin" / "docker").write_text(real(DOCKER))
         for name in ("install", "chown", "mv"):
