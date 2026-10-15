@@ -11,11 +11,11 @@ of yours) decides: validates what the box sent, signs with `leanpool-pki sign-cs
 `leanpool-admit` against the box alone, adds it to the server list. The service only moves the
 files, so it can run as an unprivileged, read-only container that holds no authority key.
 
-**What this project ships is the service, and it is one half of a join.** The other half is
-yours: the script a new box runs, and whatever acts on the spool on the pool's host. Both are a
-handful of this project's commands, shown [below](#one-join-step-by-step); the deployment this
-project was written for wraps them in scripts of its own, with its own installer, firewall and
-paths, which is why they are not here.
+**The service is one half of a join.** The other half is the script a new box runs, and
+whatever acts on the spool on the pool's host. Both are a handful of this project's commands,
+shown [below](#one-join-step-by-step). The [installers](../deploy/install/README.md) are one
+way to run that half: `lean-pool-ctl NAME join-open` opens a window, serves the script a box
+runs (`join-box.sh`) and acts on the spool. A pool set up by hand runs the commands below.
 
 ## A join window
 

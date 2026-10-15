@@ -25,6 +25,13 @@ A week of running the pool on boxes that also do other work.
 
 ### Added
 
+- **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
+  its pool and its joining boxes with, now in this repository, with their tests
+  (`tests/install/`, on a fake machine). A deployment's own values live in a site directory
+  given with `--site`; `site.example/` is an example site with one instance, which pulls
+  Kimina's published image: an instance file may name an image to pull (`INSTANCE_IMAGE`)
+  instead of a recipe to build
+  ([deploy/install/README.md](deploy/install/README.md)).
 - **Open slots.** A usage agent that is given the Lean server's worker count and its control
   group's `cpu.stat` states how many checks fit beside the box's other work, counted in cores,
   and HAProxy sends the box no more (`--workers`, `--lean-cpu-stat-path`, `--cpu-reserve`,

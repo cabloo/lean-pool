@@ -138,7 +138,8 @@ reply    = "ready up N% maxconn:S"   S open slots, 1 or more
 
 ### Giving the agent what it needs
 
-Both settings are the box's to arrange, and the compose files in [`deploy/`](../deploy) do not
+Both settings are the box's to arrange, and the compose files in
+[`deploy/lean-server/`](../deploy/lean-server) do not
 arrange them: an agent started from those answers with a weight alone.
 
 * **A control group for the Lean server alone.** With Docker under systemd, start the Lean
@@ -153,5 +154,6 @@ arrange them: an agent started from those answers with a weight alone.
   read-only). `/proc` and the CPU topology under `/sys` are the host's in a container already.
 
 That is how the deployment this project was written for runs it
-([its record](verification.md#the-deployments-record)); its installer, which writes the slice
-and these settings, is specific to it and is not shipped.
+([its record](verification.md#the-deployments-record)), and how the
+[installers](../deploy/install/README.md) set a box up: `install_cpu_priority` in `pool-lib.sh`
+writes the slice and these settings.

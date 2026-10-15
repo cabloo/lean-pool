@@ -1,0 +1,82 @@
+# The TLS front of one Lean server instance, and the usage agent behind it: with TLS a box publishes
+# neither its Lean server nor its usage agent, only this front.
+#
+# Installed by pool-lib.sh's install_tls_front into the instance's directory (/srv/kimina-NAME), for the
+# pool host's own server and for a box that joined. Every ${VAR} comes from that directory's kimina.env.
+#
+# The front is HAProxy in TCP mode (the same pinned image as the pool's proxy). On the instance's Lean port
+# and usage port it terminates TLS 1.3, requires the pool proxy's client certificate, and forwards what it
+# accepts, unchanged, to the Lean server and to the agent over the instance's own Docker network.
+services:
+  front:
+    image: ${KIMINA_FRONT_IMAGE:?set by install_tls_front}
+    container_name: ${KIMINA_FRONT_CONTAINER:?set by install_tls_front}
+    restart: unless-stopped
+    ports:
+      # The ports the Lean server and the agent used to publish themselves. IPv4 only, like them: the LAN
+      # rules in DOCKER-USER name the source address and match these ORIGINAL ports, whoever publishes them.
+      - "0.0.0.0:${KIMINA_PORT:?set by install.sh}:${KIMINA_PORT}"
+      - "0.0.0.0:${KIMINA_AGENT_PORT:?set by install_tls_front}:${KIMINA_AGENT_PORT}"
+    volumes:
+      # Directories, not files: a new config or certificate is moved into place and HAProxy is told to
+      # reload from inside the container (`kill -HUP 1`; never `docker kill`, see reload_if_kept).
+      - ./front:/usr/local/etc/haproxy:ro
+      # box.pem (this box's certificate and private key) and ca.crt (the pool authority's). The directory
+      # and box.pem belong to the group HAProxy's image runs as, read from the image at install time.
+      - ./tls:/etc/leanpool/tls:ro
+    read_only: true
+    tmpfs: ["/tmp", "/run"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 2
+    pids_limit: 256
+    networks:
+      kimina:
+        # FIXED: kimina-firewall lets this one address, and no other on the network, start a connection
+        # to the network (KIMINA-FRONT-NAME). The Lean server beside it still starts none.
+        ipv4_address: ${KIMINA_FRONT_ADDRESS:?set by install_tls_front}
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  agent:
+    # The usage agent of docker-compose.agent.yml, without a published port: the front carries its port.
+    image: ${KIMINA_AGENT_IMAGE:?set by install_tls_front}
+    container_name: ${KIMINA_AGENT_CONTAINER:?set by install_tls_front}
+    restart: unless-stopped
+    command: ["leanpool-agent"]
+    environment:
+      LEANPOOL_AGENT_HOST: 0.0.0.0
+      LEANPOOL_AGENT_PORT: "18200"
+      # Open slots: with the server's worker count and the cpu.stat of the
+      # control group the Lean server runs in, the agent states how many checks fit beside the box's other
+      # work. The installer leaves the second EMPTY on a box that has no such group (pool-lib.sh,
+      # install_cpu_priority); the agent's replies then leave the open slots out.
+      LEANPOOL_AGENT_WORKERS: ${KIMINA_MAX_REPLS:-}
+      LEANPOOL_AGENT_LEAN_CPU_STAT_PATH: ${KIMINA_AGENT_LEAN_CPU_STAT:-}
+      LEANPOOL_AGENT_CPU_RESERVE: ${KIMINA_AGENT_CPU_RESERVE:-}
+      # The most checks while other work is on the box: a number measured for the box.
+      # Empty: no such limit. `kimina-ctl set-beside` changes it.
+      LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: ${KIMINA_AGENT_BESIDE_OTHER_WORK:-}
+    volumes:
+      # The box's control groups, read-only: where the Lean server's own CPU use is read. The whole tree,
+      # because the server's group is made again whenever its container is.
+      - /sys/fs/cgroup:/host-cgroup:ro
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    networks: [kimina]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  kimina:
+    # The Lean server's own network, made by its compose project with a fixed subnet.
+    name: ${KIMINA_NETWORK:?set by install.sh}
+    external: true

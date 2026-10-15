@@ -1,0 +1,85 @@
+# The lean-pool front door for one pool: HAProxy (the address every Lean check is sent to) and the result
+# cache behind it.
+#
+# Installed by install-pool.sh into /srv/lean-pool-NAME (root-owned) and driven from there by
+# /usr/local/sbin/lean-pool-ctl. Every ${VAR} comes from that directory's pool.env.
+#
+# The cache shares the proxy's network namespace: HAProxy reaches it on 127.0.0.1:18102, and it reaches
+# HAProxy's loopback-only door to the Lean servers on 127.0.0.1:18101. Only the public port leaves the box.
+#
+# TLS: the public port serves HTTPS and every Lean server is reached over mutual TLS. The
+# hops on loopback inside this namespace stay plain: they never reach a wire.
+services:
+  proxy:
+    image: ${POOL_HAPROXY_IMAGE:?set by install-pool.sh}
+    container_name: ${SITE_PREFIX:?set by the installer and lean-pool-ctl}-proxy-${POOL_NAME:?set by install-pool.sh}
+    restart: unless-stopped
+    ports:
+      # IPv4 only, like the Lean servers: the LAN rule in DOCKER-USER names the source address.
+      - "0.0.0.0:${POOL_PUBLIC_PORT:-18100}:${POOL_PUBLIC_PORT:-18100}"
+    volumes:
+      # A DIRECTORY, not the file: a new haproxy.cfg is moved into place and HAProxy is told to reload, from
+      # inside the container (`kill -HUP 1`). Never `docker kill`: with `restart: unless-stopped`, a container
+      # Docker itself signalled counts as stopped by hand and would not come back after a reboot.
+      - ./haproxy:/usr/local/etc/haproxy:ro
+      # front.pem (the front door's certificate and key), proxy-client.pem (what the proxy shows every Lean
+      # server) and ca.crt. The directory and the two .pem files belong to the group HAProxy's image runs
+      # as, read from the image by install-pool.sh; nobody else may read a key. The authority's own key is
+      # NOT here: it stays in ./pki, which no running container mounts.
+      - ./tls:/etc/leanpool/tls:ro
+    # Lean servers on other boxes are named on the LAN; Docker's default resolver may not know the LAN.
+    dns:
+      - ${POOL_DNS:?set by install-pool.sh}
+    read_only: true
+    tmpfs: ["/tmp", "/run"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 2
+    networks: [pool]
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  cache:
+    image: ${POOL_IMAGE:?set by install-pool.sh}
+    container_name: ${SITE_PREFIX}-cache-${POOL_NAME}
+    restart: unless-stopped
+    command: ["leanpool-cache"]
+    network_mode: "service:proxy"
+    depends_on: [proxy]
+    environment:
+      # Part of every cache key: it names the pool's Lean and Mathlib, so a new image empties the cache.
+      LEANPOOL_CACHE_PIN: ${POOL_PIN:?set by install-pool.sh}
+      LEANPOOL_CACHE_API_KEY_FILE: /run/pool/api-key
+      LEANPOOL_CACHE_MAX_BYTES: ${POOL_CACHE_MAX_BYTES:-4294967296}
+      LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS: ${POOL_CACHE_UPSTREAM_TIMEOUT:?set by install-pool.sh}
+      LEANPOOL_CACHE_MAX_REQUEST_BYTES: ${POOL_MAX_REQUEST_BYTES:-262144}
+    volumes:
+      - cache-data:/var/lib/leanpool
+      - ./api-key:/run/pool/api-key:ro
+      # The authority's certificate (public): lean-pool-ctl checks the pool through its HTTPS front door
+      # from inside this container.
+      - ./certs/ca.crt:/run/pool/ca.crt:ro
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    cpus: 2
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+networks:
+  pool:
+    name: ${SITE_PREFIX}-pool-${POOL_NAME}
+    ipam:
+      config:
+        # Fixed, so the proxy reaches this box's own Lean server at the gateway address (an IPv4 literal:
+        # HAProxy's run-time resolver cannot see /etc/hosts names such as host.docker.internal).
+        - subnet: ${POOL_SUBNET:-172.29.55.0/24}
+
+volumes:
+  cache-data:
+    name: ${SITE_PREFIX}-cache-${POOL_NAME}

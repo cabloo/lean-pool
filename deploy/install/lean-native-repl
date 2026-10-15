@@ -1,0 +1,27 @@
+#!/bin/sh
+# lean-native-repl - what a Lean pool worker is started as.
+#
+# It starts the image's own REPL, with one library loaded into that process first: linarith's search step
+# as compiled code (lean-native-build.sh makes it, from the C files of the image this container runs).
+# Lean finds a compiled function by its symbol name and calls it in place of interpreting the same
+# function, so nothing else has to be told. What Lean accepts does not change: the search only proposes
+# numbers, and Lean's kernel checks the proof built from them exactly as before.
+#
+# The library is loaded ONLY when it was compiled from the very C files this container holds: the build
+# wrote their names (`sources`) and one hash over them (`built-from`), and the hash is taken again here.
+# Anything else (no library, another image under the same mount, a file that cannot be read) starts the
+# plain REPL, which is what the server ran before this file existed. It never fails for want of the library.
+#
+# LD_PRELOAD is given to the REPL alone. The library removes it from the environment as it is loaded
+# (lean-native-build.sh), so a program a tactic starts (`bv_decide` runs a SAT solver) does not inherit it.
+real=${LEAN_NATIVE_REPL:-/repl/.lake/build/bin/repl}
+here=${LEAN_NATIVE_DIR:-/opt/lean-native}
+library=$here/linarith-search.so
+if [ -r "$library" ] && [ -r "$here/sources" ] && [ -s "$here/built-from" ]; then
+  # shellcheck disable=SC2046  # one path a line, none with a space: lean-native-build.sh refuses any other
+  now=$(sha256sum $(cat "$here/sources") 2>/dev/null | sha256sum | cut -d ' ' -f 1)
+  if [ "$now" = "$(cat "$here/built-from")" ]; then
+    LD_PRELOAD=$library exec "$real" "$@"
+  fi
+fi
+exec "$real" "$@"

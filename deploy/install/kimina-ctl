@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+# kimina-ctl - the ONLY thing an operator's key may do to the Kimina Lean Servers on this host, through the door.
+#
+# install.sh installs it to /usr/local/bin/kimina-ctl (root:root 0755).
+# The operator's machine need not have Docker access: it reaches this script through a dedicated ssh key
+# pinned to it by a forced command in authorized_keys.
+# The key cannot open a shell, forward a port or run anything else; whatever the client asks for arrives
+# as $SSH_ORIGINAL_COMMAND and is matched against the whitelist below. The sudoers rule behind it names
+# this path only.
+#
+# It acts ONLY on /srv/kimina (instance 1) and /srv/kimina-NAME (`@NAME`), which are root-owned and
+# written by install.sh. It never reads the repo, so nothing committed on the operator's machine can change
+# what this script runs. Changing a Dockerfile or compose file means the operator re-runs install.sh.
+#
+#   [@NAME] status                      container state, health, memory, processes and zombies, whether it
+#                                       has an init process, its CPU priority, its memory ceiling beside the
+#                                       box's memory, what its usage agent says, settings (never the key)
+#   [@NAME] check                       one valid and one invalid proof through the live server
+#   [@NAME] logs [N]                    last N server log lines (default 100, max 500)
+#   [@NAME] logs build                  tail of the last image build log
+#   [@NAME] up | down                   start / stop the service
+#   [@NAME] restart                     recreate the container (picks up kimina.env changes)
+#   [@NAME] set-repls N                 set the worker count (1-32) and restart
+#   [@NAME] set-cpus N                  set the CPU ceiling (1-32) and restart
+#   [@NAME] set-mem SIZE                set the memory ceiling (28g, 512m) and restart; the worker count,
+#                                       what one worker may take and the usage agent stay as they are
+#   [@NAME] set-beside N|none          the most checks this box holds while other work is on it (0-32),
+#                                       a number MEASURED for the box; none = no such limit. Only the usage
+#                                       agent is made again: no check in flight is touched
+#   @NAME compiled-search on|off        whether the workers run linarith's search step as compiled code
+#                                       (the library this box's installer made and checked) or the plain
+#                                       REPL; the Lean server is made again, nothing else
+#   [@NAME] read-only on|off            whether the Lean server's root filesystem is read-only;
+#                                       `on` only where the installer's own reading of this server passed.
+#                                       The Lean server is made again, nothing else
+#   [@NAME] show-key                    print the API key (clients need it)
+#
+#   @proxy-NAME status | servers | check | logs [N] | restart | cache-stop | cache-start
+#   @proxy-NAME ca                                         the pool authority's certificate (public)
+#   @proxy-NAME admit HOST:PORT WORKERS [SERVER]           the admission test against one Lean server
+#   @proxy-NAME add-backend SERVER HOST:PORT WORKERS [AGENT_PORT]   admission, then add to the pool
+#   @proxy-NAME remove-backend SERVER
+#   @proxy-NAME pause SERVER | resume SERVER               keep a server listed but send it nothing; resume
+#                                                          runs the admission test again first
+#   @proxy-NAME set-workers SERVER N                       the worker count SERVER is listed with, after its
+#                                                          box's own was changed there
+#   @proxy-NAME join-open [MINUTES]                        open a join window for ONE new box: prints the
+#                                                          command to run there and waits (default 120)
+#                                       the lean-pool front door of pool NAME (HAProxy + cache); these
+#                                       are handed to /usr/local/sbin/lean-pool-ctl after validation here
+#
+# No @NAME is instance 1 (/srv/kimina), the instance with no name. The names of its container and
+# network come from the site this host was installed for (/etc/lean-pool/site.env, written by the installer).
+# A site may put a program of its own in front of this one as the door's (install.sh --door-program): it
+# answers what it adds and hands everything else here unchanged.
+set -uo pipefail
+
+LOG=/var/log/kimina-ctl.log
+SITE_ENV=/etc/lean-pool/site.env
+
+# `sudo` scrubs the environment; the sudoers drop-in env_keeps SSH_ORIGINAL_COMMAND. Fall back to argv
+# (hand invocation), then to the read-only verb.
+cmd=${SSH_ORIGINAL_COMMAND:-${*:-status}}
+
+stamp() { date -u +%FT%TZ; }
+log()   { { printf '%s kimina-ctl[%s]: %s\n' "$(stamp)" "${SSH_CLIENT:-local}" "$*" >> "$LOG"; } 2>/dev/null; }
+refuse() {
+  echo "kimina-ctl: refused '$cmd' - allowed: [@NAME] status | check | logs [N|build] | up | down | restart | set-repls N | set-cpus N | set-mem SIZE | set-beside N|none | read-only on|off | show-key ; @NAME compiled-search on|off ; @proxy-NAME status | servers | check | ca | logs [N] | restart | cache-stop | cache-start | admit HOST:PORT WORKERS [SERVER] | add-backend SERVER HOST:PORT WORKERS [AGENT_PORT] | remove-backend SERVER | pause SERVER | resume SERVER | set-workers SERVER N | join-open [MINUTES]" >&2
+  log "REFUSED: ${cmd}"
+  exit 2
+}
+
+# Letters, digits, spaces, hyphens, underscores, dots, colons and one leading @: nothing that could reach
+# a shell or a path. Each argument is validated again, strictly, per verb below.
+[[ "$cmd" =~ ^[A-Za-z0-9@._:\ -]{1,200}$ ]] || refuse
+# shellcheck disable=SC2086
+set -- $cmd
+
+# The pool's front door: validate, then hand over to lean-pool-ctl (which validates again and does the work).
+if [[ "${1:-}" =~ ^@proxy-([a-z0-9]{1,16})$ ]]; then
+  pool=${BASH_REMATCH[1]}
+  shift
+  pool_verb=${1:-status}
+  [ "$#" -ge 1 ] && shift
+  # A server that is added is named by ONE DNS label in lower case (it is the name on its certificate, and
+  # a dotted name could be one of the pool's own); one that is removed, paused or resumed may have an older
+  # list's name.
+  server_name='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+  listed_name='^[A-Za-z0-9_.-]{1,40}$'
+  server_address='^[A-Za-z0-9.-]{1,120}:[0-9]{2,5}$'
+  count='^[0-9]{1,3}$'
+  case "$pool_verb" in
+    status|servers|check|ca|restart|cache-stop|cache-start) [ "$#" -eq 0 ] || refuse ;;
+    logs) [ "$#" -le 1 ] || refuse
+          [ "$#" -eq 0 ] || { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 500 ]; } || refuse ;;
+    admit)
+      { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } && [[ "$1" =~ $server_address ]] && [[ "$2" =~ $count ]] || refuse
+      [ "$#" -eq 2 ] || [[ "$3" =~ $server_name ]] || refuse ;;
+    add-backend)
+      { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } && [[ "$1" =~ $server_name ]] && [[ "$2" =~ $server_address ]] && [[ "$3" =~ $count ]] || refuse
+      [ "$#" -eq 3 ] || [[ "$4" =~ ^[0-9]{2,5}$ ]] || refuse ;;
+    remove-backend|pause|resume) [ "$#" -eq 1 ] && [[ "$1" =~ $listed_name ]] || refuse ;;
+    set-workers) [ "$#" -eq 2 ] && [[ "$1" =~ $listed_name ]] && [[ "$2" =~ $count ]] || refuse ;;
+    join-open)
+      # How long the window stays open, in minutes. The window's token is made by lean-pool-ctl, never
+      # sent through here, and appears only in the command it prints for the new box.
+      [ "$#" -le 1 ] || refuse
+      [ "$#" -eq 0 ] || { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 1440 ]; } || refuse
+      [ "$#" -eq 0 ] || set -- --minutes "$1" ;;
+    *) refuse ;;
+  esac
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "kimina-ctl: must run as root (sudo kimina-ctl $cmd)" >&2
+    exit 1
+  fi
+  [ -x /usr/local/sbin/lean-pool-ctl ] || { echo "kimina-ctl: no lean-pool on this host - run install.sh --proxy $pool" >&2; exit 1; }
+  log "request: ${cmd}"
+  /usr/local/sbin/lean-pool-ctl "$pool" "$pool_verb" "$@"
+  rc=$?
+  log "proxy-$pool $pool_verb -> rc=$rc"
+  exit "$rc"
+fi
+
+INSTANCE=""
+if [[ "${1:-}" == @* ]]; then
+  INSTANCE=${1#@}
+  [[ "$INSTANCE" =~ ^[a-z0-9]{1,16}$ ]] || refuse
+  shift
+fi
+verb=${1:-status}
+arg=${2:-}
+arg2=${3:-}
+[ "$#" -le 3 ] || refuse
+
+# Validate the whole request BEFORE doing anything: an unknown verb or a malformed argument is refused
+# here, so the execution branches below only ever see a request that passed.
+case "$verb" in
+  status|check|up|down|restart|show-key)
+    [ -z "$arg" ] && [ -z "$arg2" ] || refuse ;;
+  logs)
+    [ -z "$arg2" ] || refuse
+    if [ -n "$arg" ] && [ "$arg" != build ]; then
+      [[ "$arg" =~ ^[0-9]{1,3}$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 500 ] || refuse
+    fi ;;
+  set-repls|set-cpus)
+    [ -z "$arg2" ] || refuse
+    [[ "$arg" =~ ^[0-9]{1,2}$ ]] && [ "$arg" -ge 1 ] && [ "$arg" -le 32 ] || refuse ;;
+  set-beside)
+    [ -z "$arg2" ] || refuse
+    [ "$arg" = none ] || { [[ "$arg" =~ ^(0|[1-9][0-9]?)$ ]] && [ "$arg" -le 32 ]; } || refuse ;;
+  set-mem)
+    # What the installer's --mem-limit takes: a whole number from 1, then g or m.
+    [ -z "$arg2" ] || refuse
+    [[ "$arg" =~ ^[1-9][0-9]{0,3}[gGmM]$ ]] || refuse ;;
+  compiled-search|read-only)
+    [ -z "$arg2" ] || refuse
+    [ "$arg" = on ] || [ "$arg" = off ] || refuse ;;
+  *)
+    refuse ;;
+esac
+case "$verb" in
+  compiled-search) [ -n "$INSTANCE" ] || refuse ;;   # a compiled search step exists beside a named instance only
+esac
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "kimina-ctl: must run as root (sudo kimina-ctl $cmd)" >&2
+  exit 1
+fi
+
+DIR=/srv/kimina${INSTANCE:+-$INSTANCE}
+ENV_FILE=$DIR/kimina.env
+[ -f "$ENV_FILE" ] || { echo "kimina-ctl: $ENV_FILE is missing - run install.sh${INSTANCE:+ --instance $INSTANCE}" >&2; exit 1; }
+
+SITE_PREFIX=$(sed -n 's/^SITE_PREFIX=//p' "$SITE_ENV" 2>/dev/null | head -n 1)
+[[ "$SITE_PREFIX" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] \
+  || { echo "kimina-ctl: $SITE_ENV is missing or names no site (SITE_PREFIX) - run install.sh${INSTANCE:+ --instance $INSTANCE}" >&2; exit 1; }
+
+setting() { sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1; }
+CONTAINER=$(setting KIMINA_CONTAINER); CONTAINER=${CONTAINER:-$SITE_PREFIX-kimina}
+PROJECT=$(setting KIMINA_PROJECT); PROJECT=${PROJECT:-$SITE_PREFIX-kimina}
+NETWORK=$(setting KIMINA_NETWORK); NETWORK=${NETWORK:-$SITE_PREFIX-kimina}
+FW_UNIT=kimina-firewall${INSTANCE:+-$INSTANCE}.service
+CHAIN_SUFFIX=${INSTANCE:+-$(echo "$INSTANCE" | tr '[:lower:]' '[:upper:]')}
+# The compose files name the image with the site's prefix, and the container and network with these (the
+# instance with no name's kimina.env holds neither: its names are the site's plain ones).
+export SITE_PREFIX KIMINA_CONTAINER=$CONTAINER KIMINA_NETWORK=$NETWORK
+COMPOSE=(docker compose --project-name "$PROJECT" --env-file "$ENV_FILE" -f "$DIR/docker-compose.yml")
+
+log "request: ${cmd}"
+
+set_setting() {   # set_setting KEY VALUE : replace or append one line of kimina.env
+  sed -i "s/^$1=.*/$1=$2/" "$ENV_FILE"
+  grep -q "^$1=$2\$" "$ENV_FILE" || echo "$1=$2" >> "$ENV_FILE"
+}
+
+# zombies_in CONTAINER : how many of the container's processes have exited and been collected by nobody. Each
+# holds a slot under pids_limit until its parent collects it, and a container without an init process fills
+# up with the workers its server closed. Counted on the HOST, by the
+# container's PID namespace, with nothing started inside it: `docker exec` cannot start a process in a
+# container at its limit, which is when the number is wanted. Not with `docker top` either: it keeps the
+# lines of `ps` whose PID is one of the container's (moby daemon/top_unix.go), the runtime reads those from
+# the container's cgroup.procs (runc libcontainer/cgroups), and the kernel lists no zombie there.
+# `?` when it cannot be read: `status` never fails on it.
+zombies_in() {
+  local first id namespace listing
+  read -r first id <<<"$(docker inspect -f '{{.State.Pid}} {{.Id}}' "$1" 2>/dev/null)"
+  [[ "${first:-}" =~ ^[1-9][0-9]*$ ]] && [ -n "${id:-}" ] || { echo '?'; return 0; }     # PID 0: it is not running
+  # The process with that PID here must BE the container's first process: Docker names the container's
+  # control group after its ID. Where Docker runs under another kernel than this shell does (Docker Desktop),
+  # the number belongs to some other process here, or to none, and its namespace is not the container's.
+  grep -qsF -- "$id" "/proc/$first/cgroup" || { echo '?'; return 0; }
+  namespace=$(ps -o pidns= -p "$first" 2>/dev/null | tr -d '[:space:]')
+  [[ "$namespace" =~ ^[1-9][0-9]*$ ]] || { echo '?'; return 0; }
+  listing=$(ps -eo pidns=,stat= 2>/dev/null) && [ -n "$listing" ] || { echo '?'; return 0; }
+  awk -v pid_namespace="$namespace" '$1 == pid_namespace && $2 ~ /^Z/ { count++ } END { print count + 0 }' <<<"$listing"
+}
+
+# cpu_priority_line : how the RUNNING container stands against the box's other work, read like the init line from how the container was made, and from the weight the box really
+# gives the top-level control group. One of `lowest`, `normal`, `lowest NOT available here`, and the two
+# states in between: a server installed before control groups, and one whose container is older than its
+# setting.
+cpu_priority_line() {
+  local parent weight="" priority wanted
+  parent=$(docker inspect -f '{{.HostConfig.CgroupParent}}' "$CONTAINER" 2>/dev/null)
+  priority=$(setting KIMINA_CPU_PRIORITY)
+  wanted=$(setting KIMINA_CGROUP_PARENT)
+  case "$parent" in
+    leanpool-*.slice)
+      [ ! -r /sys/fs/cgroup/leanpool.slice/cpu.weight ] || weight=$(tr -d '[:space:]' < /sys/fs/cgroup/leanpool.slice/cpu.weight)
+      if [ "$weight" = 1 ]; then
+        echo "--- cpu priority: lowest (control group $parent under leanpool.slice, CPU weight 1: other work on this box gets a contended CPU first)"
+      else
+        echo "--- cpu priority: lowest NOT available here (the container is in $parent, but leanpool.slice has CPU weight '${weight:-unreadable}', not 1: re-run the installer)"
+      fi ;;
+    leanpoolnormal-*.slice)
+      echo "--- cpu priority: normal (control group $parent at the box's ordinary CPU weight, as chosen with --cpu-priority)" ;;
+    *)
+      if [ -z "$priority" ]; then
+        echo "--- cpu priority: normal (this server was installed before it had a control group of its own: the installer, or a refresh, brings the lowest)"
+      elif [ -n "$wanted" ]; then
+        echo "--- cpu priority: $priority NOT in effect (the running container was made before its control group $wanted: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }restart)"
+      elif [ "$priority" = normal ]; then
+        echo "--- cpu priority: normal (this box keeps no control group for the server, so its open slots are not measured)"
+      else
+        echo "--- cpu priority: lowest NOT available here (this box cannot keep the server in a control group of its own; the installer says why when it runs)"
+      fi ;;
+  esac
+}
+
+# memory_ceiling_line : the most memory the RUNNING container may take, beside the memory this box has.
+# A ceiling above the box's memory protects nothing: the box runs out first.
+# Read from how the container was made, like the init line; `free` is asked for the box (MemTotal, in bytes).
+# The ceiling alone when the box's memory cannot be read: `status` never fails on it.
+memory_ceiling_line() {
+  local ceiling box hint
+  ceiling=$(docker inspect -f '{{.HostConfig.Memory}}' "$CONTAINER" 2>/dev/null)
+  box=$(free -b 2>/dev/null | awk '$1 == "Mem:" { print $2; exit }')
+  hint="sudo kimina-ctl ${INSTANCE:+@$INSTANCE }set-mem SIZE"
+  [[ "${ceiling:-}" =~ ^[0-9]+$ ]] || { echo "--- memory ceiling: ? (settings say $(setting KIMINA_MEM_LIMIT))"; return 0; }
+  [ "$ceiling" -gt 0 ] || { echo "--- memory ceiling: none (set one with: $hint)"; return 0; }
+  awk -v ceiling="$ceiling" -v box="${box:-}" -v hint="$hint" 'BEGIN {
+    gib = 1024 * 1024 * 1024
+    if (box !~ /^[1-9][0-9]*$/) printf "--- memory ceiling: %.1f GiB\n", ceiling / gib
+    else if (ceiling + 0 > box + 0) printf "--- memory ceiling: %.1f GiB, ABOVE this box'\''s %.1f GiB of memory: it protects nothing (lower it: %s)\n", ceiling / gib, box / gib, hint
+    else printf "--- memory ceiling: %.1f GiB of this box'\''s %.1f GiB of memory\n", ceiling / gib, box / gib
+  }'
+}
+
+# The compiled search step: the launcher the installer puts in the
+# instance's `native/` directory, mounted in the container at this path, and the image's own REPL.
+NATIVE_LAUNCHER=/opt/lean-native/repl-native
+PLAIN_REPL=/repl/.lake/build/bin/repl
+
+set_path_setting() {   # set_path_setting KEY VALUE : as set_setting, for a value that holds slashes
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
+
+# compiled_search_here : this box holds a library its installer made AND saw work (the launcher loads it only
+# while it still matches the image's C files, which it checks itself each time a worker starts).
+compiled_search_here() {
+  [ -x "$DIR/native/repl-native" ] && [ -s "$DIR/native/linarith-search.so" ] && [ -s "$DIR/native/built-from" ] \
+    && [ "$(head -n 1 "$DIR/native/state" 2>/dev/null | cut -d ' ' -f 1)" = on ]
+}
+
+# compiled_search_line : whether this server's workers run linarith's search step as compiled code.
+# From what the RUNNING container was started with (Docker's record of its environment, of which
+# only this one variable is read: the API key is in the same list) and from the installer's record of what
+# this box's own check measured. Named instances only: instance 1 has no compiled step.
+compiled_search_line() {
+  local running state hint
+  [ -n "$INSTANCE" ] || return 0
+  running=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null | sed -n 's/^LEAN_SERVER_REPL_PATH=//p' | head -n 1)
+  state=$(head -n 1 "$DIR/native/state" 2>/dev/null)
+  hint="sudo kimina-ctl @$INSTANCE"
+  if [ "$running" = "$NATIVE_LAUNCHER" ]; then
+    if compiled_search_here; then
+      echo "--- compiled search step: on (${state#on })"
+    else
+      echo "--- compiled search step: OFF in effect (the workers are started through the launcher, but this box holds no library that passed its check, so each runs the plain REPL: re-run the installer)"
+    fi
+  elif [ "$(setting KIMINA_REPL_PATH)" = "$NATIVE_LAUNCHER" ]; then
+    echo "--- compiled search step: on in the settings, NOT in effect (the running container was made before it: $hint restart)"
+  elif [ "$(setting KIMINA_COMPILED_SEARCH)" = off ]; then
+    echo "--- compiled search step: OFF (turned off on this box; the workers run the plain REPL: $hint compiled-search on)"
+  elif [ "${state%% *}" = off ]; then
+    echo "--- compiled search step: OFF (${state#off }; the workers run the plain REPL, with the same answers)"
+  else
+    echo "--- compiled search step: OFF (this server was installed before it had one: the installer, or a refresh, makes and checks it)"
+  fi
+}
+
+# read_only_line : whether this server's root filesystem is read-only, from how
+# the RUNNING container was made (Docker's record) and from the installer's record of its reading of the server.
+read_only_line() {
+  local made state hint="sudo kimina-ctl ${INSTANCE:+@$INSTANCE }"
+  made=$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}' "$CONTAINER" 2>/dev/null)
+  state=$(head -n 1 "$DIR/read-only.state" 2>/dev/null)
+  if [ "$made" = true ]; then
+    echo "--- read-only root: on (a check can change neither Lean, Mathlib nor the REPL for the checks after it; /tmp is in memory)"
+  elif [ "$made" != false ]; then
+    echo "--- read-only root: ? (Docker did not say how the running container was made)"
+  elif [ "$(setting KIMINA_ROOT_READ_ONLY)" = true ]; then
+    echo "--- read-only root: on in the settings, NOT in effect (the running container was made before it: ${hint}restart)"
+  elif [ "$(setting KIMINA_READ_ONLY)" = off ]; then
+    echo "--- read-only root: OFF (turned off on this box: ${hint}read-only on)"
+  elif [ "${state%% *}" = off ]; then
+    echo "--- read-only root: OFF (${state#off }; the server is writable, as it was, with the same answers)"
+    # Every path the installer's reading found that a read-only root would have refused (the reason holds a few).
+    if [ -s "$DIR/read-only.outside" ]; then
+      head -n 40 "$DIR/read-only.outside" | tr -c '[:print:]\n' ' ' | sed 's/^/      wrote: /'
+      [ "$(grep -c . "$DIR/read-only.outside")" -le 40 ] || echo "      wrote: ... and $(( $(grep -c . "$DIR/read-only.outside") - 40 )) more (in $DIR/read-only.outside)"
+    fi
+  else
+    echo "--- read-only root: OFF (this server was installed before it had one: the installer, or a refresh, reads it and turns it on)"
+  fi
+}
+
+# agent_says CONTAINER : the usage agent's own answer, asked inside its container (behind a TLS front its
+# port is not published). Empty when it did not answer.
+agent_says() {
+  docker exec -i "$1" python - 2>/dev/null <<'PY' || true
+import socket
+
+with socket.create_connection(("127.0.0.1", 18200), timeout=5) as connection:
+    print(connection.makefile().read().strip())
+PY
+}
+
+# agent_line CONTAINER : that answer, and what it means for the checks this box is sent.
+agent_line() {
+  local said
+  said=$(agent_says "$1")
+  case "$said" in
+    *maxconn:*) echo "--- usage agent says: $said (maxconn = the open slots: the checks that fit beside this box's other work, of $(setting KIMINA_MAX_REPLS) workers)" ;;
+    "drain 0%") echo "--- usage agent says: $said (no check fits beside this box's other work, or memory is below the floor: the pool sends none)" ;;
+    "") echo "--- usage agent says: ? (it did not answer)" ;;
+    *) echo "--- usage agent says: $said (open slots are NOT stated: the pool may send this box a check for every worker, whatever else runs here)" ;;
+  esac
+}
+
+# beside_line : the box's own limit on checks while other work is on it. The
+# setting says what the agent was GIVEN; `usage agent says` above says what it states now.
+beside_line() {
+  local beside
+  if ! grep -q '^KIMINA_AGENT_BESIDE_OTHER_WORK=' "$ENV_FILE"; then
+    echo "--- beside other work: no limit of its own (this box was installed before it had one: the installer, or a refresh, brings 1)"
+    return 0
+  fi
+  beside=$(setting KIMINA_AGENT_BESIDE_OTHER_WORK)
+  case "$beside" in
+    "") echo "--- beside other work: no limit of its own (the free cores alone decide; set one with: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }set-beside N)" ;;
+    0)  echo "--- beside other work: no check (while anything else keeps a CPU busy here the pool sends none; the whole box when it is free)" ;;
+    *)  echo "--- beside other work: at most $beside check(s) (while anything else keeps a CPU busy here; the whole box when it is free)" ;;
+  esac
+}
+
+# refresh_agent : the usage agent again from the settings as they now are (its worker count is the Lean
+# server's). Only its own service changes; a TLS front beside it is not made again.
+refresh_agent() {
+  local agent front
+  agent=$(setting KIMINA_AGENT_CONTAINER)
+  front=$(setting KIMINA_FRONT_CONTAINER)
+  [ -n "$agent" ] || return 0
+  if [ -n "$front" ] && [ -f "$DIR/docker-compose.front.yml" ]; then
+    docker compose --project-name "$front" --env-file "$ENV_FILE" -f "$DIR/docker-compose.front.yml" up -d 2>&1 | tail -n 5
+  elif [ -f "$DIR/docker-compose.agent.yml" ]; then
+    docker compose --project-name "$agent" --env-file "$ENV_FILE" -f "$DIR/docker-compose.agent.yml" up -d 2>&1 | tail -n 5
+  fi
+}
+
+run_check() {
+  # Runs INSIDE the container with its own Python and its own copy of the key, so the host needs
+  # nothing but docker. One true statement must verify and one false statement must be rejected.
+  docker exec -i "$CONTAINER" python - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+header = "import Mathlib\nimport Aesop\n\nset_option maxHeartbeats 0\n\nopen BigOperators Real Nat Topology Rat\n\n"
+body = {
+    "snippets": [
+        {"id": "valid", "code": header + "theorem kimina_ctl_valid : (2 : Nat) + 2 = 4 := by\n  norm_num\n"},
+        {"id": "invalid", "code": header + "theorem kimina_ctl_invalid : (2 : Nat) + 2 = 5 := by\n  norm_num\n"},
+    ],
+    "timeout": 300,
+}
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/api/check",
+    data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.environ["LEAN_SERVER_API_KEY"]},
+)
+try:
+    with urllib.request.urlopen(request, timeout=900) as response:
+        reply = json.load(response)
+except Exception as error:  # noqa: BLE001 - any failure here is the answer
+    print(json.dumps({"check": "FAILED", "reason": repr(error)}))
+    sys.exit(1)
+
+
+def rejected(result):
+    if result.get("error"):
+        return True
+    messages = (result.get("response") or {}).get("messages") or []
+    return any(message.get("severity") == "error" for message in messages)
+
+
+results = {result["id"]: result for result in reply.get("results", [])}
+valid_accepted = "valid" in results and not rejected(results["valid"])
+invalid_rejected = "invalid" in results and rejected(results["invalid"])
+passed = valid_accepted and invalid_rejected
+print(json.dumps({
+    "check": "ok" if passed else "FAILED",
+    "valid_proof_accepted": valid_accepted,
+    "invalid_proof_rejected": invalid_rejected,
+    "seconds": {name: result.get("time") for name, result in results.items()},
+}))
+if not passed:
+    print(json.dumps(reply)[:4000])
+sys.exit(0 if passed else 1)
+PY
+}
+
+case "$verb" in
+  status)
+    "${COMPOSE[@]}" ps 2>&1
+    echo "--- health: $(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$CONTAINER" 2>&1)"
+    echo "--- image: $(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>&1)"
+    usage=$(docker stats --no-stream --format '--- usage: cpu {{.CPUPerc}}  mem {{.MemUsage}}  pids {{.PIDs}}' "$CONTAINER" 2>&1)
+    # The zombie count goes LAST on the line: whatever reads `pids N` from it keeps reading it.
+    case "$usage" in '--- usage:'*) usage="$usage  zombies $(zombies_in "$CONTAINER")" ;; esac
+    [ -z "$usage" ] || printf '%s\n' "$usage"
+    case "$(docker inspect -f '{{.HostConfig.Init}}' "$CONTAINER" 2>/dev/null)" in
+      true) echo "--- init process: yes (it collects what a closed worker leaves behind)" ;;
+      "")   echo "--- init process: ?" ;;
+      *)    echo "--- init process: NO (every worker the server closes leaves a zombie that holds a process slot; the installer's compose file adds one: re-run the installer)" ;;
+    esac
+    cpu_priority_line
+    echo "--- settings: port=$(setting KIMINA_PORT) repls=$(setting KIMINA_MAX_REPLS) repl_uses=$(setting KIMINA_MAX_REPL_USES) repl_mem=$(setting KIMINA_MAX_REPL_MEM) mem_limit=$(setting KIMINA_MEM_LIMIT) max_wait=$(setting KIMINA_MAX_WAIT)"
+    echo "--- cpu limit: $(docker inspect -f '{{.HostConfig.NanoCpus}}' "$CONTAINER" 2>/dev/null | awk '{ if ($1 > 0) print $1 / 1e9 " cores"; else print "none" }')"
+    memory_ceiling_line
+    compiled_search_line
+    read_only_line
+    if systemctl is-enabled --quiet "$FW_UNIT" 2>/dev/null; then
+      echo "--- firewall: $FW_UNIT enabled; inbound rule $(iptables -S DOCKER-USER 2>/dev/null | grep -c -- "-j KIMINA-LAN$CHAIN_SUFFIX\$") jump(s) in DOCKER-USER; egress block $(iptables -S DOCKER-USER 2>/dev/null | grep -c -- "-j KIMINA-EGRESS$CHAIN_SUFFIX\$") in DOCKER-USER, $(iptables -S INPUT 2>/dev/null | grep -c -- "-j KIMINA-EGRESS$CHAIN_SUFFIX\$") in INPUT"
+    else
+      echo "--- firewall: $FW_UNIT NOT installed"
+    fi
+    agent=$(setting KIMINA_AGENT_CONTAINER)
+    if [ -n "$agent" ]; then
+      echo "--- usage agent: $(docker inspect -f '{{.State.Status}}' "$agent" 2>&1) on port $(setting KIMINA_AGENT_PORT)"
+      agent_line "$agent"
+      beside_line
+    fi
+    front=$(setting KIMINA_FRONT_CONTAINER)
+    if [ -n "$front" ]; then
+      # A pool member: only the front is published, and it lets in the pool proxy's certificate alone.
+      echo "--- tls front: $(docker inspect -f '{{.State.Status}}' "$front" 2>&1) as '$(setting KIMINA_SERVER_NAME)' on ports $(setting KIMINA_PORT) and $(setting KIMINA_AGENT_PORT); its certificate has $(docker run --rm --network none --user 0:0 -v "$DIR/tls/box.crt":/box.crt:ro "$(setting KIMINA_AGENT_IMAGE)" leanpool-pki expiry /box.crt 2>/dev/null || echo '?') days left (renewal is joining again)"
+    fi
+    ;;
+
+  check)
+    run_check
+    rc=$?
+    log "check -> rc=$rc"
+    exit "$rc"
+    ;;
+
+  logs)
+    if [ "$arg" = build ]; then
+      tail -n 200 "$DIR/build.log" 2>&1
+    else
+      lines=${arg:-100}
+      "${COMPOSE[@]}" logs --no-color --tail "$lines" 2>&1 | tail -n "$lines"
+    fi
+    ;;
+
+  up)
+    "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+    ;;
+
+  down)
+    "${COMPOSE[@]}" down 2>&1 | tail -n 5
+    ;;
+
+  restart)
+    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5
+    ;;
+
+  set-repls)
+    set_setting KIMINA_MAX_REPLS "$arg"
+    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5
+    refresh_agent        # the most open slots the agent states is the worker count
+    log "set-repls $arg"
+    echo "workers set to $arg"
+    ;;
+
+  set-beside)
+    [ "$arg" != none ] || arg=""
+    set_setting KIMINA_AGENT_BESIDE_OTHER_WORK "$arg"
+    refresh_agent        # the agent alone: the Lean server and the checks it holds are not touched
+    log "set-beside ${arg:-none}"
+    echo "checks beside other work: ${arg:-no limit of its own}"
+    ;;
+
+  set-cpus)
+    set_setting KIMINA_CPUS "$arg"
+    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5
+    log "set-cpus $arg"
+    echo "cpu ceiling set to $arg"
+    ;;
+
+  set-mem)
+    # The ceiling alone: the worker count, what one worker may take, the CPU ceiling and the
+    # usage agent stay. A ceiling Docker will not make a container with (under its 6 MB floor) is taken back:
+    # the settings are again what they were, and the server is brought up with them.
+    arg=${arg,,}
+    had=$(grep -c '^KIMINA_MEM_LIMIT=' "$ENV_FILE")
+    previous=$(setting KIMINA_MEM_LIMIT)
+    set_setting KIMINA_MEM_LIMIT "$arg"
+    if ! "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 5; then
+      if [ "$had" -gt 0 ]; then set_setting KIMINA_MEM_LIMIT "$previous"; else sed -i '/^KIMINA_MEM_LIMIT=/d' "$ENV_FILE"; fi
+      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      log "set-mem $arg -> FAILED, settings as they were"
+      echo "kimina-ctl: the server could not be made with a memory ceiling of $arg (Docker's words are above); the settings are as they were" >&2
+      exit 1
+    fi
+    log "set-mem $arg"
+    echo "memory ceiling set to $arg"
+    ;;
+
+  compiled-search)
+    # Only the program a worker is changes, so only the Lean server is made again (and
+    # only if that program is not already the one it runs). `off` is a setting every later installer run
+    # keeps; the library stays on the box, so `on` needs no installer.
+    if [ "$arg" = off ]; then
+      set_path_setting KIMINA_REPL_PATH "$PLAIN_REPL"
+      set_setting KIMINA_COMPILED_SEARCH off
+      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      log "compiled-search off"
+      echo "compiled search step off: the workers run the plain REPL (the same answers; linarith's search is slower)"
+    else
+      sed -i '/^KIMINA_COMPILED_SEARCH=/d' "$ENV_FILE"
+      if ! compiled_search_here; then
+        log "compiled-search on -> no checked library here"
+        echo "kimina-ctl: this box holds no compiled search step that passed its check, so the workers stay on the plain REPL. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) makes one and checks it" >&2
+        exit 1
+      fi
+      set_path_setting KIMINA_REPL_PATH "$NATIVE_LAUNCHER"
+      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      log "compiled-search on"
+      echo "compiled search step on: $(head -n 1 "$DIR/native/state" | cut -d ' ' -f 2-)"
+    fi
+    ;;
+
+  read-only)
+    # Only how the Lean server's root filesystem is mounted changes, so only the Lean server is
+    # made again. `off` is a setting every later installer run keeps. `on` makes the server read-only only where
+    # the installer's own reading of it passed (`on` in read-only.state); elsewhere its next run reads it again.
+    if [ "$arg" = off ]; then
+      set_setting KIMINA_READ_ONLY off
+      set_setting KIMINA_ROOT_READ_ONLY false
+      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      log "read-only off"
+      echo "read-only root off: the Lean server is writable, as it was (the same answers; a check can change this server for the checks after it)"
+    else
+      sed -i '/^KIMINA_READ_ONLY=/d' "$ENV_FILE"
+      if [ "$(head -n 1 "$DIR/read-only.state" 2>/dev/null)" != on ]; then
+        log "read-only on -> no reading of this server passed"
+        echo "kimina-ctl: the installer has not found this server writing nothing outside /tmp, so it stays writable. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) reads it again" >&2
+        exit 1
+      fi
+      set_setting KIMINA_ROOT_READ_ONLY true
+      "${COMPOSE[@]}" up -d 2>&1 | tail -n 5
+      log "read-only on"
+      echo "read-only root on: the Lean server was made again with it (to check it: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }check)"
+    fi
+    ;;
+
+  show-key)
+    setting KIMINA_API_KEY
+    ;;
+
+  *)
+    refuse
+    ;;
+esac

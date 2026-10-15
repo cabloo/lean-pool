@@ -1,0 +1,98 @@
+# Kimina Lean Server, as the lean-pool installer runs it.
+#
+# Installed by install.sh into /srv/kimina (root-owned; /srv/kimina-NAME for `--instance NAME`) and driven
+# from there by /usr/local/bin/kimina-ctl. Every ${VAR} below comes from that directory's kimina.env (which
+# install.sh writes), except three that install.sh and kimina-ctl put in compose's environment: SITE_PREFIX
+# (the site's name prefix) and the container's and network's names (KIMINA_CONTAINER, KIMINA_NETWORK; a named
+# instance's kimina.env holds them too). Nothing is read from the repo at run time.
+#
+# Based on upstream compose.yaml of project-numina/kimina-lean-server @ fb2393de34 (one service, env
+# file, `restart: unless-stopped`). Added: the pinned local image, limits, a healthcheck, hardening.
+services:
+  kimina:
+    image: ${SITE_PREFIX:?set by the installer and kimina-ctl}/kimina:${KIMINA_IMAGE_TAG:?set by install.sh}
+    # Per instance (install.sh --instance NAME): the installer and kimina-ctl always set it.
+    container_name: ${KIMINA_CONTAINER:?set by the installer and kimina-ctl}
+    restart: unless-stopped
+    environment:
+      LEAN_SERVER_API_KEY: ${KIMINA_API_KEY:?set by install.sh}
+      # Worker count. Tunable: `kimina-ctl set-repls N`. Start at 12; size it from the memory one worker
+      # takes under load.
+      LEAN_SERVER_MAX_REPLS: ${KIMINA_MAX_REPLS:-12}
+      # Finite on purpose: the upstream REPL keeps every command's state, so a worker's memory grows
+      # with use until it is recycled.
+      LEAN_SERVER_MAX_REPL_USES: ${KIMINA_MAX_REPL_USES:-200}
+      # Per-worker ADDRESS-SPACE limit (RLIMIT_AS), not resident memory.
+      LEAN_SERVER_MAX_REPL_MEM: ${KIMINA_MAX_REPL_MEM:-8G}
+      # Seconds a request waits for a free worker before the server answers 429.
+      LEAN_SERVER_MAX_WAIT: ${KIMINA_MAX_WAIT:-120}
+      # INFO logs every snippet and every reply.
+      LEAN_SERVER_LOG_LEVEL: ${KIMINA_LOG_LEVEL:-WARNING}
+      # The program a worker is. The default is the REPL at the path an instance's image must put it
+      # (pool-lib.sh, LEAN_PLAIN_REPL). On a box whose installer compiled linarith's search step and
+      # saw it work, this is /opt/lean-native/repl-native: a launcher that starts that same REPL with the
+      # compiled step loaded, and the plain REPL whenever the library is not the one made for this image.
+      LEAN_SERVER_REPL_PATH: ${KIMINA_REPL_PATH:-/repl/.lake/build/bin/repl}
+    volumes:
+      # The launcher and the library, made on this box by the installer (pool-lib.sh, install_compiled_search).
+      # Read-only, and empty for an instance that has no compiled step.
+      - ./native:/opt/lean-native:ro
+    ports:
+      # All IPv4 interfaces: a host's LAN address can change (WiFi), so the port cannot be bound
+      # to one address. What keeps it LAN-only is the DOCKER-USER rule install.sh adds (ufw's INPUT
+      # rules do not apply to docker-published ports), and the API key. IPv4 ONLY on purpose: an IPv6
+      # listener is served by docker's userland proxy, whose connections reach the container from the
+      # bridge gateway address and would pass the source rule.
+      - "0.0.0.0:${KIMINA_PORT:-18000}:8000"
+    # Hard memory ceiling for the whole container. Size it to leave the host's other work its memory.
+    mem_limit: ${KIMINA_MEM_LIMIT:-36g}
+    memswap_limit: ${KIMINA_MEM_LIMIT:-36g}
+    pids_limit: 4096
+    # Docker's init as PID 1. The server closes a worker (`lake env repl`, in a
+    # session of its own) by killing the group and waiting for lake alone; the orphaned repl goes to PID 1,
+    # and a server that IS PID 1 never collects it: a zombie that holds a slot under pids_limit. They pile
+    # up with every check, and at the limit every check is an HTTP 500.
+    # The mechanism runs as a test: tests/install/test_install_reaping.py.
+    init: true
+    # CPU ceiling, so the other work on this host always keeps the rest. Each worker is single-threaded, so this also bounds useful parallelism.
+    cpus: ${KIMINA_CPUS:-16}
+    # The control group the container is started in: a group of this server's
+    # own under leanpool.slice, whose CPU weight is the lowest there is, so that whatever else runs on the
+    # box gets a contended CPU first. The ceiling above still holds when the CPUs are free. The installer
+    # asks the box first (pool-lib.sh, install_cpu_priority) and leaves this EMPTY where the box cannot do
+    # it: the container then starts where Docker puts every container.
+    cgroup_parent: ${KIMINA_CGROUP_PARENT:-}
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The root filesystem read-only. A check is a Lean file, and Lean runs
+    # programs while it reads one (`#eval`), so a check runs a program in this container: read-only, it can
+    # change neither Lean, Mathlib nor the REPL for the checks after it, nor fill the host's disk. The
+    # installer turns it on only where the running server was seen to write nothing else (`docker diff`, read
+    # before the switch) and a real check then passed; `kimina-ctl read-only off` turns it off by hand. Unset,
+    # the server stays writable.
+    read_only: ${KIMINA_ROOT_READ_ONLY:-false}
+    # Kimina writes its workers' error output here, as unnamed files. In memory, and counted against the
+    # memory ceiling above: filling it costs this server memory, not the host its disk. Nothing in it runs.
+    tmpfs:
+      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev
+    # A dedicated network with a FIXED subnet, so the firewall can name the container's traffic.
+    # kimina-firewall drops every NEW connection that STARTS from this subnet:
+    # the server only answers; Lean needs no network at run time.
+    networks: [kimina]
+    healthcheck:
+      # Liveness only: /health does not exercise a worker. `kimina-ctl check` runs a real check.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+networks:
+  kimina:
+    name: ${KIMINA_NETWORK:?set by the installer and kimina-ctl}
+    ipam:
+      config:
+        - subnet: ${KIMINA_SUBNET:-172.29.53.0/24}

@@ -141,7 +141,8 @@ each figure observed once:
 * The clone must be on a file system that lets programs run (not mounted `noexec`): the
   container starts its workers from `native/`.
 * **`make.sh` and `compose.compiled-search.yaml` have not been run as written here.** In the
-  deployment, an installer of its own ran the same `build.sh`, `check.py` and launcher, under
-  other names, in the same kind of container, and started the servers. Here those three were run
+  deployment, the [installers](../deploy/install/README.md) ran the same `build.sh`, `check.py`
+  and launcher (as `lean-native-*`), in the same kind of container, and started the servers.
+  Here those three were run
   as written against a real Lean outside Docker, and the tests hold `make.sh` to what it does
   with a stand-in for Docker. Docker validates the compose file in CI.

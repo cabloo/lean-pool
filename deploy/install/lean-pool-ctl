@@ -1,0 +1,680 @@
+#!/usr/bin/env bash
+# lean-pool-ctl - every operation on one lean-pool front door (HAProxy + cache) on this host.
+#
+# install-pool.sh installs it to /usr/local/sbin/lean-pool-ctl
+# (root:root 0755). It is run by root: by hand, and by kimina-ctl for the door's `@proxy-NAME` requests
+# (kimina-ctl validates those first; everything is validated again here).
+#
+# It acts ONLY on /srv/lean-pool-NAME, which is root-owned and written by install-pool.sh. The lean-pool
+# tools (config generator, admission test, certificates, join service) run from the pool's own image, never
+# from the repo. The pool is TLS throughout: HTTPS to clients, mutual TLS to every Lean server.
+#
+#   lean-pool-ctl NAME status                                    containers, cache counters, per-server state,
+#                                                                days left on every certificate
+#   lean-pool-ctl NAME servers                                   the server list
+#   lean-pool-ctl NAME check                                     one valid and one invalid proof through the pool
+#   lean-pool-ctl NAME ca                                        the pool authority's certificate (public)
+#   lean-pool-ctl NAME admit HOST:PORT WORKERS [SERVER]          the admission test against ONE server
+#   lean-pool-ctl NAME add-backend SERVER HOST:PORT WORKERS [AGENT_PORT]
+#                                                                admission, then add, validate, reload
+#   lean-pool-ctl NAME remove-backend SERVER                     remove, validate, reload
+#   lean-pool-ctl NAME pause SERVER                              keep it listed, with its certificate, and send
+#                                                                it nothing; validate, reload
+#   lean-pool-ctl NAME resume SERVER                             admission again, then it takes checks again
+#   lean-pool-ctl NAME set-workers SERVER N                      the worker count SERVER is listed with, after the
+#                                                                box's own was changed; validate, reload
+#   lean-pool-ctl NAME join-open [--minutes N]                   let ONE new box join: prints the command to run
+#                                                                there, then waits for it (default 120 minutes)
+#   lean-pool-ctl NAME logs [N] | restart | reload | render [--check|--no-reload]
+#   lean-pool-ctl NAME cache-stop | cache-start                  the cache only: checks keep flowing, uncached
+#
+# A server joins ONLY after the admission test passes against it alone, and a config is installed ONLY
+# after HAProxy itself has validated it: a failure at any step leaves the pool exactly as it was.
+set -uo pipefail
+
+die() { printf 'lean-pool-ctl: %s\n' "$1" >&2; exit "${2:-1}"; }
+# Files and directories for ONE container's group, as in pool-lib.sh: `install -g N` asks the host's group
+# database for N, and uutils' install (Ubuntu 25.10 and later) refuses a number with no entry there, which a
+# container image's group never has. chown takes any number.
+install_for_gid() {       # MODE GID SOURCE DESTINATION
+  install -o root -g root -m 0600 "$3" "$4"
+  chown root:"$2" "$4"
+  chmod "$1" "$4"
+}
+install_dir_for_gid() {   # MODE GID DIRECTORY...
+  local mode=$1 gid=$2 directory; shift 2
+  for directory in "$@"; do
+    [ -d "$directory" ] || install -d -o root -g root -m 0700 "$directory"
+    chown root:"$gid" "$directory"
+    chmod "$mode" "$directory"
+  done
+}
+usage() { sed -n '/^#   lean-pool-ctl NAME status/,/^#   lean-pool-ctl NAME cache-stop/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+POOL=${1:-}
+verb=${2:-}
+[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || usage
+[ -n "$verb" ] || usage
+shift 2
+
+# A server that is ADDED is named by one DNS label in lower case (no dot): the name is also the name on its
+# certificate, and a dotted name could be a name of the pool's own front door. A server that is REMOVED may
+# carry whatever name an older list gave it.
+valid_server_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$ ]]; }
+valid_listed_name() { [[ "$1" =~ ^[A-Za-z0-9_.-]{1,40}$ ]]; }
+valid_address()     { [[ "$1" =~ ^[A-Za-z0-9.-]{1,120}:[0-9]{2,5}$ ]]; }
+valid_count()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 256 ]; }
+valid_port()        { [[ "$1" =~ ^[0-9]{2,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_minutes()     { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 1440 ]; }
+
+# Validate the whole request before touching anything.
+case "$verb" in
+  status|servers|check|ca|restart|reload|cache-stop|cache-start) [ "$#" -eq 0 ] || usage ;;
+  render) [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && { [ "$1" = --check ] || [ "$1" = --no-reload ]; }; } || usage ;;
+  logs) [ "$#" -le 1 ] || usage
+        [ "$#" -eq 0 ] || { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 500 ]; } || usage ;;
+  admit)
+    { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } && valid_address "$1" && valid_count "$2" || usage
+    [ "$#" -eq 2 ] || valid_server_name "$3" || usage ;;
+  add-backend)
+    { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } && valid_server_name "$1" && valid_address "$2" && valid_count "$3" || usage
+    [ "$#" -eq 3 ] || valid_port "$4" || usage ;;
+  remove-backend|pause|resume) [ "$#" -eq 1 ] && valid_listed_name "$1" || usage ;;
+  set-workers) [ "$#" -eq 2 ] && valid_listed_name "$1" && valid_count "$2" || usage ;;
+  join-open) [ "$#" -eq 0 ] || { [ "$#" -eq 2 ] && [ "$1" = --minutes ] && valid_minutes "$2"; } || usage ;;
+  *) usage ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (sudo lean-pool-ctl $POOL $verb)"
+DIR=/srv/lean-pool-$POOL
+ENV_FILE=$DIR/pool.env
+[ -f "$ENV_FILE" ] || die "$ENV_FILE is missing - run install.sh --proxy $POOL"
+
+setting() { sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1; }
+IMAGE=$(setting POOL_IMAGE)
+IMAGE_GID=$(setting POOL_IMAGE_GID)
+HAPROXY_IMAGE=$(setting POOL_HAPROXY_IMAGE)
+PUBLIC_PORT=$(setting POOL_PUBLIC_PORT)
+LEAN_TIMEOUT=$(setting POOL_LEAN_TIMEOUT)
+SERVER_WAIT=$(setting POOL_SERVER_WAIT)
+MAX_REQUEST_BYTES=$(setting POOL_MAX_REQUEST_BYTES)
+JOIN_HOST=$(setting POOL_JOIN_HOST)
+JOIN_PORT=$(setting POOL_JOIN_PORT)
+# The site this host was installed for (written by the installer): its name prefix, which also names its helpers'
+# directory, and its LAN's domain. The compose file names the containers, network and volume with the prefix.
+SITE_ENV=/etc/lean-pool/site.env
+site_value() { sed -n "s/^$1=//p" "$SITE_ENV" 2>/dev/null | head -n 1; }
+SITE_PREFIX=$(site_value SITE_PREFIX)
+SITE_LAN_DOMAIN=$(site_value SITE_LAN_DOMAIN)
+[[ "$SITE_PREFIX" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] && [[ "$SITE_LAN_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$ ]] \
+  || die "$SITE_ENV is missing or incomplete - re-run install.sh --proxy $POOL"
+export SITE_PREFIX
+PROXY=$SITE_PREFIX-proxy-$POOL
+CACHE=$SITE_PREFIX-cache-$POOL
+JOIN_SERVICE=$SITE_PREFIX-join-$POOL
+COMPOSE=(docker compose --project-name "$SITE_PREFIX-pool-$POOL" --env-file "$ENV_FILE" -f "$DIR/docker-compose.pool.yml")
+[ -n "$IMAGE" ] && [ -n "$HAPROXY_IMAGE" ] && [ -n "$PUBLIC_PORT" ] && [ -n "$LEAN_TIMEOUT" ] \
+  || die "$ENV_FILE is incomplete - re-run install.sh --proxy $POOL"
+# The proxy's certificates (install-pool.sh): tls/ is what the proxy container reads, certs/ is public.
+TLS_DIR=$DIR/tls
+TLS_MOUNT=/etc/leanpool/tls
+[ -s "$TLS_DIR/front.pem" ] && [ -s "$TLS_DIR/proxy-client.pem" ] && [ -s "$TLS_DIR/ca.crt" ] && [ -s "$DIR/certs/ca.crt" ] \
+  || die "this pool has no certificates yet (it was installed before TLS) - re-run install.sh --proxy $POOL"
+HELPER=/usr/local/lib/$SITE_PREFIX/join_helper.py
+
+WORK=""
+WINDOW=""
+JOIN_STARTED=0
+cleanup() {
+  # A join window ends here whatever ended it (a verdict, a refusal, the time limit, Ctrl-C, a lost
+  # connection): the service is stopped, and the token, the spool and the key copy are deleted.
+  if [ "$JOIN_STARTED" -eq 1 ]; then docker rm -f -v "$JOIN_SERVICE" >/dev/null 2>&1; fi
+  [ -z "$WINDOW" ] || rm -rf "$WINDOW"
+  [ -z "$WORK" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# Whether a container is running. Asked of Docker for that one container: a listing piped into `grep -q`
+# can fail under pipefail when grep leaves first, and a reload would then be skipped without a word.
+container_runs() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+# Tell an HAProxy container to load its config and certificates again, FROM INSIDE it: PID 1 there is
+# HAProxy's master, run by the user `docker exec` gets. NEVER `docker kill -s HUP`: Docker marks a container
+# it signalled as stopped by hand, whatever the signal, and with `restart: unless-stopped` such a container
+# is not started at the next boot or daemon start, nor restarted after a crash.
+reload_haproxy() { docker exec "$1" sh -c 'kill -HUP 1'; }
+
+# Text that came from another machine (a join request, or a tool's message quoting one) is shown and
+# passed on as printable ASCII only: no escape sequence reaches the operator's terminal or a reply.
+printable()       { LC_ALL=C tr -c ' -~' ' ' | LC_ALL=C tr -s ' ' | cut -c1-"${1:-300}" | sed 's/ *$//'; }   # one line, capped
+printable_lines() { LC_ALL=C tr -c '\n -~' '?'; }                                                           # a report, a log
+
+# The pool's own tools, from the pool's image, with no network and one directory to work in.
+tool() { local work=$1; shift; docker run --rm --network none --user 0:0 -v "$work":/work "$IMAGE" "$@"; }
+
+# The pool's facts for a Prometheus scraper: the renderer writes them beside the config from
+# the server list and the pool's public certificates, and the proxy answers GET /metrics/pool with that file.
+# The certificates are read from a COPY beside the candidate list, so that a change to the list carries the
+# certificate that goes with it (a joining box's, a removed server's) before either is installed.
+POOL_METRICS=pool.metrics
+stage_certificates() {    # WORKDIR : the pool's public certificates, as WORKDIR/certs (once)
+  [ -d "$1/certs" ] || cp -R "$DIR/certs" "$1/certs"
+}
+
+render_and_validate() {   # WORKDIR holds `servers`; writes WORKDIR/haproxy.cfg and the facts it names; fails unless HAProxy accepts them
+  local work=$1
+  stage_certificates "$work" || { echo "the pool's public certificates could not be read; nothing changed" >&2; return 1; }
+  tool "$work" leanpool-haproxy-config render --servers /work/servers --public-port "$PUBLIC_PORT" \
+      --lean-timeout "$LEAN_TIMEOUT" --server-wait "$SERVER_WAIT" ${MAX_REQUEST_BYTES:+--max-request-bytes "$MAX_REQUEST_BYTES"} \
+      --tls-front-door-pem "$TLS_MOUNT/front.pem" --tls-ca-file "$TLS_MOUNT/ca.crt" --tls-client-pem "$TLS_MOUNT/proxy-client.pem" \
+      --pool-metrics "/work/$POOL_METRICS" --certificates /work/certs \
+      > "$work/haproxy.cfg" || { echo "the server list was refused; nothing changed" >&2; return 1; }
+  # A pool is always rendered with TLS: a config that says it is unencrypted is never installed.
+  if grep -q '^# UNENCRYPTED' "$work/haproxy.cfg"; then echo "the generated config is not TLS; nothing changed" >&2; return 1; fi
+  [ -s "$work/$POOL_METRICS" ] || { echo "the pool's facts for a scraper were not written; nothing changed" >&2; return 1; }
+  # HAProxy's image runs as its own unprivileged user, and mktemp -d makes the directory root-only. The
+  # candidate is validated as that user, the one the proxy itself runs as, so it gets the same modes the
+  # installed config has (0755 directory, 0644 file). No file here holds a secret. The certificates are
+  # mounted exactly where the config names them and where the proxy has them, readable by HAProxy's group.
+  # The facts are beside the config, as the config names them and as they are installed.
+  chmod 0755 "$work"
+  chmod 0644 "$work/haproxy.cfg" "$work/servers" "$work/$POOL_METRICS"
+  docker run --rm --network none -v "$work":/cfg:ro -v "$TLS_DIR":"$TLS_MOUNT":ro "$HAPROXY_IMAGE" haproxy -c -f /cfg/haproxy.cfg >/dev/null \
+    || { echo "HAProxy rejected the generated config, or cannot read its certificates or the pool's facts; nothing changed" >&2; return 1; }
+}
+
+install_and_reload() {    # WORKDIR holds a validated servers + haproxy.cfg + facts; a second argument leaves the proxy alone
+  local work=$1
+  # The facts first: HAProxy reads the file a config names when it reads the config, and refuses a config
+  # whose file is missing. A config is never in place before the file it names.
+  install -o root -g root -m 0644 "$work/$POOL_METRICS" "$DIR/haproxy/$POOL_METRICS.new"
+  mv -f "$DIR/haproxy/$POOL_METRICS.new" "$DIR/haproxy/$POOL_METRICS"
+  install -o root -g root -m 0644 "$work/haproxy.cfg" "$DIR/haproxy/haproxy.cfg.new"
+  mv -f "$DIR/haproxy/haproxy.cfg.new" "$DIR/haproxy/haproxy.cfg"
+  install -o root -g root -m 0644 "$work/servers" "$DIR/servers.new"
+  mv -f "$DIR/servers.new" "$DIR/servers"
+  [ -z "${2:-}" ] || return 0
+  # HUP makes HAProxy's master load the new config and retire the old workers once their checks finish.
+  if container_runs "$PROXY"; then
+    reload_haproxy "$PROXY" || echo "lean-pool-ctl: the config is installed, but the running proxy could not be told to load it: sudo lean-pool-ctl $POOL restart" >&2
+  fi
+}
+
+listed_name_of() {        # HOST:PORT : the name the server list gives that address (empty if it is not listed)
+  awk -v address="$1" '$1 !~ /^#/ && $2 == address {print $1; exit}' "$DIR/servers"
+}
+
+run_admission() {         # HOST:PORT WORKERS SERVER : exit 0 only if every case behaved against that ONE server
+  # Through the server's TLS front, as the proxy will reach it: with the proxy's client certificate, and
+  # holding the server to a certificate of the pool's authority for its NAME, whatever address is dialled.
+  # The proxy's private key is read inside this container (root there), from the proxy's own directory.
+  docker run --rm --network host --user 0:0 -v "$DIR/admit-cases":/cases:ro -v "$DIR/api-key":/run/pool/api-key:ro \
+    -v "$TLS_DIR":/run/pool/tls:ro "$IMAGE" leanpool-admit --server "https://$1" --api-key-file /run/pool/api-key --cases /cases \
+    --timeout "$LEAN_TIMEOUT" --concurrency "$2" \
+    --tls-ca-file /run/pool/tls/ca.crt --tls-client-pem /run/pool/tls/proxy-client.pem --tls-server-name "${3,,}"
+}
+
+ADMISSION_DETAIL=""
+admit_server() {          # HOST:PORT WORKERS SERVER : the admission test, its report shown, its outcome in one line
+  local report rc
+  report=$(run_admission "$1" "$2" "$3"); rc=$?
+  printf '%s\n' "$report" | printable_lines          # it quotes what the tested server answered
+  # In the test's own words: a TLS failure says which certificate was refused and why.
+  ADMISSION_DETAIL=$(printf '%s' "$report" | python3 "$HELPER" admission-detail --exit-code "$rc" 2>/dev/null) \
+    || ADMISSION_DETAIL="the admission test ended with status $rc"
+  return "$rc"
+}
+
+BACKEND_FAILURE=""
+add_backend() {           # SERVER HOST:PORT WORKERS [AGENT_PORT [CERTIFICATE]] : 0 added; 4 not admitted; 5 refused. Never exits.
+  # CERTIFICATE is the server's own, just signed (a join): its last day goes into the pool's facts with
+  # this render. The caller installs it among the pool's public certificates once the server is in.
+  local name=$1 address=$2 workers=$3 agent_port=${4:-} certificate=${5:-} refusal
+  echo "==> admission test against $address alone (known-good proofs must verify, known-bad must be rejected)"
+  admit_server "$address" "$workers" "$name" || { BACKEND_FAILURE="admission FAILED for $address: $ADMISSION_DETAIL"; return 4; }
+  WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+  cp "$DIR/servers" "$WORK/servers"
+  refusal=$(tool "$WORK" leanpool-haproxy-config add --servers /work/servers "$name" "$address" "$workers" ${agent_port:+--agent-port "$agent_port"} 2>&1) \
+    || { BACKEND_FAILURE="the server list refused $name: $(printf '%s' "$refusal" | printable 300)"; return 5; }
+  if [ -n "$certificate" ]; then
+    stage_certificates "$WORK" && mkdir -p "$WORK/certs/servers" && cp "$certificate" "$WORK/certs/servers/$name.crt" \
+      || { BACKEND_FAILURE="the certificate of $name could not be read"; return 5; }
+  fi
+  render_and_validate "$WORK" || { BACKEND_FAILURE="the config with $name in it was refused"; return 5; }
+  install_and_reload "$WORK"
+  rm -rf "$WORK"; WORK=""
+  echo "==> $name ($address, $workers workers) is in pool $POOL"
+}
+
+inside_pool() {           # run a Python program on the proxy's loopback
+  # In the cache container when it is up (it shares the proxy's network). With the cache stopped, in a
+  # throwaway container that joins the proxy's network instead: `status` and `check` are wanted most then.
+  # POOL_SERVER_WORKERS (`name=workers ...`, from the server list) is for `status` alone: HAProxy's
+  # statistics hold a server's limit as it is now, not the worker count it was listed with.
+  if container_runs "$CACHE"; then
+    docker exec -i -e POOL_PUBLIC_PORT="$PUBLIC_PORT" -e POOL_SERVER_WORKERS="${POOL_SERVER_WORKERS:-}" "$CACHE" python -
+  else
+    docker run --rm -i --network "container:$PROXY" --read-only --cap-drop ALL -e POOL_PUBLIC_PORT="$PUBLIC_PORT" \
+      -e POOL_SERVER_WORKERS="${POOL_SERVER_WORKERS:-}" \
+      -v "$DIR/api-key":/run/pool/api-key:ro -v "$DIR/certs/ca.crt":/run/pool/ca.crt:ro "$IMAGE" python -
+  fi
+}
+
+show_status() {
+  "${COMPOSE[@]}" ps 2>&1
+  local POOL_SERVER_WORKERS
+  POOL_SERVER_WORKERS=$(awk '$1 !~ /^#/ { sub(/#.*/, ""); if (NF >= 3) printf "%s=%s ", $1, $3 }' "$DIR/servers")
+  inside_pool <<'PY' || echo "--- the pool did not answer (is the proxy up?)"
+import csv
+import io
+import json
+import os
+import urllib.request
+
+
+def server_line(row, listed):
+    # `in flight   3/  5 of 13` is the checks a server holds, the limit HAProxy holds it to
+    # now (its worker count, or the open slots its usage agent states) and the workers it was listed with.
+    limit = row["slim"] or "-"
+    workers = listed.get(row["svname"])
+    of = f" of {workers:>2s}" if workers else ""
+    return (f"--- server {row['svname']:20s} {row['status']:10s} weight {row['weight']:>4s}  in flight {row['scur']:>3s}/{limit:>3s}{of}"
+            f"  queued {row['qcur']:>3s}  total {row['stot']}")
+
+
+listed = dict(pair.split("=", 1) for pair in os.environ.get("POOL_SERVER_WORKERS", "").split())
+
+key = open("/run/pool/api-key").read().strip()
+try:
+    request = urllib.request.Request("http://127.0.0.1:18102/status", headers={"Authorization": "Bearer " + key})
+    print("--- cache:", json.dumps(json.load(urllib.request.urlopen(request, timeout=10))))
+except Exception as error:  # noqa: BLE001 - the status report says what it could not read
+    print("--- cache: unreachable:", repr(error))
+try:
+    text = urllib.request.urlopen("http://127.0.0.1:18103/;csv", timeout=10).read().decode()
+    rows = list(csv.DictReader(io.StringIO(text.lstrip("# "))))
+    workers = 0
+    for row in rows:
+        if row["pxname"] == "checkers" and row["svname"] not in ("FRONTEND", "BACKEND"):
+            workers += int(row["slim"] or 0) if row["status"].startswith("UP") else 0
+            print(server_line(row, listed))
+        if row["pxname"] == "cache" and row["svname"] == "cache":
+            print(f"--- cache backend: {row['status']}")
+        if row["pxname"] == "checkers" and row["svname"] == "BACKEND":
+            print(f"--- checkers: queued {row['qcur']}  in flight {row['scur']}")
+    print(f"--- pool capacity: {workers} workers on servers that are up")
+except Exception as error:  # noqa: BLE001
+    print("--- haproxy stats: unreachable:", repr(error))
+PY
+  # HAProxy shows a paused server as MAINT; the list is what says it was paused on purpose.
+  local paused
+  paused=$(awk '$1 !~ /^#/ { sub(/#.*/, ""); if (NF >= 4 && $NF == "paused") printf "%s ", $1 }' "$DIR/servers")
+  [ -z "$paused" ] || echo "--- paused (listed, sent nothing; sudo lean-pool-ctl $POOL resume SERVER): ${paused% }"
+  # Days left on every certificate the pool issued (the authority's own lasts 10 years, the others 5;
+  # a box renews by joining again). Public certificates only; read with the pool's own tool.
+  docker run --rm -i --network none --read-only --cap-drop ALL -v "$DIR/certs":/certs:ro "$IMAGE" python - <<'PY' \
+    || echo "--- certificates: could not be read"
+import pathlib
+import subprocess
+
+for path in sorted(pathlib.Path("/certs").rglob("*.crt")):
+    days = subprocess.run(["leanpool-pki", "expiry", str(path)], capture_output=True, text=True).stdout.strip()
+    print(f"--- certificate {str(path.relative_to('/certs')):32s} {days or 'unreadable':>6s} days left")
+PY
+  if container_runs "$JOIN_SERVICE"; then echo "--- a join window is open (port $JOIN_PORT)"; fi
+}
+
+case "$verb" in
+  status)
+    show_status
+    ;;
+
+  servers)
+    grep -v '^[[:space:]]*#' "$DIR/servers" | grep -v '^[[:space:]]*$'
+    ;;
+
+  ca)
+    # The authority's certificate is public: a client needs it to check the front door, and nothing else.
+    cat "$DIR/certs/ca.crt"
+    ;;
+
+  check)
+    # Through the HTTPS front door on loopback, checked against the pool's authority: the front door's
+    # certificate names 127.0.0.1.
+    inside_pool <<'PY'
+import json
+import os
+import ssl
+import sys
+import urllib.request
+
+key = open("/run/pool/api-key").read().strip()
+header = "import Mathlib\n\n"
+body = {"snippets": [{"id": "valid", "code": header + "theorem pool_ctl_valid : (2 : Nat) + 2 = 4 := by\n  norm_num\n"},
+                     {"id": "invalid", "code": header + "theorem pool_ctl_invalid : (2 : Nat) + 2 = 5 := by\n  norm_num\n"}],
+        "timeout": 300, "no_cache": True}
+request = urllib.request.Request(f"https://127.0.0.1:{os.environ['POOL_PUBLIC_PORT']}/api/check", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
+try:
+    context = ssl.create_default_context(cafile="/run/pool/ca.crt")
+    reply = json.load(urllib.request.urlopen(request, timeout=900, context=context))
+except Exception as error:  # noqa: BLE001 - any failure here is the answer
+    print(json.dumps({"check": "FAILED", "reason": repr(error)}))
+    sys.exit(1)
+
+
+def rejected(result):
+    if result.get("error"):
+        return True
+    return any(m.get("severity") == "error" for m in (result.get("response") or {}).get("messages") or [])
+
+
+results = {result["id"]: result for result in reply.get("results", [])}
+passed = "valid" in results and not rejected(results["valid"]) and "invalid" in results and rejected(results["invalid"])
+print(json.dumps({"check": "ok" if passed else "FAILED", "through": "pool port " + os.environ["POOL_PUBLIC_PORT"] + " (HTTPS)",
+                  "seconds": {name: result.get("time") for name, result in results.items()}}))
+sys.exit(0 if passed else 1)
+PY
+    ;;
+
+  admit)
+    # The server is held to the certificate of its NAME: the one given, else the one the list has for the address.
+    name=${3:-$(listed_name_of "$1")}
+    [ -n "$name" ] || die "$1 is not in the server list, so its name is not known: lean-pool-ctl $POOL admit $1 $2 SERVER" 2
+    admit_server "$1" "$2" "$name"
+    rc=$?
+    [ "$rc" -eq 0 ] || echo "lean-pool-ctl: admission FAILED for $1: $ADMISSION_DETAIL" >&2
+    exit "$rc"
+    ;;
+
+  add-backend)
+    add_backend "${@:1:4}"                     # a certificate is given by a join alone, never from the command line
+    rc=$?
+    [ "$rc" -eq 0 ] || die "$BACKEND_FAILURE; the pool is unchanged" "$rc"
+    ;;
+
+  remove-backend)
+    WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+    cp "$DIR/servers" "$WORK/servers"
+    tool "$WORK" leanpool-haproxy-config remove --servers /work/servers "$1" || die "could not remove $1; the pool is unchanged" 5
+    # Its certificate leaves the pool's facts with this render, and the public certificates below.
+    stage_certificates "$WORK" || die "the pool's public certificates could not be read; the pool is unchanged" 5
+    rm -f "$WORK/certs/servers/${1,,}.crt"
+    render_and_validate "$WORK" || exit 5      # an empty list is refused: a pool keeps at least one server
+    install_and_reload "$WORK"
+    rm -f "$DIR/certs/servers/${1,,}.crt"      # its certificate still proves its name, to nobody: the proxy no longer dials it
+    echo "==> $1 is out of pool $POOL"
+    ;;
+
+  pause)
+    # The server stays in the list and keeps its certificate; the new config declares it
+    # disabled, with no agent check (the usage agent says `ready` with every reply, and HAProxy takes that
+    # as the end of a maintenance). A reload: the checks the proxy already holds finish under the old list.
+    WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+    cp "$DIR/servers" "$WORK/servers"
+    refusal=$(tool "$WORK" leanpool-haproxy-config pause --servers /work/servers "$1" 2>&1) \
+      || die "$1 was not paused: $(printf '%s' "$refusal" | printable 300); the pool is unchanged" 5
+    render_and_validate "$WORK" || exit 5
+    install_and_reload "$WORK"
+    echo "==> $1 is paused in pool $POOL: still listed, its certificate kept, sent nothing. The checks it has finish."
+    echo "    to bring it back: sudo lean-pool-ctl $POOL resume $1"
+    ;;
+
+  resume)
+    # Admission again, against that server alone, before it is sent a check: a server is
+    # usually paused because it misbehaved. The list's own refusal (no such server, not paused) comes first:
+    # it costs nothing, and the admission test takes minutes.
+    WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+    cp "$DIR/servers" "$WORK/servers"
+    refusal=$(tool "$WORK" leanpool-haproxy-config resume --servers /work/servers "$1" 2>&1) \
+      || die "$1 was not resumed: $(printf '%s' "$refusal" | printable 300); the pool is unchanged" 5
+    read -r address workers <<<"$(awk -v name="$1" '$1 == name {print $2, $3; exit}' "$DIR/servers")"
+    valid_address "${address:-}" && valid_count "${workers:-}" \
+      || die "the server list's line for $1 could not be read; the pool is unchanged" 5
+    echo "==> admission test against $address alone, before $1 is sent a check again"
+    admit_server "$address" "$workers" "$1" \
+      || die "admission FAILED for $address: $ADMISSION_DETAIL; $1 stays paused and the pool is unchanged" 4
+    render_and_validate "$WORK" || exit 5
+    install_and_reload "$WORK"
+    echo "==> $1 ($address, $workers workers) takes checks again in pool $POOL"
+    ;;
+
+  set-workers)
+    # The count a server was listed with at its join, brought in line with what its box
+    # runs now (the box is changed there: kimina-ctl set-repls). One field of one line, then a reload. No
+    # admission test: no check is sent anywhere it was not sent before, and a paused server stays paused.
+    WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+    cp "$DIR/servers" "$WORK/servers"
+    refusal=$(tool "$WORK" leanpool-haproxy-config set-workers --servers /work/servers "$1" "$2" 2>&1) \
+      || die "$1 keeps the worker count it is listed with: $(printf '%s' "$refusal" | printable 300); the pool is unchanged" 5
+    render_and_validate "$WORK" || exit 5
+    install_and_reload "$WORK"
+    echo "==> $1 is listed with $2 workers in pool $POOL. Its box was not touched: its own count is set there."
+    ;;
+
+  join-open)
+    # One window, one box, no SSH: the new box pulls a script over HTTPS, pinned to
+    # the front door's public key. The join service is an unprivileged container that runs nothing: it
+    # passes files. Everything that acts happens here, as root, after every field has been validated.
+    minutes=${2:-120}
+    command -v python3 >/dev/null && [ -f "$HELPER" ] || die "python3 and $HELPER are needed - re-run install.sh --proxy $POOL"
+    [ -s "$DIR/join/join-box.sh" ] && [ -s "$DIR/join/bundle.b64" ] || die "the join bundle is missing - re-run install.sh --proxy $POOL"
+    [[ "$JOIN_HOST" =~ ^[A-Za-z0-9.-]{1,120}$ ]] && valid_port "${JOIN_PORT:-}" && [[ "$IMAGE_GID" =~ ^[0-9]{1,10}$ ]] \
+      || die "$ENV_FILE has no usable POOL_JOIN_HOST, POOL_JOIN_PORT or POOL_IMAGE_GID - re-run install.sh --proxy $POOL"
+    exec 9>"$DIR/.join.lock"
+    flock -n 9 || die "a join window is already open for pool $POOL (one box per window)"
+    # Every way out goes through `cleanup` (the EXIT trap): Ctrl-C, a kill, a closed terminal or door.
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    trap 'exit 141' PIPE
+    docker rm -f -v "$JOIN_SERVICE" >/dev/null 2>&1      # left behind only by a window that was killed outright
+    rm -rf "$DIR"/.join.??????
+    WINDOW=$(mktemp -d "$DIR/.join.XXXXXX") || die "could not make the window's directory"
+
+    # Everything the join service reads, by the group its image runs as (read from the image at install
+    # time), and nothing else. The window's directory itself stays root-only.
+    #   serve/            root:<group> 0750   mounted read-only
+    #     token           root:<group> 0640   the window's secret
+    #     join.sh         root:<group> 0640   holds the token (in its URL), no key
+    #     front.pem       root:<group> 0640   a copy of the front door's certificate and key, for this window
+    #   spool/            root:<group> 0750   mounted read-write
+    #     requests/       root:<group> 0770   the service writes here
+    #     responses/      root:<group> 0750   only root writes here
+    #   work/             root 0700           the signing request and the signed certificate
+    install_dir_for_gid 0750 "$IMAGE_GID" "$WINDOW/serve" "$WINDOW/spool" "$WINDOW/spool/responses"
+    install_dir_for_gid 0770 "$IMAGE_GID" "$WINDOW/spool/requests"
+    install -d -o root -g root -m 0700 "$WINDOW/work"
+    # The pool's OWN names, read from what is installed: the names on the front door's certificate, the
+    # name on the proxy's client certificate, and the join host. No box is signed under one of them (or
+    # under `localhost`): its certificate would pass for the pool itself to every client that trusts the
+    # pool's authority. Read with the pool image's Python (the host may not have `cryptography`), as root
+    # there without any capability, with no network, the proxy's directory mounted read-only.
+    docker run --rm -i --network none --read-only --cap-drop ALL --user 0:0 -v "$TLS_DIR":/run/pool/tls:ro "$IMAGE" \
+        python - certificate-names /run/pool/tls/front.pem /run/pool/tls/proxy-client.pem < "$HELPER" > "$WINDOW/work/reserved" \
+      && [ -s "$WINDOW/work/reserved" ] \
+      || die "could not read the names on the pool's own certificates, so no join window was opened"
+    printf '%s\n' "$JOIN_HOST" >> "$WINDOW/work/reserved"
+    ( umask 077; head -c 16 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' > "$WINDOW/serve/token" )
+    [ "$(wc -c < "$WINDOW/serve/token")" -ge 22 ] || die "could not make a token"
+    install_for_gid 0640 "$IMAGE_GID" "$TLS_DIR/front.pem" "$WINDOW/serve/front.pem"
+    chown root:"$IMAGE_GID" "$WINDOW/serve/token"; chmod 0640 "$WINDOW/serve/token"
+    # The pin of the very file the service will present, read as the service's own user: this also shows
+    # that user can read it.
+    pin=$(docker run --rm --network none -v "$WINDOW/serve":/run/join:ro "$IMAGE" leanpool-pki pin /run/join/front.pem) \
+      || die "the join service's user cannot read the front door's certificate (group $IMAGE_GID)"
+    python3 "$HELPER" script --url-base "https://$JOIN_HOST:$JOIN_PORT" --token-file "$WINDOW/serve/token" --pin "$pin" \
+        --pool "$POOL" --lean-timeout "$LEAN_TIMEOUT" --server-wait "${SERVER_WAIT:-120}" \
+        --body "$DIR/join/join-box.sh" --bundle "$DIR/join/bundle.b64" --out "$WINDOW/serve/join.sh" \
+      || die "could not make the join script"
+    chown root:"$IMAGE_GID" "$WINDOW/serve/join.sh"; chmod 0640 "$WINDOW/serve/join.sh"
+
+    # The Lean server's image this host exported for joining boxes (install.sh --proxy), if
+    # the export is of the image this host holds NOW: a box then loads it instead of building. Mounted
+    # read-only; the service serves the manifest and the one file it names, and nothing else from there.
+    image_dir=$DIR/join/image
+    image_mount=(); image_flag=()
+    ships="no image (this host has exported none): a box builds its own"
+    if [ -s "$image_dir/manifest.json" ]; then
+      lean_image_id=$(docker image inspect -f '{{.Id}}' "$SITE_PREFIX/kimina:$(setting POOL_PIN)" 2>/dev/null || true)
+      if exported=$(python3 "$HELPER" image-export --manifest "$image_dir/manifest.json" --directory "$image_dir" \
+            --image-id "${lean_image_id:-none}" 2>&1); then
+        image_mount=(-v "$image_dir":/run/join-image:ro); image_flag=(--image-directory /run/join-image)
+        ships="the Lean server's image $(sed -n 1p <<<"$exported") ($(sed -n 5p <<<"$exported"), for $(sed -n 4p <<<"$exported") boxes): a box loads it instead of building"
+      else
+        ships="no image ($(printf '%s' "$exported" | printable 200); sudo bash install.sh --proxy $POOL exports it again): a box builds its own"
+      fi
+    fi
+
+    JOIN_STARTED=1
+    docker run -d --name "$JOIN_SERVICE" --read-only --cap-drop ALL --security-opt no-new-privileges:true --tmpfs /tmp \
+        --memory 256m --cpus 1 --pids-limit 64 -p "0.0.0.0:$JOIN_PORT:18110" \
+        -v "$WINDOW/serve":/run/join:ro -v "$WINDOW/spool":/spool -v "$DIR/api-key":/run/pool/api-key:ro \
+        ${image_mount[@]+"${image_mount[@]}"} \
+        "$IMAGE" leanpool-join --script /run/join/join.sh --token-file /run/join/token --tls-pem /run/join/front.pem \
+        --spool /spool --api-key-file /run/pool/api-key --host 0.0.0.0 --port 18110 ${image_flag[@]+"${image_flag[@]}"} >/dev/null \
+      || die "the join service could not be started (is port $JOIN_PORT in use?)"
+    sleep 2
+    if ! container_runs "$JOIN_SERVICE"; then
+      docker logs --tail 20 "$JOIN_SERVICE" 2>&1 | printable_lines >&2
+      die "the join service stopped at once (its last lines are above)"
+    fi
+
+    # The ONE place a secret is printed: the command for the new box, which holds the window's token.
+    cat <<EOF
+==> Join window open for pool $POOL: ONE box, $minutes minutes. On the new box (Linux with Docker, as a user who may sudo):
+
+  curl -fsSk --pinnedpubkey '$pin' https://$JOIN_HOST:$JOIN_PORT/j/$(cat "$WINDOW/serve/token") | sudo bash
+
+    options go after "sudo bash -s --":  --name NAME  --workers N  --cpus N  --no-firewall
+    a box that is ALREADY in this pool takes this window's installer with "sudo bash -s -- --refresh": it keeps
+    its image, key, certificate and place in the pool, the pool is asked for nothing, and the window stays open
+    (curl refuses any server but this pool's front door before it sends or receives anything: exit 90)
+==> This window ships $ships.
+==> Waiting here for the box. Ctrl-C closes the window. Nothing joins without passing the admission test.
+EOF
+
+    deadline=$(( $(date +%s) + minutes * 60 ))
+    wait_for() {          # FILE : 0 once the join service has written FILE; 1 at the window's end; 2 if the service died
+      local waited=0
+      while [ ! -e "$1" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        container_runs "$JOIN_SERVICE" || return 2
+        sleep 2
+        waited=$((waited + 1))
+        # A line every five minutes: the operator sees the window is alive, and a caller that has gone
+        # (the door's connection closed) is noticed here, which closes the window.
+        [ $((waited % 150)) -ne 0 ] || echo "    still waiting: $(( (deadline - $(date +%s)) / 60 )) minutes left in this window"
+      done
+    }
+    hand_over() {         # PATTERN : keep the service up until it logs that the box fetched its answer, at most a minute
+      local _ lines
+      for _ in $(seq 1 30); do
+        lines=$(docker logs "$JOIN_SERVICE" 2>&1)
+        grep -q "$1" <<<"$lines" && return 0
+        sleep 2
+      done
+      return 1
+    }
+    refuse_box() {        # REASON : tell the box why, and end the window
+      local reason
+      reason=$(printf '%s' "$1" | printable 400)       # it may quote the request: printable ASCII only, capped
+      python3 "$HELPER" refuse --spool "$WINDOW/spool" --reason "$reason" || true
+      echo "==> REFUSED: $reason. The pool is unchanged."
+      hand_over 'refusal of its signing request was handed' || true
+      exit 6
+    }
+
+    # 1. the signing request
+    wait_for "$WINDOW/spool/requests/csr.json"
+    case $? in
+      1) echo "==> the window closed: no box asked to join. The pool is unchanged."; exit 3 ;;
+      2) docker logs --tail 20 "$JOIN_SERVICE" 2>&1 | printable_lines >&2; die "the join service stopped; the pool is unchanged" ;;
+    esac
+    # Every field again, here, with the door's own patterns for add-backend. Refused before anything is
+    # signed: a name that is not one DNS label, one of the pool's own names, and a name or an address that
+    # is already in the server list.
+    fields=$(python3 "$HELPER" request --spool "$WINDOW/spool" --servers "$DIR/servers" --reserved "$WINDOW/work/reserved" \
+        --csr-out "$WINDOW/work/request.csr") \
+      || refuse_box "${fields:-the join request could not be read}"
+    read -r name caller lean_port agent_port workers <<<"$fields"
+    valid_server_name "$name" && valid_address "$caller:$lean_port" && valid_port "$agent_port" && valid_count "$workers" \
+      || refuse_box "the join request has a malformed field"
+    echo "==> $caller asks to join as '$name': $workers workers, Lean port $lean_port, usage port $agent_port"
+    # Signed for exactly that name, as a server certificate, whatever the request itself asks for. The
+    # authority's directory is mounted read-only, in a container with no network.
+    signing=$(docker run --rm --network none --user 0:0 -v "$DIR/pki/ca":/pki/ca:ro -v "$WINDOW/work":/work "$IMAGE" \
+        leanpool-pki sign-csr --ca-dir /pki/ca --csr /work/request.csr --out /work/box.crt --allow-dns "$name" 2>&1) \
+      || refuse_box "the signing request was not signed: $(printf '%s' "$signing" | printable 240)"
+    python3 "$HELPER" certificate-response --spool "$WINDOW/spool" --certificate "$WINDOW/work/box.crt" --ca "$DIR/certs/ca.crt" \
+      || die "could not hand the certificate to the join service; the pool is unchanged"
+    echo "==> signed a server certificate for '$name' and nothing else; the box now installs its Lean server (the long part)"
+
+    # 2. the box is ready
+    wait_for "$WINDOW/spool/requests/ready.json"
+    case $? in
+      1) echo "==> the window closed before '$name' was ready. The pool is unchanged; open a new window and run the new command there."; exit 3 ;;
+      2) docker logs --tail 20 "$JOIN_SERVICE" 2>&1 | printable_lines >&2; die "the join service stopped; the pool is unchanged" ;;
+    esac
+    python3 "$HELPER" ready --spool "$WINDOW/spool" --caller "$caller" || die "the ready notice is not from $caller; the pool is unchanged"
+    # Where the pool will dial the box: its name, if this host's resolver AND the proxy's map it to the
+    # address the request came from (NAME.<the LAN's domain> first, then NAME); otherwise that address.
+    host_lookup=$(python3 "$HELPER" lookup "$name.$SITE_LAN_DOMAIN" "$name" 2>/dev/null || true)
+    proxy_lookup=$(docker run --rm -i --network "container:$PROXY" --read-only --cap-drop ALL "$IMAGE" python - lookup "$name.$SITE_LAN_DOMAIN" "$name" < "$HELPER" 2>/dev/null || true)
+    chosen=$(python3 "$HELPER" choose-address --name "$name" --caller "$caller" --host-lookup "$host_lookup" --proxy-lookup "$proxy_lookup" --domain "$SITE_LAN_DOMAIN") \
+      || die "could not choose the box's address; the pool is unchanged"
+    box_host=$(sed -n 1p <<<"$chosen")
+    echo "==> '$name' is ready at $box_host:$lean_port ($(sed -n 2p <<<"$chosen"))"
+    valid_address "$box_host:$lean_port" || die "the chosen address is malformed; the pool is unchanged"
+
+    # 3. the existing add-backend path: admission against that server ALONE (mutual TLS, held to its name),
+    #    then add, validate, reload.
+    add_backend "$name" "$box_host:$lean_port" "$workers" "$agent_port" "$WINDOW/work/box.crt"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      install -o root -g root -m 0644 "$WINDOW/work/box.crt" "$DIR/certs/servers/$name.crt"
+      python3 "$HELPER" verdict --spool "$WINDOW/spool" --admitted yes \
+        --detail "$name ($box_host:$lean_port, $workers workers) is serving checks in pool $POOL: $ADMISSION_DETAIL" || true
+    else
+      echo "==> NOT ADMITTED: $BACKEND_FAILURE. The pool is unchanged."
+      python3 "$HELPER" verdict --spool "$WINDOW/spool" --admitted no --detail "$BACKEND_FAILURE; the pool is unchanged" || true
+    fi
+    hand_over 'verdict .* was handed' || echo "(the box did not fetch its verdict within a minute; the result above stands)"
+    echo "==> pool $POOL now"
+    show_status
+    exit "$rc"
+    ;;
+
+  logs)
+    "${COMPOSE[@]}" logs --no-color --tail "${1:-100}" 2>&1 | tail -n "${1:-100}"
+    ;;
+
+  restart)
+    "${COMPOSE[@]}" up -d --force-recreate 2>&1 | tail -n 6
+    ;;
+
+  reload)
+    reload_haproxy "$PROXY" || die "the proxy could not be told to reload (is it running? sudo lean-pool-ctl $POOL status)"
+    ;;
+
+  cache-stop)
+    # HAProxy notices on the first failed connection and sends checks straight to the Lean servers.
+    docker stop "$CACHE" >/dev/null && echo "cache stopped: checks keep flowing, uncached"
+    ;;
+
+  cache-start)
+    docker start "$CACHE" >/dev/null && echo "cache started"
+    ;;
+
+  render)
+    # Rebuild haproxy.cfg from the current server list and settings (install, or after a settings change).
+    # --check validates and installs nothing; --no-reload installs without telling the running proxy.
+    WORK=$(mktemp -d "$DIR/.work.XXXXXX")
+    cp "$DIR/servers" "$WORK/servers"
+    render_and_validate "$WORK" || exit 5
+    [ "${1:-}" != --check ] || { echo "the config is valid; nothing was installed"; exit 0; }
+    if [ "${1:-}" = --no-reload ]; then install_and_reload "$WORK" keep; else install_and_reload "$WORK"; fi
+    # The generator states how long the cache must wait for the checkers; install-pool.sh reads it here.
+    sed -n 's/^# The cache must wait at least \([0-9]*\)s.*/cache_upstream_timeout=\1/p' "$DIR/haproxy/haproxy.cfg"
+    ;;
+esac
