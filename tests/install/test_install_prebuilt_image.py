@@ -24,6 +24,7 @@ EXAMPLE = INSTALLERS / "site.example"
 REFERENCE = "projectnumina/kimina-lean-server:2.0.0"
 IMAGE = "leanpool/kimina:kimina-2.0.0"
 LEAN = "leanpool-kimina-upstream"
+AGENT = "leanpool-agent-upstream"
 INSTANCE = "/srv/kimina-upstream"
 
 
@@ -158,7 +159,8 @@ def test_another_reference_is_pulled_and_the_server_is_made_again_once(
         f"docker pull {newer}",
         f"docker tag {newer} {IMAGE}",
     ]
-    assert machine.recreated() == [*recreated, LEAN] and machine.container_id(LEAN) not in (
+    # The usage agent too, once: the instance's values are in the installer's version it states.
+    assert machine.recreated() == [*recreated, LEAN, AGENT] and machine.container_id(LEAN) not in (
         "",
         lean,
     )

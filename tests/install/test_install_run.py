@@ -1379,6 +1379,7 @@ def test_the_instances_own_status_shows_its_front_and_instance_one_has_none(pool
 # --- the Lean server has an init process, and `status` shows its zombies -------------------------------------
 
 LEAN = "acme-kimina-demo"
+AGENT = "acme-agent-demo"
 
 
 def status(
@@ -1525,7 +1526,8 @@ def test_a_pool_refresh_makes_this_hosts_lean_server_again_once_when_its_compose
 ):
     """A refresh (`install.sh --proxy`) installs the Lean server's
     compose file and brings the service up: a server made from another file is made again, once, and that is
-    how the pool's own host gets the init process. It builds no image and makes no other container again."""
+    how the pool's own host gets the init process. It builds no image and makes no other container again but
+    the usage agent, once, whose settings now carry the newer installer's version."""
     # A host installed before the init process: its Lean server made from a file without the line.
     pool.deploy = before_the_init_process(deploy, tmp_path / "before")
     assert pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES).returncode == 0
@@ -1536,14 +1538,19 @@ def test_a_pool_refresh_makes_this_hosts_lean_server_again_once_when_its_compose
         len(lean_builds(pool)),
         pool.mark(),
     )
-    others = {name: pool.container_id(name) for name in EVERY_CONTAINER if name != LEAN}
+    others = {
+        name: pool.container_id(name) for name in EVERY_CONTAINER if name not in (LEAN, AGENT)
+    }
     # Today's files.
     pool.deploy = deploy
     result = pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES)
     assert result.returncode == 0 and "POOL INSTALLED AND VERIFIED" in result.stdout, (
         result.stdout[-3000:] + result.stderr[-3000:]
     )
-    assert pool.recreated() == [*recreated, LEAN] and pool.container_id(LEAN) not in ("", lean)
+    assert pool.recreated() == [*recreated, LEAN, AGENT] and pool.container_id(LEAN) not in (
+        "",
+        lean,
+    )
     assert {name: pool.container_id(name) for name in others} == others
     assert len(lean_builds(pool)) == builds  # a refresh never builds the Lean image
     compose = pool.path(f"{INSTANCE}/docker-compose.yml").read_text()
@@ -2298,7 +2305,14 @@ def joined(joining, deploy, tmp_path):
     return joining
 
 
-def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_is_made_again(
+def but_the_installers_version(settings: bytes) -> list[bytes]:
+    """An instance's settings, every line but the installer's version."""
+    return [
+        line for line in settings.splitlines() if not line.startswith(b"KIMINA_INSTALLER_VERSION=")
+    ]
+
+
+def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_and_agent_are_made_again(
     joined, deploy, tmp_path
 ):
     pool, box = joined.pool, joined.box
@@ -2307,10 +2321,11 @@ def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_is_m
     had = SimpleNamespace(
         certificate=box.path(f"{INSTANCE}/tls/box.pem").read_bytes(),
         settings=box.path(f"{INSTANCE}/kimina.env").read_bytes(),
+        version=setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION"),
         stamp=box.path(f"{INSTANCE}/image.built").read_bytes(),
         lean=box.container_id(LEAN),
         recreated=box.recreated(),
-        others={name: box.container_id(name) for name in ("acme-front-demo", "acme-agent-demo")},
+        others={name: box.container_id(name) for name in ("acme-front-demo",)},
         builds=len(lean_builds(box)),
         servers=pool.path(f"{POOL}/servers").read_bytes(),
         config=pool.path(f"{POOL}/haproxy/haproxy.cfg").read_bytes(),
@@ -2320,22 +2335,29 @@ def test_a_box_in_the_pool_takes_the_new_installer_and_only_its_lean_server_is_m
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     assert steps(result) == ["1/3", "2/3", "3/3"] and "REFRESHED: 'box-a'" in result.stdout
     assert "INSTALLED AND VERIFIED" in result.stdout  # the installer's own check ran
-    # The box: today's compose file, in a pool member's form, and its Lean server made again, once, with an init.
+    # The box: today's compose file, in a pool member's form, and its Lean server made again, once, with an init;
+    # its usage agent made again, once, for the newer installer's version.
     compose = box.path(f"{INSTANCE}/docker-compose.yml").read_text()
     assert "\n    init: true\n" in compose and "ports:" not in compose
-    assert box.recreated() == [*had.recreated, LEAN] and box.container_id(LEAN) not in (
+    assert box.recreated() == [*had.recreated, LEAN, AGENT] and box.container_id(LEAN) not in (
         "",
         had.lean,
     )
+    version = setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    assert version != had.version and version == setting_of(
+        pool, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION"
+    )
     assert "--- init process: yes" in status(box, "@demo").stdout
-    # What it had, it has: the image (not built, not loaded) and its record, the key and every setting, the
-    # certificate, the front and the agent.
+    # What it had, it has: the image (not built, not loaded) and its record, the key and every setting but the
+    # installer's version, the certificate and the front.
     calls = box.calls_since(box_mark)
     assert len(lean_builds(box)) == had.builds and not any(
         call.startswith("docker load") for call in calls
     )
     assert box.path(f"{INSTANCE}/image.built").read_bytes() == had.stamp
-    assert box.path(f"{INSTANCE}/kimina.env").read_bytes() == had.settings
+    assert but_the_installers_version(
+        box.path(f"{INSTANCE}/kimina.env").read_bytes()
+    ) == but_the_installers_version(had.settings)
     assert box.path(f"{INSTANCE}/tls/box.pem").read_bytes() == had.certificate
     assert {name: box.container_id(name) for name in had.others} == had.others
     assert not any("leanpool-pki csr" in call for call in calls)  # no key was made

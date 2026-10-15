@@ -27,6 +27,7 @@ pytestmark = [
 INSTANCE = "/srv/kimina-demo"
 NATIVE = f"{INSTANCE}/native"
 LEAN = "acme-kimina-demo"
+AGENT = "acme-agent-demo"
 CTL = "/usr/local/bin/kimina-ctl"
 INSTALL = ("install.sh", "--instance", "demo", "--no-door")
 LAUNCHER = "/opt/lean-native/repl-native"
@@ -169,7 +170,8 @@ def test_a_changed_file_of_the_four_makes_the_library_again_and_not_the_server(
     tmp_path, machine, changed
 ):
     """The library is a function of the image and of these files. The server's definition did not change, so
-    its container stays: a worker loads the new library when it next starts."""
+    its container stays: a worker loads the new library when it next starts. The usage agent is made again,
+    once: the installer's version it states is of these files too."""
     newer = rewritten_installers(tmp_path / "newer")
     with open(newer / changed, "a") as handle:
         handle.write("\n# one more line\n")
@@ -177,7 +179,7 @@ def test_a_changed_file_of_the_four_makes_the_library_again_and_not_the_server(
     machine.deploy = newer
     result = installed(machine)
     assert f"COMPILED SEARCH STEP: on - {MEASURED}" in result.stdout
-    assert len(machine.native_builds()) == had[1] + 1 and machine.recreated() == had[0]
+    assert len(machine.native_builds()) == had[1] + 1 and machine.recreated() == [*had[0], AGENT]
     assert (
         machine.path(f"{NATIVE}/repl-native").read_bytes()
         == (newer / "lean-native-repl").read_bytes()
@@ -264,7 +266,7 @@ def test_a_box_that_had_the_step_loses_it_when_a_newer_build_does_not_pass(tmp_p
         and not machine.path(f"{INSTANCE}/native.built").exists()
     )
     assert settings(machine)["KIMINA_REPL_PATH"] == PLAIN
-    assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [*had, LEAN]
+    assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [*had, LEAN, AGENT]
 
 
 # --- the switch ---------------------------------------------------------------------------------------------------

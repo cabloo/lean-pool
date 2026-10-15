@@ -512,8 +512,9 @@ def test_the_lean_server_is_started_in_the_control_group_its_settings_name():
 
 def test_the_usage_agent_is_told_how_to_measure_open_slots_with_a_front_and_without():
     """The worker count, the cpu.stat of the Lean server's control group, the reserve and the
-    box's limit beside other work come from the settings (empty means "not set" to the agent), and the box's
-    control groups are its one host mount, read-only. The front beside it is given none of this."""
+    box's limit beside other work come from the settings (empty means "not set" to the agent), and so does the
+    installer's version it states; the box's control groups are its one host mount, read-only. The front beside
+    it is given none of this."""
     yaml = pytest.importorskip("yaml")
     plain = yaml.safe_load((INSTALLERS / "docker-compose.agent.yml").read_text())["services"][
         "agent"
@@ -527,6 +528,7 @@ def test_the_usage_agent_is_told_how_to_measure_open_slots_with_a_front_and_with
             "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH": "${KIMINA_AGENT_LEAN_CPU_STAT:-}",
             "LEANPOOL_AGENT_CPU_RESERVE": "${KIMINA_AGENT_CPU_RESERVE:-}",
             "LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK": "${KIMINA_AGENT_BESIDE_OTHER_WORK:-}",
+            "LEANPOOL_AGENT_VERSION": "${KIMINA_INSTALLER_VERSION:-}",
         }
         assert agent["volumes"] == ["/sys/fs/cgroup:/host-cgroup:ro"]
         assert agent["read_only"] is True and agent["cap_drop"] == ["ALL"]
