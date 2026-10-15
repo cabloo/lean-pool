@@ -62,6 +62,8 @@ The reply::
     "ready up N%"                 no slots stated
     "ready up N% maxconn:S"       S open slots, 1 or more
 
+An agent told the installer's version ends each of these with `` # version V``.
+
 ``drain`` leaves the server up: it finishes the checks it has and is sent no new one. The ``0%``
 beside it sets the server's weight to 0, which is what the pool's own count of open slots reads
 to leave a drained server out (HAProxy's ``srv_is_up`` is true for a drained server). ``ready``
@@ -196,6 +198,19 @@ def agent_reply(state: BoxState, memory_floor_bytes: int) -> str:
     if state.open_slots is not None:
         words.append(f"maxconn:{state.open_slots}")
     return " ".join(words) + "\n"
+
+
+def with_installer_version(reply: str, installer_version: str | None) -> str:
+    """Return the reply with `` # version V`` before its newline, or unchanged without a version.
+
+    HAProxy reads no word after a ``#``. After a reply that says ``up`` it keeps the text as the
+    server's check description (``via agent : up (version V)``, the statistics' ``last_agt``),
+    so the pool can list the version each box runs. After a ``drain`` it keeps none.
+    """
+    if installer_version is None:
+        return reply
+    line = reply.removesuffix("\n")
+    return f"{line} # version {installer_version}\n"
 
 
 def _limit_to_unit(value: float) -> float:

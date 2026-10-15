@@ -14,7 +14,8 @@
 #
 #   [@NAME] status                      container state, health, memory, processes and zombies, whether it
 #                                       has an init process, its CPU priority, its memory ceiling beside the
-#                                       box's memory, what its usage agent says, settings (never the key)
+#                                       box's memory, what its usage agent says, settings (never the key),
+#                                       the installer's version (on the health line)
 #   [@NAME] check                       one valid and one invalid proof through the live server
 #   [@NAME] logs [N]                    last N server log lines (default 100, max 500)
 #   [@NAME] logs build                  tail of the last image build log
@@ -352,7 +353,7 @@ agent_line() {
   said=$(agent_says "$1")
   case "$said" in
     *maxconn:*) echo "--- usage agent says: $said (maxconn = the open slots: the checks that fit beside this box's other work, of $(setting KIMINA_MAX_REPLS) workers)" ;;
-    "drain 0%") echo "--- usage agent says: $said (no check fits beside this box's other work, or memory is below the floor: the pool sends none)" ;;
+    "drain 0%"|"drain 0% #"*) echo "--- usage agent says: $said (no check fits beside this box's other work, or memory is below the floor: the pool sends none)" ;;
     "") echo "--- usage agent says: ? (it did not answer)" ;;
     *) echo "--- usage agent says: $said (open slots are NOT stated: the pool may send this box a check for every worker, whatever else runs here)" ;;
   esac
@@ -444,7 +445,10 @@ PY
 case "$verb" in
   status)
     "${COMPOSE[@]}" ps 2>&1
-    echo "--- health: $(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$CONTAINER" 2>&1)"
+    # The installer's version, as the installer wrote it: its first 12 digits, as `lean-pool-ctl status` shows it.
+    version=$(setting KIMINA_INSTALLER_VERSION)
+    version=${version:0:12}
+    echo "--- health: $(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' "$CONTAINER" 2>&1) (installer version ${version:-?})"
     echo "--- image: $(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>&1)"
     usage=$(docker stats --no-stream --format '--- usage: cpu {{.CPUPerc}}  mem {{.MemUsage}}  pids {{.PIDs}}' "$CONTAINER" 2>&1)
     # The zombie count goes LAST on the line: whatever reads `pids N` from it keeps reading it.

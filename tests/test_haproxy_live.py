@@ -27,7 +27,7 @@ from support import API_KEY, AUTHORIZED, PIN, StartLeanServer
 
 from leanpool.agent import AgentSettings, UsageAgent, UsageSampler
 from leanpool.haproxy import LeanServer
-from leanpool.haproxy.config import AGENT_INTERVAL_SECONDS
+from leanpool.haproxy.config import AGENT_INTERVAL_SECONDS, render_haproxy_config
 from leanpool.signals import PoolCapacity
 
 pytestmark = pytest.mark.skipif(HAPROXY is None, reason="HAProxy is not installed")
@@ -435,6 +435,81 @@ async def test_haproxy_applies_what_the_usage_agent_reports(
         assert (unreached["status"], unreached["weight"]) == ("UP", str(FULL_WEIGHT))
     finally:
         await agent.close()
+
+
+INSTALLER_VERSION = "0123456789abcdef0123456789abcdef"
+
+
+async def test_haproxy_keeps_the_installers_version_the_usage_agent_states(
+    start_lean_server: StartLeanServer, start_pool: StartPool, tmp_path: Path
+) -> None:
+    """An answer that ends ``# version V`` sets the weight as before, and after an ``up`` HAProxy
+    keeps the text as the server's agent description (``last_agt``), where the pool's status
+    reads it. After a ``drain`` it keeps none."""
+    lean = await start_lean_server()
+    pool = await start_pool(lean, started=False)
+    agent_port = free_port()
+    write_box(tmp_path, busy_ticks=0, idle_ticks=0, available_bytes=64 * GIBIBYTE)
+    agent = UsageAgent(
+        dataclasses.replace(
+            AgentSettings(),
+            host="127.0.0.1",
+            port=agent_port,
+            stat_path=tmp_path / "stat",
+            meminfo_path=tmp_path / "meminfo",
+            installer_version=INSTALLER_VERSION,
+        )
+    )
+    await agent.start()
+    servers = [LeanServer("with-agent", "127.0.0.1", lean.port, WORKERS, agent_port)]
+
+    async def reaches(status: str, weight: int, description: str) -> None:
+        async def reached() -> bool:
+            state = await pool.server_state("checkers", "with-agent")
+            return (state["status"], state["weight"], state["last_agt"]) == (
+                status,
+                str(weight),
+                description,
+            )
+
+        await eventually(reached)
+
+    try:
+        await pool.start_cache()
+        await pool.start_haproxy(pool.render(servers))
+
+        write_box(tmp_path, busy_ticks=500, idle_ticks=500, available_bytes=64 * GIBIBYTE)
+        agent.sampler.sample()
+        assert agent.sampler.reply() == f"ready up 50% # version {INSTALLER_VERSION}\n"
+        await reaches("UP", FULL_WEIGHT // 2, f"via agent : up (version {INSTALLER_VERSION})")
+
+        write_box(tmp_path, busy_ticks=500, idle_ticks=1500, available_bytes=1 * GIBIBYTE)
+        agent.sampler.sample()
+        assert agent.sampler.reply() == f"drain # version {INSTALLER_VERSION}\n"
+        await reaches("DRAIN (agent)", FULL_WEIGHT // 2, "")
+    finally:
+        await agent.close()
+
+
+async def test_health_carries_the_installers_version_when_the_settings_name_one(
+    start_lean_server: StartLeanServer,
+    start_pool: StartPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    lean = await start_lean_server()
+    pool = await start_pool(lean, started=False)
+    settings = dataclasses.replace(pool.settings, installer_version=INSTALLER_VERSION)
+    await pool.start_cache()
+    await pool.start_haproxy(render_haproxy_config(pool.servers, settings))
+    async with session.get(f"{pool.url}/health") as reply:
+        assert reply.status == 200
+        assert await reply.json() == {
+            "status": "ok",
+            "workers": WORKERS,
+            "queued": 0,
+            "servers": 1,
+            "version": INSTALLER_VERSION,
+        }
 
 
 async def test_a_drained_server_keeps_its_workers_in_the_count_and_takes_no_checks(

@@ -29,6 +29,8 @@ SERVERS_HEADER = "X-Lean-Pool-Servers"
 WORKERS_FIELD = "workers"
 QUEUED_FIELD = "queued"
 SERVERS_FIELD = "servers"
+# And, when the pool's settings name one, the version of the installer that set up its host.
+VERSION_FIELD = "version"
 
 _LARGEST_COUNT = 1_000_000
 

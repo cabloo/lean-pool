@@ -175,6 +175,58 @@ def test_the_upgrade_ends_verified_over_https(upgraded):
     )
 
 
+def setting_of(machine: Machine, path: str, key: str) -> str:
+    """One KEY=VALUE of a settings file the installers wrote (empty when absent)."""
+    return next(
+        (
+            line.split("=", 1)[1]
+            for line in machine.path(path).read_text().splitlines()
+            if line.startswith(f"{key}=")
+        ),
+        "",
+    )
+
+
+def test_the_upgrade_records_one_installer_version_for_the_pool_and_its_own_server(upgraded):
+    """The version is written for the usage agent of the pool's own server and for the pool's
+    /health, the same for both; `kimina-ctl status` shows its first 12 digits."""
+    machine = upgraded.machine
+    version = setting_of(machine, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    assert re.fullmatch(r"[0-9a-f]{32}", version), version
+    assert setting_of(machine, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION") == version
+    assert f',"version":"{version}"}}\'' in machine.path(f"{POOL}/haproxy/haproxy.cfg").read_text()
+    # The agent behind the front is handed it by its compose file.
+    assert (
+        "LEANPOOL_AGENT_VERSION: ${KIMINA_INSTALLER_VERSION:-}"
+        in machine.path(f"{INSTANCE}/docker-compose.front.yml").read_text()
+    )
+    output = status(machine, "@demo").stdout
+    (health,) = [line for line in output.splitlines() if line.startswith("--- health: ")]
+    assert health.endswith(f" (installer version {version[:12]})"), health
+
+
+def test_a_plain_instance_with_an_agent_records_the_installers_version(today):
+    """No pool yet: the agent beside `demo` publishes its own port, and is handed the version too."""
+    version = setting_of(today, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION")
+    assert re.fullmatch(r"[0-9a-f]{32}", version), version
+    assert (
+        "LEANPOOL_AGENT_VERSION: ${KIMINA_INSTALLER_VERSION:-}"
+        in today.path(f"{INSTANCE}/docker-compose.agent.yml").read_text()
+    )
+    # Instance 1 runs no agent, and its settings are as they were: no version, and its status says so.
+    assert "KIMINA_INSTALLER_VERSION" not in today.path("/srv/kimina/kimina.env").read_text()
+    assert " (installer version ?)" in status(today).stdout
+
+
+def test_a_drain_that_states_the_version_is_read_as_a_drain(pool):
+    version = "0123456789abcdef0123456789abcdef"
+    output = status(pool, "@demo", STUB_AGENT_SAYS=f"drain 0% # version {version}").stdout
+    assert (
+        f"--- usage agent says: drain 0% # version {version} (no check fits beside this box's other work"
+        in output
+    )
+
+
 def test_the_upgrade_gives_the_pools_own_lean_server_the_compiled_search_step(upgraded):
     """What `install.sh --proxy` does for the compiled search step on the pool's host: the pool's own Lean
     server runs its workers through it."""
@@ -1786,6 +1838,12 @@ def test_a_box_joins_over_https_with_no_ssh_and_serves_under_its_own_certificate
         "KIMINA_SERVER_NAME=box-a" in settings
         and "KIMINA_MAX_REPLS=2" in settings
         and "KIMINA_MEM_LIMIT=12g" in settings
+    )
+    # The version the box computed from the bundle it unpacked is the one the pool's host computed from its
+    # checkout: one installer, one version.
+    assert re.search(r"^KIMINA_INSTALLER_VERSION=[0-9a-f]{32}$", settings, re.MULTILINE)
+    assert setting_of(box, f"{INSTANCE}/kimina.env", "KIMINA_INSTALLER_VERSION") == setting_of(
+        pool, f"{POOL}/pool.env", "POOL_INSTALLER_VERSION"
     )
     assert "ports:" not in box.path(f"{INSTANCE}/docker-compose.yml").read_text()
     assert (
@@ -3957,6 +4015,7 @@ def test_the_pools_status_line_says_in_flight_open_slots_and_workers(monkeypatch
     }
     assert scope["server_line"](row, scope["listed"]) == (
         "--- server desk-1               UP         weight   22  in flight   3/  5 of 13  queued   0  total 941"
+        "  version ?"
     )
     drained = {**row, "status": "DRAIN (agent)", "weight": "0", "scur": "0", "slim": "13"}
     assert "DRAIN (agent) weight    0  in flight   0/ 13 of 13" in scope["server_line"](
@@ -3965,8 +4024,35 @@ def test_the_pools_status_line_says_in_flight_open_slots_and_workers(monkeypatch
     # A server the list does not name (an older tool beside a newer list) is shown without a list's name.
     unknown = {**row, "svname": "laptop"}
     assert scope["server_line"](unknown, scope["listed"]).endswith(
-        "in flight   3/  5  queued   0  total 941"
+        "in flight   3/  5  queued   0  total 941  version ?"
     )
+
+
+@pytest.mark.parametrize(
+    ("last_agt", "shown"),
+    [
+        ("via agent : up (version 0123456789abcdef0123456789abcdef)", "0123456789ab"),
+        ("via agent : up (version 0123ab)", "0123ab"),
+        # Installed before it stated one, a drain (HAProxy keeps no text of it), no agent at all.
+        ("via agent : up", "?"),
+        ("", "?"),
+        ("agent reports an error : nonsense", "?"),
+    ],
+)
+def test_the_pools_status_line_ends_with_the_version_the_boxs_agent_states(last_agt, shown):
+    scope: dict[str, Any] = {}
+    exec(status_program(), scope)
+    row = {
+        "svname": "desk-1",
+        "status": "UP",
+        "weight": "22",
+        "scur": "3",
+        "slim": "5",
+        "qcur": "0",
+        "stot": "941",
+        "last_agt": last_agt,
+    }
+    assert scope["server_line"](row, {}).endswith(f"total 941  version {shown}")
 
 
 def test_status_hands_the_listed_worker_counts_to_the_program(pool):

@@ -157,3 +157,16 @@ That is how the deployment this project was written for runs it
 ([its record](verification.md#the-deployments-record)), and how the
 [installers](../deploy/install/README.md) set a box up: `install_cpu_priority` in `pool-lib.sh`
 writes the slice and these settings.
+
+## The installer's version
+
+An agent given `--installer-version V` ends every reply with ` # version V`:
+`ready up 87% maxconn:5 # version 0123...`. HAProxy reads no word after a `#`. After a reply that
+says `up` it keeps the text as the server's check description, `via agent : up (version V)`,
+which is the `last_agt` field of its statistics. Weights, open slots and drains are exactly as
+without it. After a `drain` HAProxy keeps no description, so a drained box shows no version
+until its next `up`.
+
+The [installers](../deploy/install/README.md) give each agent the md5 of everything a join bundle
+carries (`installer_version` in `pool-lib.sh`), so `lean-pool-ctl NAME status` can say which
+installer each box of the pool last ran, and `GET /health` carries the pool host's own.

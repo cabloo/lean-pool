@@ -39,6 +39,7 @@ reference.
 | `--cpu-reserve` | `LEANPOOL_AGENT_CPU_RESERVE` | `1.0` | Cores left free beside the box's other work before a check counts as fitting. |
 | `--cpu-topology-path` | `LEANPOOL_AGENT_CPU_TOPOLOGY_PATH` | `/sys/devices/system/cpu` | Where the kernel says which logical CPUs share a core. Slots are counted in cores. |
 | `--slots-beside-other-work` | `LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK` | not set | The most open slots stated while the box also runs other work (a CPU or more busy with something else): a number measured for the box. Not set: no such limit. |
+| `--installer-version` | `LEANPOOL_AGENT_VERSION` | not set | The version of the installer that set the box up, 1 to 64 lower-case hex digits. Every reply then ends `# version V`, which HAProxy keeps as the server's check description and otherwise ignores (see [The installer's version](usage-agent.md#the-installers-version)). Not set: the replies carry none. |
 
 ## `leanpool-haproxy-config`
 
@@ -85,6 +86,7 @@ Options of `render`:
 | `--agent-tunnel-port` | `LEANPOOL_HAPROXY_AGENT_TUNNEL_PORT` | `18300` | With TLS, the first of the loopback ports the usage agents are asked through: one per server, counting up. |
 | `--pool-metrics` | `LEANPOOL_HAPROXY_POOL_METRICS` | none | Also write the pool's facts for a Prometheus scraper to this file, and have HAProxy answer `GET /metrics/pool` with it. Install the file beside `haproxy.cfg` under the same name. See [Metrics for Prometheus](haproxy.md#metrics-for-prometheus). |
 | `--certificates` | `LEANPOOL_HAPROXY_CERTIFICATES` | none | With `--pool-metrics`: a directory of public certificates. The end of validity of every `*.crt` file under it is written to the facts, under the file's path there. |
+| `--installer-version` | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | none | The version of the installer that set up the pool's host, 1 to 64 lower-case hex digits. `GET /health` then ends `"version":"V"`. Not set: the body is without it. |
 
 The three TLS files are paths as HAProxy sees them (inside its container). They are written into
 the configuration, not read by `render`, so they are absolute paths of letters, digits, `.`,

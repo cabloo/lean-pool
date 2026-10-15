@@ -811,6 +811,7 @@ install_usage_agent() {
   set_env_in "$dir/kimina.env" KIMINA_AGENT_IMAGE "$LEAN_POOL_IMAGE"
   set_env_in "$dir/kimina.env" KIMINA_AGENT_CONTAINER "$container"
   set_env_in "$dir/kimina.env" KIMINA_AGENT_PORT "$port"
+  record_installer_version "$dir/kimina.env" "$instance"
   docker compose --project-name "$container" --env-file "$dir/kimina.env" -f "$dir/docker-compose.agent.yml" up -d
   if [ -n "$subnet" ]; then
     install_lan_firewall "agent${instance:+-$instance}" "$port" "$subnet"
@@ -979,6 +980,7 @@ install_tls_front() {
   set_env_in "$env" KIMINA_AGENT_IMAGE "$LEAN_POOL_IMAGE"
   set_env_in "$env" KIMINA_AGENT_CONTAINER "$agent"
   set_env_in "$env" KIMINA_AGENT_PORT "$agent_port"
+  record_installer_version "$env" "$instance"
 
   # From here on containers change. An agent that still publishes its own port (the plain install) goes:
   # the front's project brings it back, unpublished.
@@ -1061,6 +1063,46 @@ pack_join_bundle() {
   tar -czf - -C "$stage" --owner=0 --group=0 join | base64 > "$out" \
     || { rm -rf "$stage"; die "could not pack the join bundle"; }
   rm -rf "$stage"
+}
+
+# installer_version INSTANCE : the version of this installer, one md5 of everything a join bundle of INSTANCE
+# carries (pack_join_bundle): the installer's files, the site's values for INSTANCE and the lean-pool project's
+# source as the bundle packs it. It is the md5 of the list `md5  path` (installer_files), one line a file, with
+# the file's path in the bundle, sorted by path. The pool's host computes it from its checkout and a joined
+# box from the bundle it unpacked, so one release gives one version on every box. Prints 32 hex digits;
+# fails, printing nothing, when a file is missing.
+installer_version() {
+  local files
+  files=$(installer_files "$1") || return 1
+  printf '%s\n' "$files" | md5sum | cut -c 1-32
+}
+installer_files() {       # INSTANCE : the list installer_version hashes
+  local instance=${1:-default} source file recipe lines=""
+  source=$(lean_pool_source) || return 1
+  [ -f "$SITE/instances/$instance.env" ] || return 1
+  read -r -a recipe <<<"$(setting_in "$SITE/instances/$instance.env" INSTANCE_BUILD_FILES)"
+  for file in "${LEAN_POOL_JOIN_FILES[@]}"; do
+    [ -f "$SRC/$file" ] || return 1
+    lines+="$(md5sum < "$SRC/$file" | cut -c 1-32)  $file"$'\n'
+  done
+  for file in site.env "instances/$instance.env" ${recipe[@]+"${recipe[@]}"}; do
+    [ -f "$SITE/$file" ] || return 1
+    lines+="$(md5sum < "$SITE/$file" | cut -c 1-32)  site/$file"$'\n'
+  done
+  # The same files as the bundle's tar of the project: no __pycache__ anywhere.
+  while IFS= read -r file; do
+    lines+="$(md5sum < "$source/$file" | cut -c 1-32)  lean_pool/$file"$'\n'
+  done < <(cd "$source" && find pyproject.toml README.md LICENSE leanpool deploy/Dockerfile -name __pycache__ -prune -o -type f -print)
+  printf '%s' "$lines" | LC_ALL=C sort -k 2
+}
+
+# record_installer_version ENV_FILE INSTANCE : KIMINA_INSTALLER_VERSION in a Lean server's settings, which its
+# usage agent ends every answer with. Left empty when it cannot be computed: the agent then answers without one.
+record_installer_version() {
+  local version
+  version=$(installer_version "$2") \
+    || { warn "could not compute this installer's version: the usage agent's answers carry none"; version=""; }
+  set_env_in "$1" KIMINA_INSTALLER_VERSION "$version"
 }
 
 # ---------------------------------------------------------------- the Lean image a joining box loads

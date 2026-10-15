@@ -45,7 +45,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from leanpool.environment import MAXIMUM_PORT
+from leanpool.environment import MAXIMUM_PORT, parse_installer_version
 from leanpool.haproxy.servers import (
     LeanServer,
     ServerListError,
@@ -73,6 +73,7 @@ from leanpool.signals import (
     QUEUED_HEADER,
     SERVERS_FIELD,
     SERVERS_HEADER,
+    VERSION_FIELD,
     WORKERS_FIELD,
     WORKERS_HEADER,
 )
@@ -163,6 +164,9 @@ class PoolSettings:
     ``pool_metrics_file`` is the name of the file HAProxy answers ``GET /metrics/pool`` with: a
     name with no directory, for a file that lies beside the configuration (HAProxy reads it when
     it reads the configuration). Without it the configuration has no rule for that path.
+
+    ``installer_version`` is the version of the installer that set up the pool's host. With it
+    the body of ``GET /health`` ends ``"version":"V"``; without it the body is as before.
     """
 
     public_port: int = 18100
@@ -178,6 +182,7 @@ class PoolSettings:
     maximum_connections: int = 1024
     tls: TlsSettings | None = None
     pool_metrics_file: str | None = None
+    installer_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -342,6 +347,11 @@ def validate_pool(servers: Sequence[LeanServer], settings: PoolSettings) -> None
             f"the pool's metrics file cannot be named {name!r}: the configuration names it "
             "beside itself, by letters, digits, '.', '_' and '-' (64 at most, no directory)"
         )
+    if settings.installer_version is not None:
+        try:
+            parse_installer_version(settings.installer_version)
+        except ValueError as error:
+            raise PoolSettingsError(str(error)) from error
     if settings.tls is not None:
         _validate_tls(servers, settings, settings.tls)
 
@@ -571,14 +581,17 @@ def open_slots_rules(rule: str, variable: str, servers: Sequence[LeanServer]) ->
     return lines
 
 
-def _capacity_body(status: str) -> str:
-    """The body of ``GET /health``: its status and the pool's three numbers, as a log format."""
+def _capacity_body(status: str, installer_version: str | None) -> str:
+    """The body of ``GET /health``: its status and the pool's three numbers, as a log format,
+    and the installer's version when the settings name one (hex digits: nothing to escape)."""
+    version = "" if installer_version is None else f',"{VERSION_FIELD}":"{installer_version}"'
     return (
         "'{"
         f'"status":"{status}",'
         f'"{WORKERS_FIELD}":%[var({_REQUEST_WORKERS})],'
         f'"{QUEUED_FIELD}":%[queue(checkers)],'
         f'"{SERVERS_FIELD}":%[nbsrv(checkers)]'
+        f"{version}"
         "}'"
     )
 
@@ -623,6 +636,7 @@ def metrics_rules(settings: PoolSettings) -> list[str]:
 def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> str:
     reply = "http-request return status {status} content-type application/json string"
     health = "http-request return status {status} content-type application/json lf-string"
+    version = settings.installer_version
     bind = f"bind :{settings.public_port}"
     if settings.tls is not None:
         bind = f"{bind} {bind_options(settings.tls.front_door_pem)}"
@@ -654,9 +668,10 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             *open_slots_rules("http-request", _REQUEST_WORKERS, servers),
             "# Answered here, so a health probe never queues behind proofs or needs the cache.",
             health.format(status=200)
-            + f" {_capacity_body('ok')} if METH_GET is_health checkers_up",
+            + f" {_capacity_body('ok', version)} if METH_GET is_health checkers_up",
             health.format(status=503)
-            + f" {_capacity_body('no Lean server is taking checks')} if METH_GET is_health",
+            + f" {_capacity_body('no Lean server is taking checks', version)}"
+            + " if METH_GET is_health",
             "# The same three numbers on every answer that leaves this door, summed again as the",
             "# answer leaves: a check may have waited minutes since its request was read.",
             *open_slots_rules("http-after-response", _RESPONSE_WORKERS, servers),

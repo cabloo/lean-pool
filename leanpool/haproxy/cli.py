@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from leanpool.environment import (
     SettingsParser,
+    parse_installer_version,
     parse_port,
     parse_positive_integer,
     parse_whole_number,
@@ -276,6 +277,15 @@ def _add_render_command(commands: Subparsers, environment: Mapping[str, str]) ->
         "*.crt file under it is written to the pool's facts, by the file's path there",
         optional=True,
     )
+    settings.add(
+        "--installer-version",
+        "LEANPOOL_HAPROXY_INSTALLER_VERSION",
+        parse_installer_version,
+        None,
+        "the version of the installer that set up the pool's host (1 to 64 lower-case hex "
+        'digits), added to the body of GET /health as "version"',
+        optional=True,
+    )
 
 
 def _add_render_box_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
@@ -425,6 +435,7 @@ def _render(options: argparse.Namespace) -> None:
         maximum_connections=options.maximum_connections,
         tls=_tls_settings(options),
         pool_metrics_file=None if pool_metrics is None else pool_metrics.name,
+        installer_version=options.installer_version,
     )
     config = render_haproxy_config(servers, settings)
     if pool_metrics is not None:

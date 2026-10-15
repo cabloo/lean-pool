@@ -27,6 +27,7 @@ from leanpool.agent import (
     memory_share,
     next_slots,
     parse_cpu_times,
+    with_installer_version,
 )
 from leanpool.agent.cli import main, parse_settings
 from leanpool.agent.readings import (
@@ -412,6 +413,49 @@ def test_unusable_settings_are_usage_errors(arguments: list[str]) -> None:
     with pytest.raises(SystemExit) as exit_information:
         parse_settings(arguments, {})
     assert exit_information.value.code == 2
+
+
+VERSION = "0123456789abcdef0123456789abcdef"
+
+
+def test_the_installers_version_comes_from_the_environment_or_a_flag() -> None:
+    assert parse_settings([], {}).installer_version is None
+    # A compose file that names no version hands the agent an empty variable: no version.
+    assert parse_settings([], {"LEANPOOL_AGENT_VERSION": ""}).installer_version is None
+    assert parse_settings([], {"LEANPOOL_AGENT_VERSION": VERSION}).installer_version == VERSION
+    assert parse_settings(["--installer-version", "ab12"], {}).installer_version == "ab12"
+
+
+@pytest.mark.parametrize(
+    "version", ["0123456789ABCDEF", "12 34", "12#34", "g1", "a" * 65, "version", "12\n"]
+)
+def test_an_installers_version_that_is_not_hex_is_refused_at_the_start(
+    version: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for arguments, environment in (
+        (["--installer-version", version], {}),
+        ([], {"LEANPOOL_AGENT_VERSION": version}),
+    ):
+        with pytest.raises(SystemExit) as exit_information:
+            parse_settings(arguments, environment)
+        assert exit_information.value.code == 2
+        assert "is not an installer version" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "reply", ["drain\n", "drain 0%\n", "ready up\n", "ready up 40%\n", "ready up 40% maxconn:5\n"]
+)
+def test_with_a_version_every_reply_ends_with_it_and_is_otherwise_the_same(reply: str) -> None:
+    assert with_installer_version(reply, VERSION) == f"{reply[:-1]} # version {VERSION}\n"
+    assert with_installer_version(reply, None) == reply
+
+
+def test_a_box_whose_agent_was_told_the_version_states_it_in_every_answer(tmp_path: Path) -> None:
+    box = Box(tmp_path)
+    box.settings = dataclasses.replace(box.settings, installer_version=VERSION)
+    assert sampled_reply(box, busy=0, idle=100) == f"ready up 100% # version {VERSION}\n"
+    box.set_memory(FLOOR - 4096)
+    assert sampled_reply(box, busy=0, idle=100) == f"drain # version {VERSION}\n"
 
 
 @pytest.mark.parametrize("module", ["leanpool.agent.cli", "leanpool.haproxy.cli"])

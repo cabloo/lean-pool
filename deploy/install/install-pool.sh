@@ -185,6 +185,10 @@ set_env_in "$DIR/pool.env" POOL_SERVER_WAIT "$SERVER_WAIT"
 set_env_in "$DIR/pool.env" POOL_SUBNET "$POOL_SUBNET"
 set_env_in "$DIR/pool.env" POOL_DNS "$DNS"
 set_env_in "$DIR/pool.env" POOL_JOIN_PORT "$JOIN_PORT"
+# This installer's version (pool-lib.sh, installer_version), which the pool's GET /health carries.
+POOL_VERSION=$(installer_version "$POOL") \
+  || { warn "could not compute this installer's version: the pool's GET /health carries none"; POOL_VERSION=""; }
+set_env_in "$DIR/pool.env" POOL_INSTALLER_VERSION "$POOL_VERSION"
 grep -q '^POOL_MAX_REQUEST_BYTES=' "$DIR/pool.env" || echo "POOL_MAX_REQUEST_BYTES=262144" >> "$DIR/pool.env"
 grep -q '^POOL_CACHE_MAX_BYTES=' "$DIR/pool.env" || echo "POOL_CACHE_MAX_BYTES=4294967296" >> "$DIR/pool.env"
 grep -q '^POOL_CACHE_UPSTREAM_TIMEOUT=' "$DIR/pool.env" || echo "POOL_CACHE_UPSTREAM_TIMEOUT=1200" >> "$DIR/pool.env"

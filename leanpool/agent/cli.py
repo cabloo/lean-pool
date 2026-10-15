@@ -18,6 +18,7 @@ from leanpool.agent.readings import ReadingError
 from leanpool.agent.server import AgentSettings, run_agent
 from leanpool.environment import (
     SettingsParser,
+    parse_installer_version,
     parse_non_negative_number,
     parse_port,
     parse_positive_integer,
@@ -141,6 +142,16 @@ def parse_settings(
         "something else): a number measured for the box. Not given: no such limit",
         optional=True,
     )
+    settings.add(
+        "--installer-version",
+        "LEANPOOL_AGENT_VERSION",
+        parse_installer_version,
+        None,
+        "the version of the installer that set this box up (1 to 64 lower-case hex digits): "
+        "every reply then ends ' # version V', which HAProxy keeps as the server's check "
+        "description and otherwise ignores. Not given: the replies carry none",
+        optional=True,
+    )
     options = parser.parse_args(arguments)
     return AgentSettings(
         host=options.host,
@@ -156,6 +167,7 @@ def parse_settings(
         lean_cpu_stat_path=options.lean_cpu_stat_path,
         cpu_topology_path=options.cpu_topology_path,
         slots_beside_other_work=options.slots_beside_other_work,
+        installer_version=options.installer_version,
     )
 
 

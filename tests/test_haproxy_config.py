@@ -53,6 +53,21 @@ def test_the_public_frontend_answers_health_itself_from_the_checkers_that_are_up
     assert health_rules[1].endswith("if METH_GET is_health")
 
 
+def test_health_ends_with_the_installers_version_when_the_settings_name_one(config: str) -> None:
+    version = "0123456789abcdef0123456789abcdef"
+    versioned = render_haproxy_config(SERVERS, PoolSettings(installer_version=version))
+    health_rules = [
+        line
+        for line in section(versioned, "frontend lean_pool")
+        if " is_health" in line and "return" in line
+    ]
+    assert len(health_rules) == 2
+    ending = f'"servers":%[nbsrv(checkers)],"version":"{version}"}}\''
+    assert all(ending in line for line in health_rules)
+    # The version is all that changes: without one the configuration is as it was.
+    assert versioned.replace(f',"version":"{version}"', "") == config
+
+
 def test_health_and_every_answer_carry_the_open_slots_the_queue_and_the_servers_up(
     config: str,
 ) -> None:
@@ -433,6 +448,10 @@ def test_the_same_input_renders_the_same_configuration() -> None:
         ({"queue_timeout_seconds": 60}, "above the Lean timeout"),
         ({"maximum_connections": 0}, "maximum connections"),
         ({"maximum_request_bytes": 16383}, "HAProxy's default buffer size, 16384"),
+        ({"installer_version": ""}, "installer version"),
+        ({"installer_version": "ABCDEF"}, "installer version"),
+        ({"installer_version": "ab\n    server evil 192.0.2.1:1"}, "installer version"),
+        ({"installer_version": "a" * 65}, "installer version"),
     ],
 )
 def test_unusable_settings_are_refused(change: dict[str, Any], reason: str) -> None:

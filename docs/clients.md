@@ -131,6 +131,10 @@ computed by HAProxy as the answer leaves:
 {"status":"ok","workers":12,"queued":0,"servers":2}
 ```
 
+A pool rendered with the installer's version (`--installer-version`, which the
+[installers](../deploy/install/README.md) pass) adds it last, `"version":"0123..."`: which
+installer set up the pool's host. Nothing reads it but people.
+
 So a client can size itself before its first check, and follow a server that joins or drops
 without being restarted. Keep a little more in flight than there are workers (a fifth or a
 quarter more), so that no worker waits for the client.

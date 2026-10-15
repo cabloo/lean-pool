@@ -100,6 +100,7 @@ SERVER_WAIT=$(setting POOL_SERVER_WAIT)
 MAX_REQUEST_BYTES=$(setting POOL_MAX_REQUEST_BYTES)
 JOIN_HOST=$(setting POOL_JOIN_HOST)
 JOIN_PORT=$(setting POOL_JOIN_PORT)
+INSTALLER_VERSION=$(setting POOL_INSTALLER_VERSION)
 # The site this host was installed for (written by the installer): its name prefix, which also names its helpers'
 # directory, and its LAN's domain. The compose file names the containers, network and volume with the prefix.
 SITE_ENV=/etc/lean-pool/site.env
@@ -167,7 +168,7 @@ render_and_validate() {   # WORKDIR holds `servers`; writes WORKDIR/haproxy.cfg 
   tool "$work" leanpool-haproxy-config render --servers /work/servers --public-port "$PUBLIC_PORT" \
       --lean-timeout "$LEAN_TIMEOUT" --server-wait "$SERVER_WAIT" ${MAX_REQUEST_BYTES:+--max-request-bytes "$MAX_REQUEST_BYTES"} \
       --tls-front-door-pem "$TLS_MOUNT/front.pem" --tls-ca-file "$TLS_MOUNT/ca.crt" --tls-client-pem "$TLS_MOUNT/proxy-client.pem" \
-      --pool-metrics "/work/$POOL_METRICS" --certificates /work/certs \
+      --pool-metrics "/work/$POOL_METRICS" --certificates /work/certs ${INSTALLER_VERSION:+--installer-version "$INSTALLER_VERSION"} \
       > "$work/haproxy.cfg" || { echo "the server list was refused; nothing changed" >&2; return 1; }
   # A pool is always rendered with TLS: a config that says it is unencrypted is never installed.
   if grep -q '^# UNENCRYPTED' "$work/haproxy.cfg"; then echo "the generated config is not TLS; nothing changed" >&2; return 1; fi
@@ -269,17 +270,25 @@ import csv
 import io
 import json
 import os
+import re
 import urllib.request
+
+# A usage agent ends its answer `# version V`, and HAProxy keeps the text after an `up` as the
+# server's agent description: `via agent : up (version V)`.
+AGENT_VERSION = re.compile(r"\(version ([0-9a-f]{1,12})[0-9a-f]*\)")
 
 
 def server_line(row, listed):
     # `in flight   3/  5 of 13` is the checks a server holds, the limit HAProxy holds it to
     # now (its worker count, or the open slots its usage agent states) and the workers it was listed with.
+    # `version V` is the first 12 digits of the installer version the box's agent last stated; `?` when its
+    # agent states none (installed before it could) or its last answer was a drain, which HAProxy keeps no text of.
     limit = row["slim"] or "-"
     workers = listed.get(row["svname"])
     of = f" of {workers:>2s}" if workers else ""
+    stated = AGENT_VERSION.search(row.get("last_agt") or "")
     return (f"--- server {row['svname']:20s} {row['status']:10s} weight {row['weight']:>4s}  in flight {row['scur']:>3s}/{limit:>3s}{of}"
-            f"  queued {row['qcur']:>3s}  total {row['stot']}")
+            f"  queued {row['qcur']:>3s}  total {row['stot']}  version {stated.group(1) if stated else '?'}")
 
 
 listed = dict(pair.split("=", 1) for pair in os.environ.get("POOL_SERVER_WORKERS", "").split())

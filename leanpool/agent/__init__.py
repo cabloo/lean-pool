@@ -7,6 +7,7 @@ from leanpool.agent.headroom import (
     headroom_percent,
     memory_share,
     next_slots,
+    with_installer_version,
 )
 from leanpool.agent.readings import CpuTimes, idle_share, parse_cpu_times
 from leanpool.agent.server import AgentSettings, UsageAgent, UsageSampler
@@ -24,4 +25,5 @@ __all__ = [
     "memory_share",
     "next_slots",
     "parse_cpu_times",
+    "with_installer_version",
 ]

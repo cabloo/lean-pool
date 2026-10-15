@@ -1187,6 +1187,67 @@ def test_the_bundle_holds_no_key_no_settings_and_nothing_a_box_does_not_need(pac
     assert len(text) < 1_000_000
 
 
+def bundle_version(join: Path) -> subprocess.CompletedProcess[str]:
+    """`installer_version demo` as a joined box computes it: from the bundle it unpacked, with the
+    bundle's own site."""
+    script = (
+        f"set -euo pipefail\nSRC={shlex.quote(str(join))}\nsay() {{ :; }}\nwarn() {{ :; }}\n"
+        f'die() {{ echo "die: $*" >&2; exit 1; }}\n. "$SRC/pool-lib.sh"\nload_site "$SRC/site"\n'
+        "installer_version demo\n"
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+
+
+@pytest.fixture
+def unpacked(packed, tmp_path):
+    """The real bundle, unpacked as a joining box unpacks it: its `join/` directory."""
+    _, _, archive = packed
+    archive.extractall(tmp_path, filter="data")
+    return tmp_path / "join"
+
+
+def test_a_box_computes_from_its_bundle_the_version_the_pool_computes_from_the_checkout(unpacked):
+    here, there = pool_lib("installer_version demo"), bundle_version(unpacked)
+    assert here.returncode == 0 and there.returncode == 0, here.stderr + there.stderr
+    assert re.fullmatch(r"[0-9a-f]{32}\n", here.stdout), here.stdout
+    assert there.stdout == here.stdout
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "kimina-ctl",
+        "docker-compose.front.yml",
+        "site/site.env",
+        "site/instances/demo.env",
+        "lean_pool/leanpool/agent/cli.py",
+        "lean_pool/deploy/Dockerfile",
+    ],
+)
+def test_one_byte_in_any_bundled_file_changes_the_version(unpacked, member):
+    before = bundle_version(unpacked).stdout
+    path = unpacked / member
+    path.write_bytes(path.read_bytes() + b"\n")
+    after = bundle_version(unpacked)
+    assert after.returncode == 0, after.stderr
+    assert re.fullmatch(r"[0-9a-f]{32}\n", after.stdout) and after.stdout != before
+
+
+def test_a_file_the_bundle_does_not_carry_leaves_the_version_as_it_is(unpacked):
+    before = bundle_version(unpacked).stdout
+    # The pool's own command runs on the pool's host alone, and Python's byte-code cache is never packed.
+    (unpacked / "lean-pool-ctl").write_text("#!/usr/bin/env bash\n")
+    (unpacked / "lean_pool/leanpool/__pycache__").mkdir()
+    (unpacked / "lean_pool/leanpool/__pycache__/names.cpython-313.pyc").write_bytes(b"\0")
+    assert bundle_version(unpacked).stdout == before
+
+
+def test_a_bundle_missing_a_file_gives_no_version(unpacked):
+    (unpacked / "kimina-ctl").unlink()
+    result = bundle_version(unpacked)
+    assert result.returncode != 0 and result.stdout == ""
+
+
 def test_the_real_bundle_makes_a_script_bash_accepts(packed, tmp_path):
     text, _, _ = packed
     settings = helper.ScriptSettings(

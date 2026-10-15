@@ -185,6 +185,28 @@ def test_render_settings_come_from_the_environment_and_flags_override_them(
     assert "bind :9100" in capsys.readouterr().out
 
 
+def test_render_puts_the_installers_version_in_the_health_answer(
+    servers_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run("render", "--servers", str(servers_file)) == 0
+    assert '"version"' not in capsys.readouterr().out
+    version = "0123456789abcdef0123456789abcdef"
+    assert run("render", "--servers", str(servers_file), "--installer-version", version) == 0
+    assert f',"version":"{version}"}}\'' in capsys.readouterr().out
+    environment = {"LEANPOOL_HAPROXY_INSTALLER_VERSION": version[:12]}
+    assert run("render", "--servers", str(servers_file), environment=environment) == 0
+    assert f',"version":"{version[:12]}"}}\'' in capsys.readouterr().out
+
+
+def test_render_refuses_an_installers_version_that_is_not_hex(
+    servers_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_information:
+        run("render", "--servers", str(servers_file), "--installer-version", "1.2.3")
+    assert exit_information.value.code == 2
+    assert "installer version" in capsys.readouterr().err
+
+
 def test_render_refuses_a_queue_timeout_not_above_the_lean_timeout(
     servers_file: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -69,6 +69,24 @@ def parse_non_negative_number(text: str) -> float:
     return value
 
 
+MAXIMUM_INSTALLER_VERSION_DIGITS = 64
+
+
+def parse_installer_version(text: str) -> str:
+    """Read an installer's version: 1 to 64 lower-case hex digits (the installer writes an md5).
+
+    Anything else is refused, because the version is written into replies and a configuration
+    where a space, a ``#`` or a quote would change what they say.
+    """
+    is_hex = text.isascii() and all(character in "0123456789abcdef" for character in text)
+    if not (is_hex and 1 <= len(text) <= MAXIMUM_INSTALLER_VERSION_DIGITS):
+        raise ValueError(
+            f"{text!r} is not an installer version "
+            f"(1 to {MAXIMUM_INSTALLER_VERSION_DIGITS} lower-case hex digits)"
+        )
+    return text
+
+
 def parse_switch(text: str) -> bool:
     """Read an on/off value from an environment variable (1/0, true/false, yes/no, on/off)."""
     word = text.strip().lower()

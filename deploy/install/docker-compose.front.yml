@@ -59,6 +59,9 @@ services:
       # The most checks while other work is on the box: a number measured for the box.
       # Empty: no such limit. `kimina-ctl set-beside` changes it.
       LEANPOOL_AGENT_SLOTS_BESIDE_OTHER_WORK: ${KIMINA_AGENT_BESIDE_OTHER_WORK:-}
+      # The version of the installer that set this box up: every answer ends `# version V`, which the
+      # pool's HAProxy keeps as the server's check description. Empty: the answers carry none.
+      LEANPOOL_AGENT_VERSION: ${KIMINA_INSTALLER_VERSION:-}
     volumes:
       # The box's control groups, read-only: where the Lean server's own CPU use is read. The whole tree,
       # because the server's group is made again whenever its container is.

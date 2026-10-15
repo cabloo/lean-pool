@@ -15,7 +15,13 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from leanpool.agent.headroom import BoxState, agent_reply, fitting_slots, next_slots
+from leanpool.agent.headroom import (
+    BoxState,
+    agent_reply,
+    fitting_slots,
+    next_slots,
+    with_installer_version,
+)
 from leanpool.agent.readings import (
     CpuTimes,
     ReadingError,
@@ -55,7 +61,8 @@ class AgentSettings:
     cores are left free beside the box's other work before a check is counted as fitting, and
     ``cpu_topology_path`` is where the kernel says which logical CPUs share a core.
     ``slots_beside_other_work`` is the box's measured limit on checks while it also runs other
-    work (None: no such limit).
+    work (None: no such limit). ``installer_version`` is the version of the installer that set
+    the box up; with it every reply ends `` # version V`` (see ``with_installer_version``).
     """
 
     host: str = "0.0.0.0"
@@ -71,6 +78,7 @@ class AgentSettings:
     lean_cpu_stat_path: Path | None = None
     cpu_topology_path: Path = Path("/sys/devices/system/cpu")
     slots_beside_other_work: int | None = None
+    installer_version: str | None = None
     clock_ticks_per_second: int = _clock_ticks_per_second()
 
     @property
@@ -159,7 +167,10 @@ class UsageSampler:
         """Return the agent-check line for the latest sample."""
         if self._state is None:
             raise RuntimeError("sample() must run before reply()")
-        return agent_reply(self._state, self._settings.memory_floor_bytes)
+        return with_installer_version(
+            agent_reply(self._state, self._settings.memory_floor_bytes),
+            self._settings.installer_version,
+        )
 
     def _sampled_slots(self, cpu_times: CpuTimes) -> int | None:
         """Return the slots to state after this reading. Called before the reading is kept.
