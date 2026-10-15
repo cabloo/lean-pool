@@ -1,9 +1,10 @@
 """The compose files in ``deploy/`` and the demo's: what can be held to account without Docker.
 
-Docker itself is not run here (the CI workflow has it read every combination of these files, and starts the
-demo). These tests read the files as Compose does (`tests/compose_files.py`) and keep them consistent with the
-project: what they build exists, what they tell the reader to run is a real command, the ports that must stay
-inside a box are not published, and every setting they read is in the table of `deploy/README.md`.
+Docker itself is not run here (the CI workflow has it read every combination of these files, and
+starts the demo). These tests read the files as Compose does (`tests/compose_files.py`) and keep
+them consistent with the project: what they build exists, what they tell the reader to run is a
+real command, the ports that must stay inside a box are not published, and every setting they read
+is in the table of `deploy/README.md`.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from compose_files import read, resolve
+
 from leanpool.admit.cases import Expectation, load_cases
 from leanpool.haproxy import PoolSettings, parse_server_list
 from leanpool.haproxy.cli import main as haproxy_main
@@ -113,8 +114,8 @@ def test_every_project_resolves_and_builds_only_this_project(
         build = service.get("build")
         if build is not None:
             context = (directory / build["context"]).resolve()
-            assert context == PROJECT
-            assert (context / build["dockerfile"]).is_file()
+            assert context == PROJECT, name
+            assert (context / build["dockerfile"]).is_file(), name
 
 
 @pytest.mark.parametrize(("directory", "name", "files"), PROJECTS, ids=PROJECT_IDS)
@@ -129,7 +130,7 @@ def test_no_project_publishes_a_port_that_must_stay_inside_the_proxy(
     }
 
     for service in services(directory, files).values():
-        assert not published_ports(service) & inside
+        assert not published_ports(service) & inside, name
 
 
 @pytest.mark.parametrize("directory", [POOL, DEMO], ids=["deploy/pool", "the demo"])
@@ -199,7 +200,11 @@ def test_the_compiled_step_changes_only_how_a_worker_starts() -> None:
     (mount,) = with_it["kimina"]["volumes"]
     assert mount["target"] == "/opt/lean-native"
     assert mount["read_only"] is True
-    rest = {key: value for key, value in with_it["kimina"].items() if key not in ("environment", "volumes")}
+    rest = {
+        key: value
+        for key, value in with_it["kimina"].items()
+        if key not in ("environment", "volumes")
+    }
     assert rest == {key: value for key, value in without["kimina"].items() if key != "environment"}
 
 

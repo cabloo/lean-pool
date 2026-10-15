@@ -1,17 +1,19 @@
 """How Docker Compose reads a project from several files, as far as this project's files need it.
 
-The tests cannot run Docker; CI's own job has Docker read every combination of the files. This model lets the
-tests ask what a project resolves to, and the fake machine of `tests/install/stand_ins.py` decide what each
-`docker compose` call makes:
+The tests cannot run Docker; CI's own job has Docker read every combination of the files. This
+model lets the tests ask what a project resolves to, and the fake machine of
+`tests/install/stand_ins.py` decide what each `docker compose` call makes:
 
-* each file is read as YAML with Compose's two merge tags, `!reset` (drop what the files before set) and
-  `!override` (replace it instead of merging);
-* each file's values are interpolated from the environment before the files are merged (`${NAME}`,
-  `${NAME:-default}`, `${NAME-default}`, `${NAME:?message}`, `${NAME?message}`, and `$$` for a dollar sign);
-* the files are merged in order: mappings key by key, and lists as Compose merges them (most are joined without
-  repeats, `volumes` by the path inside the container, a command or a healthcheck's test replaced);
-* a service that names no container gets Compose's name, PROJECT-SERVICE-1, and the network a service joins
-  without naming one is the project's own, PROJECT_default.
+* each file is read as YAML with Compose's two merge tags, `!reset` (drop what the files before
+  set) and `!override` (replace it instead of merging);
+* each file's values are interpolated from the environment before the files are merged
+  (`${NAME}`, `${NAME:-default}`, `${NAME-default}`, `${NAME:?message}`, `${NAME?message}`, and
+  `$$` for a dollar sign);
+* the files are merged in order: mappings key by key, and lists as Compose merges them (most are
+  joined without repeats, `volumes` by the path inside the container, a command or a
+  healthcheck's test replaced);
+* a service that names no container gets Compose's name, PROJECT-SERVICE-1, and the network a
+  service joins without naming one is the project's own, PROJECT_default.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class _Loader(yaml.SafeLoader):
     pass
 
 
-def _reset(loader: yaml.SafeLoader, node: yaml.Node) -> Reset:
+def _reset(_loader: yaml.SafeLoader, _node: yaml.Node) -> Reset:
     return Reset()
 
 
@@ -61,7 +63,7 @@ class MissingSetting(ValueError):
 
 def read(path: Path) -> dict[str, Any]:
     """One compose file, with its merge tags kept as `Reset` and `Override`."""
-    loaded = yaml.load(path.read_text(), Loader=_Loader)  # noqa: S506 - a SafeLoader with two more tags
+    loaded = yaml.load(path.read_text(), Loader=_Loader)  # a SafeLoader with two more tags
     return loaded if isinstance(loaded, dict) else {}
 
 
@@ -85,7 +87,7 @@ def interpolate(text: str, env: Mapping[str, str]) -> str:
             return word if unset_or_empty else str(given)
         if how == "-":
             return word if given is None else str(given)
-        if how == ":?" and unset_or_empty or how == "?" and given is None:
+        if (how == ":?" and unset_or_empty) or (how == "?" and given is None):
             raise MissingSetting(f"required variable {name} is missing a value: {word}")
         return "" if given is None else str(given)
 
@@ -150,14 +152,16 @@ def _without_tags(value: Any) -> Any:
     if isinstance(value, Override):
         return _without_tags(value.value)
     if isinstance(value, dict):
-        return {key: _without_tags(item) for key, item in value.items() if not isinstance(item, Reset)}
+        return {
+            key: _without_tags(item) for key, item in value.items() if not isinstance(item, Reset)
+        }
     if isinstance(value, list):
         return [_without_tags(item) for item in value]
     return value
 
 
 def resolve(files: Iterable[Path], env: Mapping[str, str]) -> dict[str, Any]:
-    """The project the files make together, each file interpolated first and then merged in order."""
+    """The project the files make together: each file interpolated, then merged in order."""
     project: dict[str, Any] = {}
     for path in files:
         project = merge(project, _interpolated(read(path), env))
@@ -171,13 +175,18 @@ def container_name(project_name: str, service_name: str, service: Mapping[str, A
 
 
 def network_names(project_name: str, project: Mapping[str, Any]) -> dict[str, str]:
-    """Each network the project declares or its services join, by its name in the file: the name Docker knows it
-    by (its `name:`, else PROJECT_NETWORK). External networks are left out: the project does not make them."""
+    """Each network the project declares or its services join, by its name in the file: the name
+    Docker knows it by (its `name:`, else PROJECT_NETWORK). External networks are left out: the
+    project does not make them."""
     declared = dict(project.get("networks") or {})
-    joined = {"default"} if any(
-        "network_mode" not in service and not service.get("networks")
-        for service in (project.get("services") or {}).values()
-    ) else set()
+    joined = (
+        {"default"}
+        if any(
+            "network_mode" not in service and not service.get("networks")
+            for service in (project.get("services") or {}).values()
+        )
+        else set()
+    )
     for service in (project.get("services") or {}).values():
         networks = service.get("networks") or []
         joined.update(networks if isinstance(networks, list) else networks.keys())
