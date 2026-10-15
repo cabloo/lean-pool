@@ -92,6 +92,10 @@ matters to the pool is that every box runs **the same Lean and Mathlib**; buildi
 with your versions is described in
 [Kimina's README](https://github.com/project-numina/kimina-lean-server).
 
+Once the box runs, it can also compile the step of `linarith` that took most of the Lean
+time in the deployment this project was written for. That is optional, makes Lean itself
+faster and changes no verdict: [compiled search](compiled-search.md).
+
 A box that already runs Kimina some other way needs only the agent beside it:
 
 ```sh

@@ -1,0 +1,25 @@
+# linarith's search step as compiled code (docs/compiled-search.md), added after compose.yaml or
+# compose.tls.yaml. Make it first, on this box, from the image this box runs:
+#
+#   compiled-search/make.sh
+#
+# then start the box with this file after the other one:
+#
+#   docker compose -f compose.yaml -f compose.compiled-search.yaml up -d --build
+#
+# Kimina then starts each worker through the launcher make.sh put in ./native. The launcher loads
+# the library only if it was compiled from this image's own files, and otherwise starts the
+# image's REPL as before. Without this file the box runs exactly as before.
+
+services:
+  kimina:
+    environment:
+      LEAN_SERVER_REPL_PATH: /opt/lean-native/repl-native
+    volumes:
+      # Read-only, and never created empty: without make.sh's directory the box does not start.
+      - type: bind
+        source: ./native
+        target: /opt/lean-native
+        read_only: true
+        bind:
+          create_host_path: false

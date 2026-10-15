@@ -77,7 +77,14 @@ cases.
   stores of its answers; that the demo's committed `haproxy.cfg` is what `render` writes for
   its server list; that every compose file builds this project, publishes no port that must
   stay inside the proxy, and quotes commands that exist; the
-  [example client](../examples/pool_client.py)'s sizing, retries and verdicts.
+  [example client](../examples/pool_client.py)'s sizing, retries and verdicts;
+* the [compiled search step](compiled-search.md): that the launcher loads the library only
+  when it was made from the files that are there, and starts the plain REPL in each other
+  case; the build's refusals; the check's judgement over a stand-in Lean, which fails a
+  library that is not loaded, answers differently, is handed to a program a tactic starts,
+  or is not 3 times faster; and what `make.sh` installs over a stand-in for Docker, when
+  the check passes and when anything fails. The real build and check need a Lean with
+  Mathlib and are not part of the suite.
 
 ### Tests that run only where `haproxy` is installed
 
@@ -265,6 +272,14 @@ check, the pause and the metrics paths were each built against what that showed:
 * the three metrics paths have been scraped there by a Prometheus since 12 October 2026, on
   the official `haproxy:3.0` image.
 
+**Compiled search for linarith, 12 October 2026.** Each of the four Lean server boxes
+compiled the step and passed its own check ([what each measured](compiled-search.md#measured)).
+On one server alone, 86 checks a run had sent were sent again past the cache with the step
+on and then off. Of the 71 that finished both ways no verdict differed, from each other or
+from the one stored, and their Lean time was 608 s off and 217 s on. The other three boxes
+were switched over while a client kept the pool busy, and every answer was a success
+(2xx).
+
 Not part of that deployment, and run once by hand against the demo's pool, whose Lean servers
 are stand-ins: Kimina's own Python client (`kimina-client` 0.2.1), unchanged but for the
 address. Its single and its batched requests were answered, and repeats came from the cache.
@@ -288,6 +303,12 @@ address. Its single and its batched requests were answered, and repeats came fro
   them in CI; only the demo's compose file is started there.
 * **Kimina's published image has not been used.** The deployment builds Kimina from source at
   one commit. The fakes and the stand-in follow Kimina's interface as read from that source.
+* **The compiled search step's `make.sh` and compose file have not been run as written.**
+  The deployment ran the same build, check and launcher through an installer of its own;
+  here those three have been run as written against a real Lean, outside Docker. And the
+  check compares three proofs: it does not show that the compiled search and the
+  interpreted one agree on every input
+  ([why that cannot let a wrong proof pass](compiled-search.md#what-it-cannot-change-and-what-it-does)).
 * **What TLS costs** in CPU or throughput has not been measured, beyond the timers above.
 * **What a check costs the work beside it** was measured on three machines of one deployment
   and differed on each. Nothing here says what it is on yours: measure the box

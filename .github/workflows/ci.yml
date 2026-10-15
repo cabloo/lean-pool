@@ -110,6 +110,9 @@ jobs:
           export LEAN_SERVER_API_KEY=ci LEAN_SERVER_MAX_REPLS=2
           docker compose -f compose.yaml config --quiet
           docker compose -f compose.tls.yaml config --quiet
+          mkdir -p native
+          docker compose -f compose.yaml -f compose.compiled-search.yaml config --quiet
+          docker compose -f compose.tls.yaml -f compose.compiled-search.yaml config --quiet
       - name: Start the demo
         run: docker compose -f examples/demo/compose.yaml up --build -d
       - name: Walk through it

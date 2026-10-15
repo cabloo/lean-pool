@@ -25,6 +25,9 @@ deploy/pool/join.sh
 token.txt
 deploy/lean-server/front/
 deploy/lean-server/tls/
+deploy/lean-server/native/
+deploy/lean-server/native.work.*
+deploy/lean-server/native.log
 *.key
 *.pem
 *.csr

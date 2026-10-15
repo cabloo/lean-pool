@@ -88,6 +88,11 @@ benchmark:
   the pool was not slower than the server alone, within the variation between single runs. On
   4 October 2026, over TLS, HAProxy's own timers for 40 checks show 0 ms in its queue and 13 ms
   in all to connect to the Lean server, mutual TLS handshakes included, out of 102 s.
+* **Less Lean time, and no verdict changed.** On 12 October 2026 each Lean server box
+  compiled the one step of `linarith` where most of the deployment's Lean time went
+  ([compiled search](docs/compiled-search.md)). Of 86 checks a run had sent, sent again to
+  one server both ways, the 71 that finished both ways took 608 s of Lean time with the
+  step off and 217 s with it on.
 
 How throughput grows with machines has not been measured.
 [docs/verification.md](docs/verification.md) has the full record and what remains unverified.
@@ -209,6 +214,7 @@ the cache's counters, and each certificate's last day
 | [The usage agent](docs/usage-agent.md) | The weight formula, what HAProxy does with it, and open slots for a box that also does other work. |
 | [The generated HAProxy configuration](docs/haproxy.md) | Pausing a server, the health check, failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus. |
 | [Admission](docs/admission.md) | Testing a Lean server alone before it joins. |
+| [Compiled search for linarith](docs/compiled-search.md) | An optional step on each Lean server box that makes Lean itself faster on the proofs that take it longest, and changes no verdict. |
 | [Configuration reference](docs/configuration.md) | Every flag and environment variable of the six commands. |
 | [What is tested, and what is not verified](docs/verification.md) | The test suite, the deployment's record, and the gaps. |
 | [Limitations](docs/limitations.md) | What the pool does not do. |

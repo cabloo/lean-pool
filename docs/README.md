@@ -9,6 +9,8 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 * [TLS](tls.md): the pool's own certificate authority; what is encrypted and who holds which key.
 * [Joining over the network](joining.md): letting a new box request its certificate over HTTPS.
 * [Admission](admission.md): testing a Lean server alone before it joins.
+* [Compiled search for linarith](compiled-search.md): an optional step on each Lean server
+  box that makes Lean itself faster on the proofs that take it longest.
 * [Configuration reference](configuration.md): every flag and environment variable.
 
 **Using**

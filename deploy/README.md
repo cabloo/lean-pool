@@ -8,11 +8,15 @@
 | [`pool/servers.example`](pool/servers.example) | The format of the server list. |
 | [`lean-server/compose.yaml`](lean-server/compose.yaml) | A Lean server box: Kimina and the usage agent, plain HTTP. |
 | [`lean-server/compose.tls.yaml`](lean-server/compose.tls.yaml) | A Lean server box with TLS: Kimina and the agent behind a TLS front. |
+| [`lean-server/compiled-search/`](lean-server/compiled-search) | Optional: makes and checks linarith's search step as compiled code on the box (`compiled-search/make.sh`). |
+| [`lean-server/compose.compiled-search.yaml`](lean-server/compose.compiled-search.yaml) | Added after either Lean server file: the workers start through that step. |
 
-[Deploying a pool](../docs/deployment.md) walks through them, and [TLS](../docs/tls.md) through
-the two TLS files. They are adapted from the files of a running deployment and have not been
-run as they are written here ([what is verified](../docs/verification.md)); Docker validates
-them in this project's CI.
+[Deploying a pool](../docs/deployment.md) walks through them, [TLS](../docs/tls.md) through
+the two TLS files, and [compiled search](../docs/compiled-search.md) through the last two.
+They are adapted from the files of a running deployment and have not been run as they are
+written here ([what is verified](../docs/verification.md)); Docker validates them in this
+project's CI.
 
-A deployment's own files (its key, its certificates, its server list and the configuration
-rendered from it) are created beside these files and are ignored by git.
+A deployment's own files (its key, its certificates, its server list, the configuration
+rendered from it, and what `make.sh` makes) are created beside these files and are ignored
+by git.

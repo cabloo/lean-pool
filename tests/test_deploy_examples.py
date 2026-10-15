@@ -26,6 +26,7 @@ COMPOSE_FILES = [
     POOL / "compose.tls.yaml",
     LEAN_SERVER / "compose.yaml",
     LEAN_SERVER / "compose.tls.yaml",
+    LEAN_SERVER / "compose.compiled-search.yaml",
     PROJECT / "examples" / "demo" / "compose.yaml",
 ]
 

@@ -37,6 +37,12 @@ A week of running the pool on boxes that also do other work.
   exporter), `/metrics/cache` (the cache's counters) and `/metrics/pool` (listed workers,
   paused servers and the last day of each certificate, written by
   `render --pool-metrics FILE [--certificates DIR]`).
+- **Compiled search for linarith**, an optional step on each Lean server box
+  (`deploy/lean-server/compiled-search/` and `compose.compiled-search.yaml`). The box
+  compiles the search step of `linarith` and `nlinarith` from the C files its own Kimina
+  image holds, checks that it changes nothing but the time, and has every worker load it.
+  In the deployment it was written for: 8 to 10 times faster on four machines, and no
+  verdict changed ([docs/compiled-search.md](docs/compiled-search.md)).
 
 ## 0.1.0 - 2026-10-05
 
