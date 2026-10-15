@@ -443,6 +443,28 @@ def test_the_join_port_is_firewalled_and_no_join_service_runs_outside_a_window(u
 # --- a re-run -----------------------------------------------------------------------------------------------------------
 
 
+def test_a_refresh_of_the_pool_host_makes_its_writable_server_read_only_once(pool):
+    """A pool host whose own Lean server runs writable (installed before its root could be read-only, or
+    left writable by an earlier reading). One run of `install.sh --proxy` reads it, makes it again
+    read-only ONCE, checks it by itself, and touches no other container."""
+    env = pool.path(f"{INSTANCE}/kimina.env")
+    env.write_text(
+        "".join(
+            line
+            for line in env.read_text().splitlines(keepends=True)
+            if not line.startswith(("KIMINA_ROOT_READ_ONLY=", "KIMINA_READ_ONLY="))
+        )
+    )
+    pool.path(f"{INSTANCE}/read-only.state").unlink(missing_ok=True)
+    assert pool.bash(pool.path("/usr/local/bin/kimina-ctl"), "@demo", "restart").returncode == 0
+    assert not pool.read_only(LEAN)
+    recreated = pool.recreated()
+    result = pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    assert "POOL INSTALLED AND VERIFIED" in result.stdout and pool.read_only(LEAN)
+    assert pool.recreated() == [*recreated, LEAN]
+
+
 def test_a_re_run_keeps_the_authority_and_the_pin_and_recreates_nothing(pool):
     authority = pool.path(f"{POOL}/pki/ca/ca.crt").read_bytes()
     key = pool.path(f"{POOL}/pki/ca/ca.key").read_bytes()
