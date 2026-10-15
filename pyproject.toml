@@ -63,6 +63,7 @@ testpaths = ["tests"]
 pythonpath = ["tests", "tests/install", "examples", "examples/demo"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = ["lean: needs a real Lean project and REPL (skipped without one)"]
 
 [tool.ruff]
 line-length = 100
@@ -124,7 +125,6 @@ module = [
     "test_install_host_tools",
     "test_install_join_helper",
     "test_install_join_script",
-    "test_install_lean_native",
     "test_install_memory_ceiling",
     "test_install_read_only",
     "test_install_reaping",

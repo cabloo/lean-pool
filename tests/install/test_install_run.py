@@ -242,6 +242,7 @@ def test_the_upgrade_gives_the_pools_own_lean_server_the_compiled_search_step(up
     )
     assert {path.name for path in machine.path(f"{INSTANCE}/native").iterdir()} == {
         "repl-native",
+        "repl-path",
         "linarith-search.so",
         "sources",
         "built-from",

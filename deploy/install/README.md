@@ -15,7 +15,6 @@ pieces.
 | [`kimina-firewall`](kimina-firewall) | The firewall rules of one Lean server, re-applied at boot by a systemd unit. |
 | [`pool-lib.sh`](pool-lib.sh) | What the scripts above share. |
 | `docker-compose*.yml` | The compose files the installers copy into `/srv`. |
-| `lean-native-*` | Builds and checks linarith's search step as compiled code on a box ([compiled search](../../docs/compiled-search.md)). |
 | [`site.example/`](site.example) | An example site: copy it and change its values. |
 
 Each script describes what it does, in order, at its top, and `bash install.sh --help` lists every option.

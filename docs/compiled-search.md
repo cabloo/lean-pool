@@ -20,7 +20,7 @@ On the Lean server box, in the clone, once the box runs (step 2 of
 ```sh
 cd deploy/lean-server
 compiled-search/make.sh
-docker compose -f compose.yaml -f compose.compiled-search.yaml up -d --build
+docker compose -f compose.yaml -f compose.compiled-search.yaml up -d
 ```
 
 `make.sh` takes a few minutes and ends with one line:
@@ -32,13 +32,18 @@ COMPILED SEARCH STEP: on - linarith's search took 9.3 s as the image runs it and
 or `COMPILED SEARCH STEP: OFF - ` and the reason. Either way the box can then be started with
 [`compose.compiled-search.yaml`](../deploy/lean-server/compose.compiled-search.yaml): when there
 is no library, the workers start as they did before. (If `make.sh` could not run the image at
-all, its line says so and that the box must not be started with the file.) With TLS, put the file after
-`compose.tls.yaml` instead. The second command restarts the Lean server, so a pool's failover
-sends the checks it held elsewhere ([failover](haproxy.md#failover-among-the-lean-servers)).
+all, its line says so and that the box must not be started with the file.) On a box started with
+other overlays as well (the usage agent, TLS), add this one last. The second command restarts the
+Lean server, so a pool's failover sends the checks it held elsewhere
+([failover](haproxy.md#failover-among-the-lean-servers)).
 
-`make.sh` uses the image named by `KIMINA_IMAGE` in `.env`, or compose.yaml's default, or the
-image given as its argument. Run it again whenever the box's image changes. Until it has, the
-launcher finds that the library was made from other files and starts the plain REPL.
+`make.sh` uses the image given with `--image` (or as its argument), else the one named by
+`LEAN_SERVER_IMAGE` in `.env`, else compose.yaml's default. Run it again whenever the box's image
+changes. Until it has, the launcher finds that the library was made from other files and starts
+the plain REPL. A run for the same image and the same `compiled-search/` files makes nothing
+again, and says `COMPILED SEARCH STEP: on - already made from this image and checked`. `--box`
+names another directory to fill than `deploy/lean-server`, and `--name` the build's container:
+the [installer](../deploy/install/README.md) uses both.
 
 To turn it off, start the box without the second file: `docker compose -f compose.yaml up -d`.
 
@@ -60,7 +65,8 @@ To turn it off, start the box without the second file: `docker compose -f compos
    * the search, timed by Lean's own profiler, is at least 3 times faster.
 4. Only on a pass is the library copied out into `deploy/lean-server/native/`, which the second
    compose file mounts read-only. `native/state` keeps the line, and `native.log` the whole
-   output.
+   output. `native.built` records what the library was made from: one hash over the files of
+   `compiled-search/`, and the image's ID.
 
 ## What keeps a worker from running the wrong thing
 
@@ -140,9 +146,9 @@ each figure observed once:
   Kimina's own image does.
 * The clone must be on a file system that lets programs run (not mounted `noexec`): the
   container starts its workers from `native/`.
-* **`make.sh` and `compose.compiled-search.yaml` have not been run as written here.** In the
-  deployment, the [installers](../deploy/install/README.md) ran the same `build.sh`, `check.py`
-  and launcher (as `lean-native-*`), in the same kind of container, and started the servers.
-  Here those three were run
-  as written against a real Lean outside Docker, and the tests hold `make.sh` to what it does
-  with a stand-in for Docker. Docker validates the compose file in CI.
+* **The measurements above came from an earlier form of the installer.** It ran the same
+  `build.sh` and `check.py`, and a launcher with a fixed REPL path, in the same kind of container,
+  and started the servers. The [installer](../deploy/install/README.md) now runs `make.sh` itself.
+  Here `build.sh` and `check.py` were run as written against a real Lean outside Docker, and the
+  tests hold `make.sh` to what it does with a stand-in for Docker. Docker validates the compose
+  files in CI.

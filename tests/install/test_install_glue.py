@@ -274,13 +274,15 @@ def test_a_missing_api_key_file_is_refused(tmp_path):
 
 # --- joining is by pulling: no SSH between hosts ------------------------------------------------------------
 
+# The installers, and the programs of the Lean server's directory they run (the compiled search step, the
+# read-only check).
 SCRIPTS = sorted(
     path
-    for path in INSTALLERS.iterdir()
+    for path in [*INSTALLERS.iterdir(), *(INSTALLERS.parent / "lean-server").rglob("*")]
     if path.is_file()
     and (
         path.suffix in (".sh", ".py")
-        or path.name in ("kimina-ctl", "lean-pool-ctl", "kimina-firewall")
+        or path.name in ("kimina-ctl", "lean-pool-ctl", "kimina-firewall", "repl-native")
     )
 )
 
@@ -304,7 +306,7 @@ def commands_of(path: Path) -> str:
 
 def test_no_installer_runs_ssh_or_scp():
     """A server joins by pulling, and the pool's host never reaches into another host."""
-    assert len(SCRIPTS) >= 10
+    assert len(SCRIPTS) >= 12
     callers = [
         path.name
         for path in SCRIPTS

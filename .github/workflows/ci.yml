@@ -59,9 +59,9 @@ jobs:
       - name: Run every test, those that need HAProxy included
         # With HAProxy, curl and openssl installed no test may be skipped: -rs lists any that
         # was, and the second command fails the step if there is one. The installer tests run
-        # in the job above; a few of them need a real Lean workspace, which this job has not.
+        # in the job above, and the tests marked `lean` need a real Lean, which this job has not.
         run: |
-          uv run pytest -rs --ignore=tests/install | tee pytest.log
+          uv run pytest -rs -m "not lean" --ignore=tests/install | tee pytest.log
           ! grep -E '^SKIPPED| skipped' pytest.log
 
   image:

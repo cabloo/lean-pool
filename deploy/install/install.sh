@@ -527,11 +527,10 @@ if [ "$AGENT" -eq 1 ]; then
   done
   lean_pool_source >/dev/null || die "$LEAN_POOL_SOURCE_MISSING (it is needed for the usage agent; --no-agent skips that)"
 fi
-# A named instance compiles linarith's search step from its own image.
+# A named instance compiles linarith's search step from its own image, with the lean-pool project's make.sh.
 if [ -n "$INSTANCE" ] && declare -F install_compiled_search >/dev/null; then
-  for file in "${LEAN_NATIVE_FILES[@]}"; do
-    [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-  done
+  project=$(lean_pool_source) && [ -f "$project/$LEAN_NATIVE_MAKE" ] \
+    || die "missing $LEAN_NATIVE_MAKE: $LEAN_POOL_SOURCE_MISSING"
 fi
 if [ "$TLS" -eq 1 ]; then
   for file in docker-compose.front.yml kimina-firewall; do

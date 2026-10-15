@@ -31,12 +31,13 @@ run the REAL scripts against a fake machine:
   - says how it keeps control groups (`info -f '{{.CgroupDriver}} {{.CgroupVersion}}'`: `systemd 2`, or what
     STUB_CGROUPS says), and refuses `run --cgroup-parent` where a test says so (STUB_NO_CGROUP_PARENT);
   - answers for the usage agent when `kimina-ctl status` asks inside its container (STUB_AGENT_SAYS);
-  - plays the build and the check of the compiled search step (`run --entrypoint bash IMAGE -c
-    '... lean-native-build.sh ... lean-native-check.py ...'`). It refuses a container that is not hardened as
-    the installer says (no network, no capability, no new privileges), one whose source mount lacks a file, and
-    one whose output mount holds no launcher it could start; then it writes what the real build writes and says
-    what the real check says: passed, or what a test says (STUB_NATIVE: `no-c-files`, an image without the C
-    files; `check-fails`, a library that is built and does not pass). A Lean server remembers the program its
+  - plays the build and the check of the compiled search step as make.sh runs them (`run --pull never --name N
+    ... --entrypoint bash IMAGE /lean-native-src/inside.sh /opt/lean-native`, then `cp N:/opt/lean-native/. DIR`
+    and `rm -f N`). It refuses a container that is not hardened as make.sh says (nothing pulled, no network, no
+    capability, no new privileges), one whose source mount lacks a file, and one given a directory of the host
+    to write in; then it writes, in the container's own file system, what inside.sh writes, and says what the
+    real check says: passed, or what a test says (STUB_NATIVE: `no-c-files`, an image without the C files;
+    `check-fails`, a library that is built and does not pass). A Lean server remembers the program its
     workers were started as when it was MADE (`LEAN_SERVER_REPL_PATH`), which is what
     `inspect -f '{{range .Config.Env}}...'` answers, with the API key in the same list as on a real box;
   - remembers whether a container was made with its root filesystem read-only (`read_only:`,
@@ -118,6 +119,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -337,7 +339,7 @@ def run(args):
     mounts, bare, user, entrypoint, name, ports, cgroup_parent, given = [], set(), None, None, None, [], None, {}
     with_value = {"--network", "--user", "--entrypoint", "-v", "--name", "--cap-drop", "--security-opt", "--tmpfs",
                   "--memory", "--memory-swap", "--cpus", "--pids-limit", "-p", "-e", "--dns", "--restart",
-                  "--cgroup-parent"}
+                  "--cgroup-parent", "--pull"}
     index = 0
     while index < len(args) and args[index].startswith("-"):
         option = args[index]
@@ -408,8 +410,8 @@ def run(args):
         (STATE / "running" / name).write_text("")
         print((STATE / f"id.{name}").read_text())
         return 0
-    if entrypoint == "bash" and command[:1] == ["-c"] and "lean-native-build.sh" in command[1]:
-        return compiled_search(image, command[1], given, mount_of)
+    if entrypoint == "bash" and command[:1] == ["/lean-native-src/inside.sh"]:
+        return compiled_search(image, command[1:], name, given, mount_of)
     tool, mapped = command[0], [host(argument) for argument in command[1:]]
     source = {**os.environ, "PYTHONPATH": PROJECT}
     if tool in ("leanpool-pki", "leanpool-haproxy-config"):
@@ -524,32 +526,46 @@ def run(args):
     fail(f"docker run: the stand-in does not know the command {tool}")
 
 
-def compiled_search(image, script, given, mount_of):
-    """The build and the check of the compiled search step, as a container of the Lean server's image runs them
-    What the real ones do is tests/install/test_install_lean_native.py's, against
-    a real Lean; here it is what the INSTALLER must give them, and what it does with each outcome."""
-    for option, wanted in (("--network", "none"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges:true")):
+def container_files(name):
+    """A container's own file system (what `docker cp` reads), while the container exists."""
+    return STATE / "containers" / name
+
+
+def compiled_search(image, arguments, name, given, mount_of):
+    """The build and the check of the compiled search step, as make.sh has a container of the Lean server's image
+    run them (inside.sh). What the real ones do is tests/test_compiled_search.py's; here it is what make.sh must
+    give them, and what the installer does with each outcome."""
+    for option, wanted in (("--pull", "never"), ("--network", "none"), ("--cap-drop", "ALL"),
+                           ("--security-opt", "no-new-privileges:true")):
         if given.get(option) != [wanted]:
             fail(f"docker run: the stand-in builds the compiled search step only in a hardened container ({option} {wanted})")
-    source, out = mount_of("/lean-native-src"), mount_of("/opt/lean-native")
-    if source is None or out is None:
-        fail("docker run: /lean-native-src and /opt/lean-native must both be mounted")
-    for needed in ("lean-native-build.sh", "lean-native-check.py", "lean-native-modules", "lean-native-repl"):
+    source = mount_of("/lean-native-src")
+    if source is None or not given["-v"][0].endswith(":/lean-native-src:ro") or len(given["-v"]) != 1:
+        fail("docker run: the compiled search step is built with its source mounted read-only, and nothing else")
+    for needed in ("inside.sh", "build.sh", "check.py", "modules", "repl-native"):
         if not Path(source[0], needed).is_file():
             fail(f"bash: /lean-native-src/{needed}: No such file or directory", 127)
-    if "/opt/lean-native/repl-native" not in script or not os.access(Path(out[0], "repl-native"), os.X_OK):
-        fail("lean-native-check.py: the launcher /opt/lean-native/repl-native is not there, or cannot be started", 126)
+    if not name or arguments != ["/opt/lean-native"]:
+        fail("docker run: the stand-in builds the compiled search step in a named container, into /opt/lean-native")
+    if (STATE / f"id.{name}").exists():
+        fail(f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.', 125)
+    (STATE / f"id.{name}").write_text(uuid.uuid4().hex)
+    out = container_files(name) / "opt" / "lean-native"
+    out.mkdir(parents=True)
+    # inside.sh: the image's REPL, and the launcher, before the build and the check.
+    (out / "repl-path").write_text("/repl/.lake/build/bin/repl\n")
+    shutil.copy(Path(source[0], "repl-native"), out / "repl-native")
     note("native-builds", image)
     outcome = os.environ.get("STUB_NATIVE", "ok")
     if outcome == "no-c-files":
-        print("lean-native-build.sh: this image holds no C file for Mathlib/Tactic/Linarith/Oracle/SimplexAlgorithm of mathlib "
+        print("build.sh: this image holds no C file for Mathlib/Tactic/Linarith/Oracle/SimplexAlgorithm of mathlib "
               "(/lean-project/.lake/packages/mathlib/.lake/build/ir/Mathlib/Tactic/Linarith/Oracle/SimplexAlgorithm.c): "
               "nothing was built", file=sys.stderr)
         return 3
-    Path(out[0], "linarith-search.so").write_bytes(b"\x7fELF made for " + image.encode())
-    Path(out[0], "sources").write_text("/lean-project/.lake/packages/mathlib/.lake/build/ir/Mathlib/Data/Ineq.c\n"
-                                       "/lean-project/lean-toolchain\n")
-    Path(out[0], "built-from").write_text(hashlib.sha256(image.encode()).hexdigest() + "\n")
+    (out / "linarith-search.so").write_bytes(b"\x7fELF made for " + image.encode())
+    (out / "sources").write_text("/lean-project/.lake/packages/mathlib/.lake/build/ir/Mathlib/Data/Ineq.c\n"
+                                 "/lean-project/lean-toolchain\n")
+    (out / "built-from").write_text(hashlib.sha256(image.encode()).hexdigest() + "\n")
     print("COMPILED: 7 modules into /opt/lean-native/linarith-search.so (865976 bytes); 4 imported modules are not compiled "
           "and got an initializer that does nothing")
     if outcome == "check-fails":
@@ -587,6 +603,13 @@ def main():
         return compose(argv[1:])
     if verb == "run":
         return run(argv[1:])
+    if verb == "cp":                                         # cp CONTAINER:PATH DIRECTORY, out of a container
+        name, path = argv[1].split(":", 1)
+        origin = container_files(name) / path.lstrip("/")
+        if not origin.is_dir():
+            fail(f"Error response from daemon: Could not find the file {path} in container {name}")
+        shutil.copytree(origin, argv[2], dirs_exist_ok=True)
+        return 0
     if verb == "info":
         if "-f" in argv and "CgroupDriver" in argv[argv.index("-f") + 1]:
             # How this Docker keeps its containers' control groups: the driver and the version.
@@ -785,6 +808,7 @@ def main():
                        STATE / f"cgroup-parent.{name}", STATE / f"memory.{name}", STATE / f"repl-path.{name}",
                        STATE / f"read-only.{name}", STATE / f"mounts.{name}", STATE / f"image.{name}"):
             holder.unlink(missing_ok=True)
+        shutil.rmtree(container_files(name), ignore_errors=True)
         return 0
     if verb == "diff":
         # What a container changed in its writable layer: a Lean server that has served checks wrote unnamed
@@ -1049,7 +1073,14 @@ CURL = (
 # A pool's admission cases, as a test installs a pool with them: the repository's own example.
 ADMIT_CASES = str(ROOT / "examples" / "admission-cases")
 # What the installers build the pool's image from, and all a join bundle carries of the project.
-PROJECT_FILES = ("pyproject.toml", "README.md", "LICENSE", "leanpool", "deploy/Dockerfile")
+PROJECT_FILES = (
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+    "leanpool",
+    "deploy/Dockerfile",
+    "deploy/lean-server/compiled-search",
+)
 
 
 def tools_run_from_source() -> bool:
@@ -1139,7 +1170,9 @@ class Machine:
         def real(text: str) -> str:  # the real tools, by where they really are
             for name in ("install", "mv", "id", "sleep", "date", "uname", "ps"):
                 text = text.replace(f"__REAL_{name}__", shutil.which(name) or name)
-            return text.replace("__PYTHON__", python).replace("__TESTS__", str(Path(__file__).resolve().parents[1]))
+            return text.replace("__PYTHON__", python).replace(
+                "__TESTS__", str(Path(__file__).resolve().parents[1])
+            )
 
         (self.stub / "bin" / "docker").write_text(real(DOCKER))
         for name in ("install", "chown", "mv"):

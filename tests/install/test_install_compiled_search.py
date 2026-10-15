@@ -1,9 +1,9 @@
 """Linarith's search step as compiled code, as the INSTALLER and `kimina-ctl` handle it.
 
-The REAL installer and the REAL `kimina-ctl` run here on the fake machine of `stand_ins.py` (read
-its docstring first). Its Docker plays the build and the check: what they really do, against a real Lean, is
-`test_install_lean_native.py`'s. What a real box adds, and no test here shows: that its Docker mounts the directory
-where the launcher expects it and lets a script on it be started.
+The REAL installer, the REAL `make.sh` it runs and the REAL `kimina-ctl` run here on the fake machine of
+`stand_ins.py` (read its docstring first). Its Docker plays the build and the check: what they really do, against
+a real Lean, is tests/test_compiled_search.py's. What a real box adds, and no test here shows: that its Docker
+mounts the directory where the launcher expects it and lets a script on it be started.
 """
 
 import os
@@ -37,7 +37,15 @@ MEASURED = (
     "linarith's search took 11.4 s as the image runs it and 1.4 s compiled (8.4 times less); the same answers; "
     "a program a tactic starts does not inherit the library"
 )
-FILES = ("lean-native-build.sh", "lean-native-check.py", "lean-native-modules", "lean-native-repl")
+# What the library is made from, beside the image: the files of the lean-pool project's compiled-search/.
+MADE_FROM = ("build.sh", "check.py", "inside.sh", "make.sh", "modules", "repl-native")
+BUILT = {"repl-native", "repl-path", "linarith-search.so", "sources", "built-from", "state"}
+LAUNCHER_ONLY = {"repl-native", "repl-path", "state"}
+
+
+def compiled_search(installers):
+    """The compiled-search/ directory of the project the installers in INSTALLERS are part of."""
+    return installers.parent / "lean-server" / "compiled-search"
 
 
 @pytest.fixture(scope="module")
@@ -95,38 +103,37 @@ def held(machine: Machine) -> set[str]:
 def test_an_install_builds_the_step_checks_it_and_only_then_starts_the_workers_with_it(fresh):
     mark = fresh.mark()
     result = installed(fresh)
-    # Built and checked once, in the instance's image, hardened as the server is and with no network.
+    # Built and checked once by the project's make.sh, in the instance's image, hardened as the server is, with
+    # no network and nothing pulled, in a container named for the instance.
     assert fresh.native_builds() == ["acme/kimina:lean-demo-1"]
-    (build,) = [call for call in fresh.calls_since(mark) if "lean-native-build.sh" in call]
-    assert "--network none --cap-drop ALL --security-opt no-new-privileges:true" in build
-    assert (
-        ":/lean-native-src:ro" in build
-        and ":/opt/lean-native " in build
-        and "--entrypoint bash" in build
-    )
-    assert (
-        "lean-native-check.py --launcher /opt/lean-native/repl-native --native-dir /opt/lean-native"
-        in build
-    )
-    # ... from a directory of the run's own BESIDE where the library will live (the same file system and
-    # mount options as the server's), which is gone when the run ends.
-    assert f"-v {fresh.path(INSTANCE)}/native.work." in build and not list(
-        fresh.path(INSTANCE).glob("native.work.*")
-    )
-    # ... before the server's container was made.
     calls = fresh.calls_since(mark)
+    (build,) = [call for call in calls if "/lean-native-src/inside.sh" in call]
+    source = compiled_search(fresh.deploy)
+    assert build == (
+        "docker run --pull never --name lean-server-demo-native --network none --cap-drop ALL "
+        f"--security-opt no-new-privileges:true -v {source}:/lean-native-src:ro "
+        "--entrypoint bash acme/kimina:lean-demo-1 /lean-native-src/inside.sh /opt/lean-native"
+    )
+    # ... copied out of the container into a directory of the run's own, never written into the box by it; the
+    # container and that directory are gone when the run ends.
+    copy = calls[calls.index(build) + 1]
+    assert copy.startswith(
+        f"docker cp lean-server-demo-native:/opt/lean-native/. {fresh.path(INSTANCE)}/native.work."
+    )
+    assert calls[calls.index(build) + 2] == "docker rm -f lean-server-demo-native"
+    assert not list(fresh.path(INSTANCE).glob("native.work.*"))
+    # ... before the server's container was made.
     assert calls.index(build) < min(
         index for index, call in enumerate(calls) if " up -d" in call and "acme-kimina-demo" in call
     )
-    # What the box holds: the launcher (to be started), the library and what ties it to the image, the record.
-    assert held(fresh) == {"repl-native", "linarith-search.so", "sources", "built-from", "state"}
+    # What the box holds: the launcher (to be started) and the image's REPL, the library and what ties it to the
+    # image, the record.
+    assert held(fresh) == BUILT
     assert fresh.owner(f"{NATIVE}/repl-native") == ("root", "root", 0o755)
     assert fresh.owner(f"{NATIVE}/linarith-search.so") == ("root", "root", 0o644)
     assert fresh.owner(NATIVE) == ("root", "root", 0o755)
-    assert (
-        fresh.path(f"{NATIVE}/repl-native").read_bytes()
-        == (fresh.deploy / "lean-native-repl").read_bytes()
-    )
+    assert fresh.path(f"{NATIVE}/repl-native").read_bytes() == (source / "repl-native").read_bytes()
+    assert fresh.path(f"{NATIVE}/repl-path").read_text() == f"{PLAIN}\n"
     assert fresh.path(f"{NATIVE}/state").read_text() == f"on {MEASURED}\n"
     assert (
         fresh.path(f"{INSTANCE}/native.built").exists()
@@ -165,15 +172,15 @@ def test_a_second_run_makes_nothing_again(machine):
     assert machine.worker_program(LEAN) == LAUNCHER
 
 
-@pytest.mark.parametrize("changed", FILES)
-def test_a_changed_file_of_the_four_makes_the_library_again_and_not_the_server(
+@pytest.mark.parametrize("changed", MADE_FROM)
+def test_a_changed_file_of_compiled_search_makes_the_library_again_and_not_the_server(
     tmp_path, machine, changed
 ):
     """The library is a function of the image and of these files. The server's definition did not change, so
     its container stays: a worker loads the new library when it next starts. The usage agent is made again,
     once: the installer's version it states is of these files too."""
     newer = rewritten_installers(tmp_path / "newer")
-    with open(newer / changed, "a") as handle:
+    with open(compiled_search(newer) / changed, "a") as handle:
         handle.write("\n# one more line\n")
     had = (machine.recreated(), len(machine.native_builds()))
     machine.deploy = newer
@@ -182,7 +189,7 @@ def test_a_changed_file_of_the_four_makes_the_library_again_and_not_the_server(
     assert len(machine.native_builds()) == had[1] + 1 and machine.recreated() == [*had[0], AGENT]
     assert (
         machine.path(f"{NATIVE}/repl-native").read_bytes()
-        == (newer / "lean-native-repl").read_bytes()
+        == (compiled_search(newer) / "repl-native").read_bytes()
     )
     assert (
         installed(machine).stdout.count("not made again") == 2
@@ -212,7 +219,7 @@ def test_an_image_without_the_c_files_installs_with_the_plain_repl_and_says_so(f
     result = installed(fresh, STUB_NATIVE="no-c-files")
     said = [line for line in result.stderr.splitlines() if "COMPILED SEARCH STEP: OFF" in line]
     assert len(said) == 1 and said[0].startswith(
-        "WARNING: COMPILED SEARCH STEP: OFF - the library was not built: "
+        "WARNING: COMPILED SEARCH STEP: OFF - nothing was built: build.sh: "
     )
     assert (
         "this image holds no C file for Mathlib/Tactic/Linarith/Oracle/SimplexAlgorithm of mathlib"
@@ -222,16 +229,16 @@ def test_an_image_without_the_c_files_installs_with_the_plain_repl_and_says_so(f
         "every answer is the same, linarith's search is slower" in said[0]
         and f"Full log: {fresh.path(INSTANCE)}/native.log" in said[0]
     )
-    assert "  search      COMPILED SEARCH STEP: OFF - the library was not built" in result.stdout
+    assert "  search      COMPILED SEARCH STEP: OFF - nothing was built" in result.stdout
     # Nothing a worker could load, and the server runs the program it always ran.
-    assert held(fresh) == {"state"} and not fresh.path(f"{INSTANCE}/native.built").exists()
-    assert fresh.path(f"{NATIVE}/state").read_text().startswith("off the library was not built: ")
+    assert held(fresh) == LAUNCHER_ONLY and not fresh.path(f"{INSTANCE}/native.built").exists()
+    assert fresh.path(f"{NATIVE}/state").read_text().startswith("off nothing was built: ")
     assert (
         settings(fresh)["KIMINA_REPL_PATH"] == PLAIN
         and fresh.worker_program(LEAN) == PLAIN
         and fresh.running(LEAN)
     )
-    assert status_line(fresh).startswith(f"{START} OFF (the library was not built: ")
+    assert status_line(fresh).startswith(f"{START} OFF (nothing was built: ")
     assert status_line(fresh).endswith("; the workers run the plain REPL, with the same answers)")
     # The next run tries again, and a build that passes turns the step on: the server is made again, once.
     had = fresh.recreated()
@@ -244,7 +251,7 @@ def test_a_library_that_does_not_pass_its_check_is_never_given_to_the_server(fre
     result = installed(fresh, STUB_NATIVE="check-fails")
     reason = "the check 'starts a program' got a different answer with the library than without"
     assert f"WARNING: COMPILED SEARCH STEP: OFF - {reason}." in result.stderr
-    assert held(fresh) == {"state"}  # the library the build wrote stayed in its own directory
+    assert held(fresh) == LAUNCHER_ONLY  # the library the build wrote stayed in its container
     assert fresh.path(f"{NATIVE}/state").read_text() == f"off {reason}\n"
     assert settings(fresh)["KIMINA_REPL_PATH"] == PLAIN and fresh.worker_program(LEAN) == PLAIN
     assert (
@@ -255,16 +262,13 @@ def test_a_library_that_does_not_pass_its_check_is_never_given_to_the_server(fre
 
 def test_a_box_that_had_the_step_loses_it_when_a_newer_build_does_not_pass(tmp_path, machine):
     newer = rewritten_installers(tmp_path / "newer")
-    with open(newer / "lean-native-modules", "a") as handle:
+    with open(compiled_search(newer) / "modules", "a") as handle:
         handle.write("mathlib Mathlib/Tactic/Linarith/Preprocessing\n")
     machine.deploy = newer
     had = machine.recreated()
     result = installed(machine, STUB_NATIVE="check-fails")
     assert "COMPILED SEARCH STEP: OFF" in result.stderr
-    assert (
-        held(machine) == {"repl-native", "state"}
-        and not machine.path(f"{INSTANCE}/native.built").exists()
-    )
+    assert held(machine) == LAUNCHER_ONLY and not machine.path(f"{INSTANCE}/native.built").exists()
     assert settings(machine)["KIMINA_REPL_PATH"] == PLAIN
     assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [*had, LEAN, AGENT]
 
@@ -440,20 +444,3 @@ def test_the_pools_own_host_keeps_what_its_instance_made_and_says_so_last(machin
         in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()
     )
     assert "ports:" not in machine.path(f"{INSTANCE}/docker-compose.yml").read_text()
-
-
-def test_a_join_bundle_carries_the_four_files(deploy):
-    installers = deploy
-    listed = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'SRC=$1; . "$1/pool-lib.sh"; printf "%s\\n" "${LEAN_POOL_JOIN_FILES[@]}"',
-            "-",
-            str(installers),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.split()
-    assert set(FILES) <= set(listed) and all((installers / name).is_file() for name in FILES)

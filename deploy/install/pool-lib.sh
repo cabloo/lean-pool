@@ -18,8 +18,7 @@ LEAN_POOL_SERVER_NAME='^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
 # What a join bundle holds beside the lean-pool project and the site (pack_join_bundle): the instance installer
 # and all it needs. No key.
 LEAN_POOL_JOIN_FILES=(install.sh pool-lib.sh kimina-firewall kimina-ctl join_helper.py
-                      docker-compose.yml docker-compose.agent.yml docker-compose.front.yml
-                      lean-native-build.sh lean-native-check.py lean-native-modules lean-native-repl)
+                      docker-compose.yml docker-compose.agent.yml docker-compose.front.yml)
 
 # ------------------------------------------------------------------------------------------------ the site
 # A site is a directory of values: site.env, and one file
@@ -297,104 +296,57 @@ remove_cpu_priority() {
 # a goal, which runs in Lean's interpreter because Mathlib is not shipped as native code. A box compiles that
 # step from the C files its own copy of the image already holds, checks it, and only then lets the Lean
 # server start its workers through a launcher that loads it. The image is not changed and nothing travels
-# between boxes. What Lean accepts does not change: the kernel checks every proof as before.
+# between boxes. What Lean accepts does not change: the kernel checks every proof as before. The lean-pool
+# project's compiled-search/make.sh does all of it (docs/compiled-search.md), for the instance's directory:
 #   <instance dir>/native/            mounted read-only at LEAN_NATIVE_MOUNT by the server's compose file
-#     repl-native                     the launcher (lean-native-repl): the program a worker is started as
+#     repl-native, repl-path          the launcher (the program a worker is started as), and the image's REPL
 #     linarith-search.so              the library; `sources` and `built-from` tie it to the image's C files
 #     state                           one line: `on ...` with what the box's own check measured, or `off REASON`
-#   <instance dir>/native.built       what the library was made from: these files and the image's ID
+#   <instance dir>/native.built       what the library was made from: make.sh's files and the image's ID
 #   <instance dir>/native.log         the last build and check, in full
 #   <instance dir>/native.work.*      a build in progress; removed when it ends, and by the next run
-LEAN_NATIVE_FILES=(lean-native-build.sh lean-native-check.py lean-native-modules lean-native-repl)
+LEAN_NATIVE_MAKE=deploy/lean-server/compiled-search/make.sh     # in the lean-pool project
 LEAN_NATIVE_MOUNT=/opt/lean-native
 LEAN_NATIVE_LAUNCHER=$LEAN_NATIVE_MOUNT/repl-native
 LEAN_PLAIN_REPL=/repl/.lake/build/bin/repl       # where an instance's image puts its REPL: the compose file's default
 COMPILED_SEARCH_INSTALLED=""     # set once install_compiled_search has run in this process
 COMPILED_SEARCH_SAID=""          # its one line, for the installer's last lines
 
-# compiled_search_off INSTANCE_DIR REASON : the server is started as the plain REPL, and the box says why.
-compiled_search_off() {
-  rm -f "$1/native/built-from" "$1/native/linarith-search.so" "$1/native/sources" "$1/native.built"
-  printf 'off %s\n' "$2" > "$1/native/state"
-  chmod 0644 "$1/native/state"
-  set_env_in "$1/kimina.env" KIMINA_REPL_PATH "$LEAN_PLAIN_REPL"
-}
-
 # install_compiled_search INSTANCE_DIR INSTANCE IMAGE : make the library from IMAGE on this box, check it,
 # and write into the instance's settings which program its workers are, BEFORE its container is (re)made.
 # Nothing here stops an install: a build or a check that fails leaves the server on the plain
 # REPL, which is what it ran before, and says so. Instance 1 gets the (empty) directory and nothing else.
 install_compiled_search() {
-  local dir=$1 instance=$2 image=$3 env=$1/kimina.env native=$1/native file inputs id work said="" reason name
+  local dir=$1 instance=$2 image=$3 env=$1/kimina.env native=$1/native project said state reason
   COMPILED_SEARCH_INSTALLED=1
   install -d -o root -g root -m 0755 "$native"
   [ -n "$instance" ] || return 0
-  for file in "${LEAN_NATIVE_FILES[@]}"; do
-    [ -f "$SRC/$file" ] || die "missing $SRC/$file - run this from the repo checkout"
-  done
+  project=$(lean_pool_source) && [ -f "$project/$LEAN_NATIVE_MAKE" ] \
+    || die "missing $LEAN_NATIVE_MAKE: $LEAN_POOL_SOURCE_MISSING"
   if [ "$(setting_in "$env" KIMINA_COMPILED_SEARCH)" = off ]; then
     set_env_in "$env" KIMINA_REPL_PATH "$LEAN_PLAIN_REPL"
     COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: off by this box's own setting (KIMINA_COMPILED_SEARCH=off in $env); 'sudo kimina-ctl @$instance compiled-search on' turns it on"
     echo "$COMPILED_SEARCH_SAID"
     return 0
   fi
-  inputs=$(cd "$SRC" && sha256sum "${LEAN_NATIVE_FILES[@]}" | sha256sum | cut -d ' ' -f 1)
-  id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)
-  if [ -n "$id" ] && [ "$(cat "$dir/native.built" 2>/dev/null || true)" = "$inputs $id" ] \
-     && [ -s "$native/linarith-search.so" ] && [ -s "$native/built-from" ] && [ -s "$native/sources" ] \
-     && [ -x "$native/repl-native" ] && [ "$(cut -d ' ' -f 1 "$native/state" 2>/dev/null || true)" = on ]; then
+  # make.sh says what it does as it goes, and its last line is the answer: on, or off and why. A make.sh that
+  # stopped before it could say (it cannot run at all) leaves the server on the plain REPL too.
+  said=$(mktemp)
+  if bash "$project/$LEAN_NATIVE_MAKE" --image "$image" --box "$dir" --name "lean-server-$instance-native" \
+       </dev/null | tee "$said"; then
+    COMPILED_SEARCH_SAID=$(tail -n 1 "$said")
     set_env_in "$env" KIMINA_REPL_PATH "$LEAN_NATIVE_LAUNCHER"
-    COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: on - already made from this image and checked ($(cut -d ' ' -f 2- "$native/state")); not made again"
-    echo "$COMPILED_SEARCH_SAID"
-    return 0
-  fi
-  say "Compiling linarith's search step from this image's own C files, and checking it (a few minutes)"
-  # Beside where the library will live, not in /tmp: the check then starts the launcher from the same
-  # file system, with the same mount options, as the server will. A run that was cut short left its own.
-  rm -rf "$dir"/native.work.*
-  work=$(mktemp -d "$dir/native.work.XXXXXX")
-  mkdir "$work/src" "$work/native"
-  chmod 0755 "$work" "$work/src" "$work/native"
-  for file in "${LEAN_NATIVE_FILES[@]}"; do install -m 0644 "$SRC/$file" "$work/src/$file"; done
-  install -m 0755 "$SRC/lean-native-repl" "$work/native/repl-native"
-  name=$SITE_PREFIX-native-$instance
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  # The image's own bash, python3 and Lean, with the service's hardening and no network. The library is
-  # written and checked at the path the server will find it under (LEAN_NATIVE_MOUNT), in a directory of
-  # this run's own.
-  if [ -n "$id" ] && timeout 1800 docker run --rm --name "$name" --network none --cap-drop ALL \
-       --security-opt no-new-privileges:true -v "$work/src":/lean-native-src:ro -v "$work/native":"$LEAN_NATIVE_MOUNT" \
-       --entrypoint bash "$image" -c "bash /lean-native-src/lean-native-build.sh $LEAN_NATIVE_MOUNT && python3 /lean-native-src/lean-native-check.py --launcher $LEAN_NATIVE_LAUNCHER --native-dir $LEAN_NATIVE_MOUNT" \
-       > "$dir/native.log" 2>&1 </dev/null; then
-    said=$({ grep -a '^COMPILED SEARCH STEP: ok - ' "$dir/native.log" || true; } | tail -n 1)
-  fi
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  if [ -n "$said" ] && [ -s "$work/native/linarith-search.so" ] && [ -s "$work/native/built-from" ] && [ -s "$work/native/sources" ]; then
-    # `built-from` goes first and comes back last: a worker that starts in between runs the plain REPL.
-    rm -f "$native/built-from"
-    install -o root -g root -m 0755 "$SRC/lean-native-repl" "$native/repl-native.new"
-    mv -f "$native/repl-native.new" "$native/repl-native"
-    install -o root -g root -m 0644 "$work/native/linarith-search.so" "$native/linarith-search.so.new"
-    mv -f "$native/linarith-search.so.new" "$native/linarith-search.so"
-    install -o root -g root -m 0644 "$work/native/sources" "$native/sources"
-    install -o root -g root -m 0644 "$work/native/built-from" "$native/built-from"
-    printf 'on %s\n' "${said#COMPILED SEARCH STEP: ok - }" > "$native/state"
-    chmod 0644 "$native/state"
-    printf '%s %s\n' "$inputs" "$id" > "$dir/native.built"
-    set_env_in "$env" KIMINA_REPL_PATH "$LEAN_NATIVE_LAUNCHER"
-    COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: on - ${said#COMPILED SEARCH STEP: ok - }"
-    echo "$COMPILED_SEARCH_SAID"
   else
-    reason=$({ grep -a '^COMPILED SEARCH STEP: FAILED - ' "$dir/native.log" 2>/dev/null || true; } | tail -n 1)
-    reason=${reason#COMPILED SEARCH STEP: FAILED - }
-    if [ -z "$id" ]; then reason="there is no image $image on this box"
-    elif [ -z "$reason" ]; then reason="the library was not built: $(last_line_of "$dir/native.log")"; fi
-    reason=$(printf '%s' "$reason" | tr -d '\n' | tr -c '[:print:]' ' ' | cut -c 1-400)
-    compiled_search_off "$dir" "$reason"
+    state=$(head -n 1 "$native/state" 2>/dev/null || true)
+    case $state in
+      "off "*) reason=${state#off } ;;
+      *) reason="make.sh stopped: $(last_line_of "$said")" ;;
+    esac
+    set_env_in "$env" KIMINA_REPL_PATH "$LEAN_PLAIN_REPL"
     COMPILED_SEARCH_SAID="COMPILED SEARCH STEP: OFF - $reason. The Lean server starts its workers as it did before (the plain REPL): every answer is the same, linarith's search is slower. Full log: $dir/native.log"
     warn "$COMPILED_SEARCH_SAID"
   fi
-  rm -rf "$work"
+  rm -f "$said"
 }
 
 # ------------------------------------------- the Lean server's root filesystem read-only
@@ -1041,7 +993,7 @@ remove_tls_front() {
 # directory `join/`: the instance installer and everything it needs; `join/site/`, the site's values for INSTANCE
 # alone (site.env, instances/INSTANCE.env and that instance's image recipe), which the installer reads when it is
 # given no --site; and `join/lean_pool/`, the lean-pool project's source (the box builds the pool's image from
-# it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
+# it, and makes the compiled search step with it). It holds NO key: the pool's key reaches a box inside its join, and a joining box has no door.
 pack_join_bundle() {
   local out=$1 instance=$2 stage source file recipe
   source=$(lean_pool_source) || die "$LEAN_POOL_SOURCE_MISSING"
@@ -1057,8 +1009,10 @@ pack_join_bundle() {
     [ -f "$SITE/$file" ] || { rm -rf "$stage"; die "missing $SITE/$file - the site's values for instance '$instance'"; }
     cp "$SITE/$file" "$stage/join/site/$file"
   done
-  # Only what the image build reads (see the project's .dockerignore): no tests, no environment, no caches.
+  # Only what the image build reads (see the project's .dockerignore), and the compiled search step: no tests, no
+  # environment, no caches.
   tar -cf - -C "$source" --exclude=__pycache__ pyproject.toml README.md LICENSE leanpool deploy/Dockerfile \
+      deploy/lean-server/compiled-search \
     | tar -xf - -C "$stage/join/lean_pool" || { rm -rf "$stage"; die "could not copy the lean-pool project"; }
   tar -czf - -C "$stage" --owner=0 --group=0 join | base64 > "$out" \
     || { rm -rf "$stage"; die "could not pack the join bundle"; }
