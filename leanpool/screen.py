@@ -9,17 +9,20 @@ never need:
 * ``import`` only ``Mathlib``, ``Aesop`` and their modules, and those of the roots a pool adds
   (``allowed_imports``; the cache's ``--screened-import``), each admitting every module under it,
   and only as the word ``import``, whitespace, and a module's name ending at whitespace or at the
-  end of the file: any other ``import`` (``import/- c -/Lean.Elab``, ``import--c``) is refused;
+  end of the file, read as the file holds it: ASCII parts, each a letter or ``_`` and then letters,
+  digits, ``_``, ``'``, ``!`` or ``?``, joined by single dots. Any other ``import``
+  (``import/- c -/Lean.Elab``, ``import--c``, ``import Mathlib.«x.y»``, ``import Mathlib..x``) is
+  refused;
 * no ``#`` followed by a name but ``#print``, ``#check``, ``#reduce`` and ``#synth``, wherever it
   stands: a command is not told apart from notation, so ``#s`` (a finset's size) is refused too,
   and ``s.card`` passes;
 * none of the words in ``REFUSED_WORDS``;
 * attributes (``@[...]``, ``attribute [...]``) naming only those in ``ALLOWED_ATTRIBUTES``.
 
-The whole text is read, comments and strings included, with ``«`` and ``»`` taken away first, and
-each word as a whole word (``elaborate`` and ``my_macro_lemma`` pass). A word in a comment costs
-its sender one refused check; telling Lean's comments apart here would be a second Lean parser to
-get wrong.
+The whole text is read, comments and strings included, each word as a whole word (``elaborate``
+and ``my_macro_lemma`` pass), and for every rule but the imports' with ``«`` and ``»`` taken away
+first. A word in a comment costs its sender one refused check; telling Lean's comments apart here
+would be a second Lean parser to get wrong.
 
 **What it is not:** proof that a check runs no code. It is a list of words over a language whose
 files can define syntax, and a determined sender may get round it. What it does is take the easy
@@ -99,7 +102,10 @@ _WORD = re.compile(r"[\w'!?]+")
 # Every word ``import`` is judged, and only one form of it is read: whitespace, then a module's
 # name ending at whitespace or at the end of the text. Any other is refused unread.
 _IMPORT_WORD = re.compile(r"(?<![\w'!?.])import(?![\w'!?])")
-_IMPORT = re.compile(r"import\s+([\w'!?.]+)(?=\s|\Z)")
+# The name as Lean reads it only when no part is written in guillemets (a part ``«a.b»`` is one part
+# to Lean and two to a reader that takes the guillemets away), so a name that has them is refused.
+_MODULE_PART = r"[A-Za-z_][A-Za-z0-9_'!?]*"
+_IMPORT = re.compile(rf"import\s+({_MODULE_PART}(?:\.{_MODULE_PART})*)(?=\s|\Z)")
 _HASH_COMMAND = re.compile(r"#([A-Za-z_][\w'!?]*)")
 _ATTRIBUTE_OPEN = re.compile(r"@\[|(?<![\w'!?.])attribute\s*\[")
 _ATTRIBUTE_TOKEN = re.compile(r"←|<-|↓|[\w'!?.]+|\S")
@@ -117,7 +123,7 @@ def screen(code: str, allowed_imports: Sequence[str] = ()) -> str | None:
             raise ValueError(f"{root!r} is not the root of a Lean module's name")
     text = code.translate(_GUILLEMETS)
     for finding in (
-        _refused_import(text, (*ALLOWED_IMPORTS, *allowed_imports)),
+        _refused_import(code, (*ALLOWED_IMPORTS, *allowed_imports)),
         _refused_hash_command(text),
         _refused_attribute(text),
         _refused_word(text),

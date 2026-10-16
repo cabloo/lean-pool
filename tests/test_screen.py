@@ -90,6 +90,13 @@ def test_an_import_of_anything_but_mathlib_and_aesop_is_refused(module: str) -> 
         "import/-x-/Mathlib",
         "import.Lean",
         "import Mathlib/- x -/",
+        "import Mathlib.«x.y»",
+        "import Mathlib.«Tactic»",
+        "import «Mathlib».Tactic",
+        "import Mathlib..Tactic",
+        "import Mathlib.",
+        "import Mathlib.1x",
+        "import Mathlib.Tactic\u00e9",
     ],
 )
 def test_an_import_the_screen_cannot_read_is_refused(code: str) -> None:
