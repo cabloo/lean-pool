@@ -61,10 +61,13 @@ itself: a request answered from the store never reaches a Lean server that would
 On a miss the caller's `Authorization` header is forwarded. `/health` and `/metrics/cache` are
 open: neither holds a key, a proof or an address.
 
-**Other replies of the cache itself:** 401 without the key, 422 for a malformed request
-(not a JSON object, no snippets, duplicate ids, a `timeout` that is not a whole number of
-seconds, a `debug` or `no_cache` that is not a boolean) or one the screen refuses (below), 508
-for a request that already carries the loop-guard header.
+**Other replies of the cache itself:** 401 without the key, with either key at the other's
+door, and for `/status` at the screened door; 413 for a body longer than `--max-request-bytes`,
+or than `--screened-max-request-bytes` with the screened key; 422 for a malformed request (not
+a JSON object, no snippets, duplicate ids, a `timeout` that is not a whole number of seconds, a
+`debug` or `no_cache` that is not a boolean) or one the screen refuses (below); 503 `{"detail":
+"the screened door is full"}` when the screened senders' places and their queue are taken
+(below); 508 for a request that already carries the loop-guard header.
 
 **The store** is one SQLite file in write-ahead-log mode. All SQLite work runs on a dedicated
 thread, never on the event loop. The size cap counts the bytes of keys and payloads; when a
@@ -120,7 +123,9 @@ than its own: machines whose owner it does not know. Checking Lean code runs it
   answers with checks sent with the pool's key. A screened check joins a flight the pool's key
   started; a check sent with the pool's key never waits on one a screened sender started, which
   may be refused (below), and starts its own. It is forwarded with the pool's key, so no Lean
-  server holds the second one. `/status` takes the pool's key alone.
+  server holds the second one, and with the priority its sender asked for (`X-Lean-Priority`):
+  normal unless `background`, so the door's senders share the workers with the pool's own checks,
+  up to the door's limits. `/status` takes the pool's key alone.
 - **What its checks may cost.** A check its senders start at the servers takes one of
   `--screened-in-flight` places while it is there, and as many more checks may wait for a place.
   Past that a check is answered 503 `{"detail":"the screened door is full"}`, which a client
@@ -144,7 +149,11 @@ than its own: machines whose owner it does not know. Checking Lean code runs it
   part (`FormalConjectures`), so `Formal` admits nothing of `FormalConjectures`. A root admits
   every module under it, and importing a module runs what its own code runs as it is loaded: name
   only a library the Lean servers have installed and whose every module you would let a stranger
-  load. None by default.
+  load. None by default; flags given replace the variable, never add to it. A root admits imports
+  alone: the rest of the screen still holds, so a statement carrying an attribute it refuses, as
+  FormalConjectures' `@[category ...]` and `@[AMS ...]` do, is still refused. An `import` is read
+  only as the word, whitespace and a module's name ending at whitespace or the file's end: any
+  other (`import/- c -/Lean.Elab`) is refused unread.
 - **Where it is set:** by the installer, with the screened door (below), which also gives the cache
   its two limits: the pool's workers, and the pool's Lean timeout.
 - **While the cache is down** the screened door answers 503, and the front door sends checks
@@ -175,9 +184,11 @@ The second key's one way in: a second HTTPS port of the pool's proxy (`--screene
 - **Its limits.** Let W be the workers of the listed servers that are not paused, when the proxy's
   config was rendered. At most W requests from the door are in the cache at once, and W more wait;
   past that, 503 `{"detail":"the screened door is full"}`, and a request still waiting at the proxy's
-  queue timeout gets HAProxy's own 503. The door keeps at most 2W + 8 connections open, speaks
-  HTTP/1.1 alone (over HTTP/2 one connection would carry a hundred requests), gives a sender 5
-  seconds to send a whole request, and takes a body only of a stated length (else 411) no longer
+  queue timeout gets HAProxy's own 503. The door keeps at most 2W + 8 connections open (a cap of
+  its own: none are set aside for it out of the proxy's global limit), speaks HTTP/1.1 alone, with
+  no h2 offered by ALPN and no upgrade to HTTP/2 on its preface (over HTTP/2 one connection would
+  carry a hundred requests), gives a sender 5 seconds to send a request's headers and 5 more for
+  its body (else 408), and takes a body only of a stated length (else 411) no longer
   than one of the proxy's buffers (else 413, before any of it is taken in). Those together bound
   what its senders can hold of the proxy's connections and memory. A request may carry several
   snippets, so the bound on the
@@ -190,12 +201,16 @@ The second key's one way in: a second HTTPS port of the pool's proxy (`--screene
   host that routes to that address is turned away, whatever its address. A bridge named `br-*` that
   is not Docker's (a LAN's `br-lan`, say) is turned away by name, as the host has it when the rule is
   applied: one made later is let in until the rule is applied again, at the next install run or
-  restart of Docker or of the host. The door's certificate is
+  restart of Docker or of the host. When Docker's networks cannot be read as the rule is applied,
+  `docker0` is the one bridge let in, and the rule's log says so. With `--no-firewall` there is no
+  rule: the door is reachable from every network that can route to its address. The door's certificate is
   the front door's, which already names that address. A program on the pool's host passes the door
   on to the machines that use it: one that opens an SSH tunnel to each, say.
 - **The key** is made by the installer once (`screened-api-key` beside the pool's key, readable by
   the cache's group alone) and kept: a re-run keeps it, and so does a closed door.
-  `sudo lean-pool-ctl NAME screened-key new` makes a new one, the door open or closed. Open, it
+  `sudo lean-pool-ctl NAME screened-key new` makes a new one, the door open or closed (closed,
+  only when a key's file is already there: a pool whose door never opened has none, and is
+  refused). Open, it
   makes the cache again with it and checks that a new cache container runs; the old key is refused
   from then on. Closed, the new key is the one taken when the door opens. No Lean server, joined
   box or join bundle ever holds it, and no command prints it. Closing the door does not retire a
@@ -206,12 +221,13 @@ The second key's one way in: a second HTTPS port of the pool's proxy (`--screene
   `--no-screened-key-copy`, and goes with the door: it is refused while the door is closed. Its
   parent must exist. A DIR that does not is made, 0700, with its parent's owner, so that parent
   should belong to the program's user: the copy goes to that owner. Its path is walked from `/` one
-  directory at a time, and none of them may be a link. Each directory on the way must be root's or
-  that owner's and writable by nobody else, as sshd asks of a key's path, so nobody else can put a
-  directory of their own in its place and have the copy written there; one writable by all but
-  sticky, as `/tmp` is, passes only above DIR's parent, and only when the directory below it is
-  root's or the owner's, which nobody else can then move. DIR itself may be written by its owner
-  alone. It is never a pool's or a Lean server's own directory (`/srv/lean-pool-*`, `/srv/kimina*`,
+  directory at a time, and none of them may be a link. Every directory on the way, DIR included,
+  must be root's or that owner's and writable by nobody else, sticky or not, as sshd asks of a
+  key's path: anyone else who could write one could make the directory below it, and so become
+  the owner the copy is written for. So no copy goes under `/tmp`. (The walk starts at
+  `LEANPOOL_KEY_COPY_WALK_ROOT` instead of `/` when root's own environment names one: a seam for
+  the tests and for packaging into a staging root, which holds every directory below it to the
+  same rule.) It is never a pool's or a Lean server's own directory (`/srv/lean-pool-*`, `/srv/kimina*`,
   `/etc/lean-pool`), nor inside one. Each file is made new beside the old one and moved over it,
   never written by name, so a link planted in DIR changes nothing outside it, and a file that
   cannot be moved into place is removed. A copy that cannot be written does not fail the install:

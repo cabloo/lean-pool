@@ -19,22 +19,25 @@ answers anything from its store, and every Lean server checks it again. No comma
 or a token as an argument, and none logs one. The installer writes it into a directory of your
 choosing only when asked (`--pool-key-copy`), for a program that hands it on: the directory's
 owner holds the key, and so does whoever can read the files there. It is written only where
-nobody but root and that owner could have put a directory of their own on the way (no directory
-of the path writable by anyone else), never beside the screened key's copy, and never in a
-pool's or a Lean server's own directory.
+nobody but root and that owner could have made a directory on its path: every directory from `/`
+down is theirs and writable by nobody else, sticky or not, so never under `/tmp`. It is never the
+screened key's copy's directory, nor inside it or around it, nor a directory whose `api-key` is
+the screened key, and never a pool's or a Lean server's own directory.
 
 **A second key, screened, for senders trusted less.** The cache can hold one more key. A check
 sent with it must first pass [the screen](docs/cache.md#the-screened-key), a list of what a proof
-never needs (`#eval`, `run_tac`, `elab`, `IO`, most attributes, imports beyond Mathlib and
-Aesop), and is forwarded with the pool's key, so no Lean server holds the second one. The screen
+never needs (`#eval`, `run_tac`, `elab`, `IO`, most attributes, imports beyond Mathlib, Aesop
+and the libraries the pool names with `--screened-import`), and is forwarded with the pool's key, so no Lean server holds the second one. The screen
 is a list of words, not proof that a check runs no code: give that key only where the Lean
 servers are also run so as to hold what passes. A request sent with it may carry only Kimina's
 plain fields, a bounded number of snippets and a bounded timeout, and its checks hold a bounded
 number of places at the servers. It is taken at one door alone: [the screened
 door](docs/cache.md#the-screened-door), a second HTTPS port that leads to the cache and nowhere
 else, which the installer publishes on the Docker bridge's address and firewalls to the Docker
-bridges. The door speaks HTTP/1.1 alone and takes a body of a stated length no longer than one
-of the proxy's buffers, so what its senders hold of the proxy is bounded by its connections.
+bridges (with `--no-firewall` it makes no such rule, and the door is reachable from every network
+that can route to that address). The door speaks HTTP/1.1 alone, gives a request's headers 5
+seconds and its body 5 more, and takes a body of a stated length no longer than one of the
+proxy's buffers, so what its senders hold of the proxy is bounded by its connections.
 
 **Three things are answered without the key.** `GET /health`, and for a Prometheus scraper
 `GET /metrics`, `/metrics/cache` and `/metrics/pool`: the names of the pool's servers and

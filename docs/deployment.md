@@ -26,9 +26,11 @@ clients| HAProxy :18100 (HTTPS)               |   mutual   | TLS front :18001 --
 | that port + 200 | every box | The same front, to the box's usage agent. |
 | 18101, 18102, 18103 | inside the proxy's network namespace | The proxy's door to the Lean servers, the cache, HAProxy's statistics. Loopback only; never published. |
 
-The installers' firewall lets the LAN subnet and the Docker bridges reach the published ports
-(the screened door: what arrives from a Docker bridge's interface alone), and nothing else. Nothing
-in the pool needs a GPU.
+The installers' firewall lets the LAN subnet, the Docker bridges and the host's own loopback
+addresses (127.0.0.0/8) reach the published ports, and nothing else. The screened door lets in
+what arrives from a Docker bridge's interface and from loopback alone; when Docker's networks
+cannot be read as its rule is applied, `docker0` is the one bridge let in. `--no-firewall` makes
+none of these rules. Nothing in the pool needs a GPU.
 
 ## What a box needs
 
@@ -304,7 +306,7 @@ own ([the screened door](cache.md#the-screened-door)):
 
 ```sh
 sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases \
-  --screened-door --screened-key-copy /srv/hand-out/lean-pool
+  --screened-door --screened-key-copy /srv/hand-out/screened-key
 sudo lean-pool-ctl upstream screened-key new     # a new key; the old one is refused from then on
 sudo lean-pool-ctl upstream screened-key copy    # the key and the authority written to the copy again
 ```
@@ -313,10 +315,12 @@ It is published on the docker0 bridge's address alone (port 18120) and firewalle
 from a docker bridge's interface: only the containers and the programs of the pool's host reach it,
 and something there passes it on (an SSH tunnel to the machine, say). `--screened-key-copy DIR`
 names the directory that program reads the key and the pool authority's certificate from; the
-files are owned by that directory's owner. DIR's parent must exist, belong to that program's user,
-and be reached through no link and through no directory anyone but root and that user can write
-(the installer refuses the copy otherwise, and writes nothing). `--no-screened-key-copy` stops the
-copy and leaves its files. The install's summary has a `screened` line, with where the door is
+files are owned by that directory's owner. DIR's parent must exist and should belong to that
+program's user: a DIR not there yet is made with its parent's owner, so under a parent of root's
+the copy is root's. Every directory of its path, from `/` down and DIR included, must be root's or
+that owner's and writable by nobody else, sticky or not, and none may be a link, so the copy never
+goes under `/tmp`; a copy refused for that is not written, and the install's summary warns of it.
+`--no-screened-key-copy` stops the copy and leaves its files. The install's summary has a `screened` line, with where the door is
 and where its key went; a copy that could not be written is a warning there, not a failed install.
 `lean-pool-ctl upstream status` says the same, and never prints the key. The door stays open
 through every re-run until `--no-screened-door`. Closing it does not retire the key: `screened-key
@@ -329,7 +333,9 @@ admits ROOT's modules too: `--screened-import FormalConjectures` for statements 
 `import FormalConjectures.Util.ProblemImports`. It is kept once given, replaced by a run that
 gives any, and cleared by `--no-screened-import`; the `screened` line of the summary names it.
 Admit only a library whose every module you would let a stranger load
-([more imports](cache.md#the-screened-key)).
+([more imports](cache.md#the-screened-key)). It admits imports alone: the rest of the screen still
+holds, so a statement that carries an attribute the screen refuses, as FormalConjectures'
+`@[category ...]` and `@[AMS ...]` do, is still refused at the door.
 
 ### A copy of the pool's key
 
@@ -338,19 +344,23 @@ pool's own key, can be given a copy that follows the key:
 
 ```sh
 sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases \
-  --pool-key-copy /srv/hand-out/lean-pool-home
+  --pool-key-copy /srv/hand-out/pool-key
 sudo lean-pool-ctl upstream pool-key copy        # the key and the authority written to the copy again
 ```
 
 Every install run writes the pool's key (`api-key`, 0600) and the pool authority's certificate
 (`ca.crt`, 0644) into DIR, as the [screened key's copy](cache.md#the-screened-door) is written:
-owned by DIR's owner, its path walked with no link followed and through no directory anyone but
-root and that owner can write, each file made beside the old one and moved over it. DIR is kept
-once given, until `--no-pool-key-copy`, which stops the copy and leaves its files where they are
-(remove them by hand). It may not be the screened key's copy's directory, lie inside it or hold
-it, nor be a directory that holds the screened key, compared as directories and by what they hold
-as well as by name: the program that hands the screened key to machines nobody vouches for must
-never be able to read the pool's own key. The installer refuses that before it changes anything.
+owned by DIR's owner, its path walked with no link followed and every directory on it, from `/`
+down and DIR included, root's or that owner's and writable by nobody else, sticky or not, each
+file made beside the old one and moved over it. DIR is kept once given, until
+`--no-pool-key-copy`, which stops the copy and leaves its files where they are (remove them by
+hand). It may not be the screened key's copy's directory, lie inside it or hold it, nor be a
+directory whose `api-key` file is the screened key: the program that hands the screened key to
+machines nobody vouches for must never be able to read the pool's own key. A directory beside it
+is allowed. The installer compares the two by name before it changes anything, and
+refuses there; `lean-pool-ctl NAME pool-key copy`, which the installer runs once the pool's
+containers are up, compares them again as directories (a bind mount, say) and by the `api-key`
+they hold, and a refusal there is a warning in the summary, with nothing written.
 One user may own both directories only when it is the one program trusted to hand each key to
 its own machines alone, as a coordinator that starts work on rented and owned boxes is. The
 summary has a `pool key` line; a copy that could not be written is a warning there, not a failed

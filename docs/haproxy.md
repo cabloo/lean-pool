@@ -328,13 +328,15 @@ With TLS and `--screened-door-port N`, `render` adds a second way in, for the ca
 door, with a comment, and two lines to the file's opening comment. W below is the workers of the
 listed servers that are not paused:
 
-* `frontend screened_door`: `bind :N ssl crt <front door> ssl-min-ver TLSv1.3 alpn http/1.1`, the
-  front door's certificate and HTTP/1.1 alone, `maxconn` 2W + 8, its own share of the proxy's
-  connections, and `timeout http-request 5s`. `/health` and the three capacity headers are
+* `frontend screened_door`: `bind :N ssl crt <front door> ssl-min-ver TLSv1.3 alpn http/1.1
+  proto h1`, the front door's certificate and HTTP/1.1 alone (ALPN alone would leave HAProxy's
+  upgrade to HTTP/2 on its preface, which `proto h1` takes away), `maxconn` 2W + 8, a cap on the
+  door's own connections (none are set aside for it out of the proxy's global limit), and
+  `timeout http-request 5s` for a request's headers. `/health` and the three capacity headers are
   answered exactly as at the front door. Anything but `POST /api/check` is answered 404
   `{"detail":"this door takes checks alone"}`. Its rules are read on a request's headers alone
   (`no option http-buffer-request`; `backend screened_cache` waits for the body, as every backend
-  does): a check with no `Content-Length` (chunked) is answered 411, and one whose
+  does, for 5 seconds at most, else 408): a check with no `Content-Length` (chunked) is answered 411, and one whose
   `Content-Length` is more than one buffer (`tune.bufsize`, `--max-request-bytes`) 413, before any
   of its body is taken in. So its senders cannot use up the proxy's own connections or its memory:
   2W + 8 connections, one request at a time on each (over HTTP/2 one connection would carry a
@@ -344,7 +346,8 @@ listed servers that are not paused:
   `X-Lean-Pool-Door: screened`, takes a sender's loop-guard header away, and uses `screened_cache`
   for everything it passes.
 * `backend screened_cache`: the cache server alone, `track cache/cache` (the cache's own health
-  check, no second one), `maxconn` W, and **no backup**: while the cache is down this door answers
+  check, no second one), `maxconn` W, `timeout http-request 5s` for a request's body (the
+  defaults give 10s), and **no backup**: while the cache is down this door answers
   503, where the front door goes round the cache.
 * `frontend lean_pool` takes `X-Lean-Pool-Door` away from every request, so only this door can
   tell the cache that a check came in by it.

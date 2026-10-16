@@ -20,7 +20,8 @@ cases.
   the cache does not cap the pool's own concurrency (150 checks in flight at once);
 * the [screen](cache.md#the-screened-key): each rule with checks it refuses and the nearest
   ones it lets through (a refused word inside a longer name, an attribute the list allows, an
-  import of one of Mathlib's modules); through the cache, that a request with one refused
+  import of one of Mathlib's modules), and an `import` it cannot read (a comment straight after
+  the word) refused; through the cache, that a request with one refused
   snippet is answered 422 whole and reaches and stores nothing, that one which passes is
   answered like any other and reaches Lean with the pool's own key, sharing the stored answer
   of the same check sent with that key, that `/status` takes the pool's key alone, that each
@@ -34,7 +35,8 @@ cases.
   never waits on a screened flight, while a screened check joins one of the pool's;
 * the screened door's configuration: absent, the file is the one rendered before it existed;
   present, its one backend is the cache with no backup, it refuses all but checks, counts its
-  queue, keeps a share of the proxy's connections of its own, marks what it passes and takes the
+  queue, caps its own connections (`maxconn`), speaks HTTP/1.1 alone (`alpn http/1.1 proto h1`),
+  gives a body 5 seconds in its backend, marks what it passes and takes the
   loop guard away, the front door takes its mark away,
   and its health and numbers are the front door's; refused without TLS and on a port the pool
   already uses, and no agent tunnel takes its port;
@@ -124,10 +126,14 @@ cases.
   the key in that file and the copy and nowhere else on the machine, kept through a re-run,
   renewed with only the cache made again, renewed while closed with no container made, a renewal
   the cache was not made again with reported as a failure, closed and opened again, a copy's
-  directory refused while it is closed) and the copy written through no link planted in its
+  directory refused while it is closed; a copy refused under any directory of its path that
+  anyone but root and its owner can write, sticky or not, a directory another made under a sticky
+  one included) and the copy written through no link planted in its
   directory or above it, with no file left behind when it cannot be moved into place, and no
   module imported from the directory the control script was started in; the worker sandbox's
-  probe with each of its outcomes, and a server whose check fails with one protection taken away at a time; every refusal before root
+  probe with each of its outcomes, and a server whose check fails with one protection taken away at a time; a
+  firewall rule for every kind of rule of a pool with a 16-character name whose chain iptables
+  takes (28 characters at most), while a rule whose chain already fit keeps it; every refusal before root
   is asked for; an instance whose
   image is pulled by name instead of built; and a box set up by the installers of an older
   version, made by those installers themselves, moved to the compose files of `deploy/` with
@@ -212,7 +218,12 @@ processes on the generated configurations, with throwaway certificates made by `
   mark forged at the front door; `/health` there is the front door's and other paths are 404;
   with the cache stopped it answers 503 while the front door goes round the cache; with as many
   requests in flight as the pool has workers and as many waiting, the next is answered 503, and
-  every one of the others is then answered.
+  every one of the others is then answered; it speaks HTTP/1.1 alone: ALPN offering h2 gets
+  http/1.1, and HTTP/2's preface sent with no ALPN gets no HTTP/2 frame back (without
+  `proto h1`, HAProxy 3.0 answers it with HTTP/2's SETTINGS, and the test fails); a body stated
+  past one buffer is answered 413 on its headers alone, a chunked one 411; and a body stated
+  and withheld is answered 408 between 4 and 8 seconds after the headers (10 without the
+  backend's own timeout, and the test fails).
 
 The metrics paths (`tests/test_metrics_live.py`), on a real HAProxy in front of the real cache:
 

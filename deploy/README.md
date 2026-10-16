@@ -103,6 +103,7 @@ open, every run writes `LEANPOOL_SCREENED_DOOR_ADDRESS` (the docker0 bridge's), 
 | `LEANPOOL_JOIN_PUBLIC_HOST` | `pool.env` | The host name a new box is told to fetch its join script from. |
 | `LEANPOOL_JOIN_PUBLIC_PORT` | `pool.env` | The port the join service is published on while a window is open. |
 | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | `pool.env` | The renderer's own setting: the installer's version, which the pool's `GET /health` carries. |
-| `LEANPOOL_SCREENED_DOOR` | `pool.env` | `on` while the [screened door](../docs/cache.md#the-screened-door) is open (`--screened-door`), `off` once closed. |
+| `LEANPOOL_SCREENED_DOOR` | `pool.env` | `on` while the [screened door](../docs/cache.md#the-screened-door) is open (`--screened-door`), else `off`: closed, or never opened. |
 | `LEANPOOL_SCREENED_KEY_COPY` | `pool.env` | The directory the screened key's copy is written to (`--screened-key-copy`; empty after `--no-screened-key-copy`). |
 | `LEANPOOL_POOL_KEY_COPY` | `pool.env` | The directory the pool's own key's copy is written to (`--pool-key-copy`; empty after `--no-pool-key-copy`). |
+| `LEANPOOL_KEY_COPY_WALK_ROOT` | root's own environment | Not a setting of a pool: where `lean-pool-ctl` walks a key's copy's path from, `/` unless set. A seam for the tests and for packaging into a staging root, read by the copy's writer alone, which holds every directory from it down to the same rule ([its copy](../docs/cache.md#the-screened-door)). |

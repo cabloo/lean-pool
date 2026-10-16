@@ -65,7 +65,8 @@ A week of running the pool on boxes that also do other work.
   import another library's modules beside Mathlib and Aesop: `FormalConjectures`, say.
 - **The screened door** ([docs](docs/cache.md#the-screened-door)): the second key's one way in, a
   second HTTPS port of the proxy (`--screened-door-port`) that leads to the cache alone, with no
-  backup, and marks what it passes (`X-Lean-Pool-Door`). It speaks HTTP/1.1 alone, and refuses on
+  backup, and marks what it passes (`X-Lean-Pool-Door`). It speaks HTTP/1.1 alone (no upgrade to
+  HTTP/2 on its preface), gives a request's headers 5 seconds and its body 5 more, and refuses on
   its headers a body of no stated length (411) or longer than one buffer (413), so its senders
   cannot use up the proxy's memory. `install.sh --proxy NAME --screened-door`
   opens it on port 18120 of the docker0 bridge's address, firewalled to the docker bridges (a
@@ -77,10 +78,11 @@ A week of running the pool on boxes that also do other work.
   `install.sh --proxy NAME --pool-key-copy DIR` writes the pool's key and the authority's
   certificate into DIR at every run, as the screened key's copy is written, for a program on the
   host that hands it to boxes of its own; never into the screened key's copy's directory, nor
-  one inside or around it, nor one that holds the screened key, nor a pool's own directory.
-  `lean-pool-ctl NAME pool-key copy` writes it again; `--no-pool-key-copy` and
-  `--no-screened-key-copy` stop a copy. Either copy is written only where no directory of its
-  path can be written by anyone but root and the copy's owner.
+  one inside or around it, nor one whose `api-key` is the screened key, nor a pool's own
+  directory. `lean-pool-ctl NAME pool-key copy` writes it again; `--no-pool-key-copy` and
+  `--no-screened-key-copy` stop a copy. Either copy is written only where every directory of its
+  path, from `/` down, is root's or the copy's owner's and writable by nobody else, sticky or not
+  (so never under `/tmp`).
 - **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
   its pool and its joining boxes with, now in this repository, with their tests
   (`tests/install/`, on a fake machine). A deployment's own values live in a site directory
