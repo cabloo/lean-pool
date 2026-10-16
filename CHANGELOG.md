@@ -89,6 +89,17 @@ A week of running the pool on boxes that also do other work.
   In the deployment it was written for: 8 to 10 times faster on four machines, and no
   verdict changed ([docs/compiled-search.md](docs/compiled-search.md)).
 
+### Fixed
+
+- **An install on a busy box.** At the lowest CPU weight, a Lean server just made on a box whose
+  CPUs other work keeps busy got almost no CPU, and its first check ran past its time limit: the
+  install failed, a move to Compose's names was put back, and the worker sandbox and the read-only
+  root were taken away for nothing. The installers now run their own checks, and a joining box
+  the pool's admission test, at the box's ordinary CPU weight. They put the lowest back after,
+  whether they succeed, fail or are stopped; an installer killed outright leaves the ordinary
+  weight until the next install on the box
+  ([a box that also does other work](docs/deployment.md#a-box-that-also-does-other-work)).
+
 ## 0.1.0 - 2026-10-05
 
 The first public release. lean-pool was developed inside a private repository and had been

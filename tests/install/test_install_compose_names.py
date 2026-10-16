@@ -477,6 +477,27 @@ def test_a_joined_box_refreshed_as_its_join_command_does_is_moved(
     assert "compose.tls.yaml" in settings(box.machine, f"{INSTANCE}/kimina.env")["COMPOSE_FILE"]
 
 
+def test_a_joined_box_busy_with_other_work_is_moved_by_its_refresh_and_keeps_its_protections(
+    older: Machine, today: Path, tmp_path: Path
+) -> None:
+    """The same refresh on a box whose CPUs other work keeps busy (STUB_BOX_BUSY): at the lowest weight the moved
+    server's first check runs past its time limit, and the move would be put back. The move's check and the
+    install's run at the box's ordinary weight (pool-lib.sh, lift_cpu_priority); the lowest comes back after."""
+    box = moved_copy(older, today, tmp_path)
+    box.machine.deploy = older.deploy
+    run(box.machine, "--proxy", "demo", "--uninstall", "--purge")
+    box.machine.deploy = today
+    result = run(box.machine, "--instance", "demo", "--no-door", "--keep-image", STUB_BOX_BUSY="1")
+    assert "MOVED TO COMPOSE'S NAMES" in result.stdout and "INSTALLED AND VERIFIED" in result.stdout
+    assert not (box.machine.stub / "starved-checks").exists()
+    said = settings(box.machine, f"{INSTANCE}/kimina.env")
+    assert said["LEAN_SERVER_CGROUP_PARENT"] == "leanpool-demo.slice"
+    assert said["LEAN_SERVER_ROOT_READ_ONLY"] == "true"
+    for off in ("READ-ONLY ROOT: OFF", "WORKER SANDBOX: OFF"):
+        assert off not in result.stdout + result.stderr
+    assert box.machine.path("/sys/fs/cgroup/leanpool.slice/cpu.weight").read_text().strip() == "1"
+
+
 # --- a move that fails --------------------------------------------------------------------------------------------
 
 

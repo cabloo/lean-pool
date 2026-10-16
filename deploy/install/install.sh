@@ -186,6 +186,8 @@ die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 [ -f "$SRC/pool-lib.sh" ] || die "missing $SRC/pool-lib.sh - run this from the repo checkout"
 # shellcheck source=pool-lib.sh
 . "$SRC/pool-lib.sh"
+# The lowest CPU weight comes back on every way out, after a lift for this installer's own checks (pool-lib.sh).
+trap restore_cpu_priority EXIT
 
 # ----------------------------------------------------------------------------------------------- site
 # The site's values (load_site, pool-lib.sh): --site DIR, else the site/ a join bundle carries beside this file.
@@ -737,6 +739,8 @@ if [ "$AGENT" -eq 1 ]; then
 elif [ -n "$INSTANCE" ]; then
   set_overlay "$DIR/kimina.env" compose.agent.yaml off
 fi
+# From here until the checks below are done, the box's ordinary CPU weight: other work cannot starve them.
+lift_cpu_priority
 if [ "$TLS" -eq 1 ]; then
   # The front publishes the Lean port and the usage port; the server and the agent run behind it, unpublished.
   install_tls_front "$DIR" "$INSTANCE" "$SERVER_NAME" "$TLS_SOURCE" "$POOL_LEAN_TIMEOUT" "$POOL_SERVER_WAIT" "$agent_subnet"
@@ -825,6 +829,7 @@ else
   # shellcheck disable=SC2086
   /usr/local/bin/kimina-ctl $CTL_PREFIX check || verdict="INSTALLED, BUT THE CHECK FAILED - see the output above and: sudo kimina-ctl ${CTL_PREFIX}logs 200"
 fi
+restore_cpu_priority
 
 shown_url="http://$(hostname):$PORT"
 [ "$TLS" -eq 0 ] || shown_url="https://$(hostname):$PORT, mutual TLS as '$SERVER_NAME': only the pool's proxy is let in"

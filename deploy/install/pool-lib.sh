@@ -330,6 +330,16 @@ install_cpu_priority() {
     if cpu_priority_starts "$image" "$parent" && [ "$priority" = lowest ]; then
       weight=""
       [ ! -r "$LEAN_POOL_SLICE_WEIGHT" ] || weight=$(tr -d '[:space:]' < "$LEAN_POOL_SLICE_WEIGHT")
+      # Lifted for an installer's checks (lift_cpu_priority): by one that runs now, the unit's weight is still
+      # the lowest; by one that was killed outright, it is put back here.
+      if [ -n "$weight" ] && [ "$weight" != 1 ] && [ -e "$LEAN_POOL_LIFT_LOCK" ]; then
+        if lifted_now; then
+          weight=1
+        else
+          systemctl set-property --runtime leanpool.slice CPUWeight=1 >/dev/null 2>&1 || true
+          weight=$(tr -d '[:space:]' < "$LEAN_POOL_SLICE_WEIGHT")
+        fi
+      fi
       [ "$weight" = 1 ] \
         || CPU_PRIORITY_REFUSAL="the control group leanpool.slice does not carry the lowest CPU weight ($LEAN_POOL_SLICE_WEIGHT reads '${weight:-nothing}', not 1)"
     fi
@@ -366,9 +376,62 @@ EOF
 # remove_cpu_priority : the top-level group's unit goes with the box's last Lean server (uninstall).
 remove_cpu_priority() {
   [ -f "$LEAN_POOL_SLICE_UNIT" ] || return 0
+  systemctl revert leanpool.slice >/dev/null 2>&1 || true     # the weight set at runtime (lift_cpu_priority)
   rm -f "$LEAN_POOL_SLICE_UNIT"
   systemctl daemon-reload 2>/dev/null || true
   echo "removed $LEAN_POOL_SLICE_UNIT"
+}
+
+# --- an installer's own checks, at the box's ordinary CPU priority
+# At the lowest weight, a Lean server that was just made on a box busy with other work gets almost no CPU, and
+# its first check (a fresh worker's first `import Mathlib`) runs past the check's time limit: the box's load
+# would fail the install, put a move back, and switch a protection off for nothing. So from just before an
+# installer makes its Lean server until its checks are done (on a joining box, until the pool's admission test
+# is done), leanpool.slice runs at the box's ordinary weight (set with systemd at runtime: the unit is not
+# changed), and the lowest weight comes back after, on every way out the installer has (its EXIT trap). Other
+# work on the box shares the CPU with the Lean servers for as long as that takes (a joining box's admission
+# test can take up to an hour). Installers that run at once share the lift: each holds a shared lock on
+# LEAN_POOL_LIFT_LOCK while it is lifted, and the last one out puts the weight back. One killed outright leaves
+# the group lifted until the next install of a Lean server at the lowest priority here, whose
+# install_cpu_priority puts it back. Nothing here stops an install: where the lift cannot be made, the checks
+# run as before.
+LEAN_POOL_LIFT_LOCK=/run/lean-pool/cpu-priority.lock
+LEAN_POOL_ORDINARY_WEIGHT=100
+LIFT_FD=""
+
+# lift_cpu_priority : as above. Nothing on a box whose Lean servers do not run at the lowest weight.
+lift_cpu_priority() {
+  [ -z "$LIFT_FD" ] || return 0
+  [ -f "$LEAN_POOL_SLICE_UNIT" ] && [ -r "$LEAN_POOL_SLICE_WEIGHT" ] || return 0
+  install -d -m 0755 "${LEAN_POOL_LIFT_LOCK%/*}" 2>/dev/null || return 0
+  { exec {LIFT_FD}>>"$LEAN_POOL_LIFT_LOCK"; } 2>/dev/null || { LIFT_FD=""; return 0; }
+  flock -s "$LIFT_FD" || { exec {LIFT_FD}>&-; LIFT_FD=""; return 0; }
+  systemctl set-property --runtime leanpool.slice "CPUWeight=$LEAN_POOL_ORDINARY_WEIGHT" >/dev/null 2>&1 || true
+  [ "$(tr -d '[:space:]' < "$LEAN_POOL_SLICE_WEIGHT" 2>/dev/null || true)" != "$LEAN_POOL_ORDINARY_WEIGHT" ] \
+    || echo "CPU priority: the box's ordinary weight while this installer starts and checks its Lean server, so that other work on this box cannot starve the checks; the lowest again after"
+}
+
+# restore_cpu_priority : the lowest weight again, unless another installer here still has the group lifted. The
+# few seconds' wait lets a look at the lock pass (kimina-ctl status, another installer's lifted_now): each takes
+# it alone for an instant, and must not keep the last installer out from putting the lowest back.
+restore_cpu_priority() {
+  [ -n "$LIFT_FD" ] || return 0
+  if flock -x -w 5 "$LIFT_FD"; then
+    systemctl set-property --runtime leanpool.slice CPUWeight=1 >/dev/null 2>&1 || true
+    echo "CPU priority: the lowest again"
+  fi
+  exec {LIFT_FD}>&-
+  LIFT_FD=""
+}
+
+# lifted_now : whether an installer that runs now holds the group lifted (the lock says so).
+lifted_now() {
+  local fd code=0
+  [ -e "$LEAN_POOL_LIFT_LOCK" ] || return 1
+  { exec {fd}>>"$LEAN_POOL_LIFT_LOCK"; } 2>/dev/null || return 1
+  flock -x -n -E 75 "$fd" || code=$?
+  exec {fd}>&-
+  [ "$code" -eq 75 ]
 }
 
 # ------------------------------------------- linarith's search step as compiled code
@@ -1072,6 +1135,9 @@ install_tls_front() {
   # From here on containers change, and only those whose settings did: the server stops publishing its
   # port if it still did, the agent likewise, and the front takes both ports.
   before=$(docker inspect -f '{{.Id}}' "$front" 2>/dev/null || true)
+  # The server's checks that follow (the caller's) run at the box's ordinary CPU weight; the caller puts the
+  # lowest back. Here, after install_cpu_priority: a pool host's first install writes the group's unit above.
+  lift_cpu_priority
   compose_in "$env" up -d || die "could not start the Lean server, its usage agent and its TLS front (docker compose logs above)"
   reload_if_kept "$front" "$before"
   if ! container_is_steady "$front"; then
@@ -1625,7 +1691,10 @@ move_to_compose_names() {
   install -o root -g root -m 0755 "$SRC/kimina-ctl" /usr/local/bin/kimina-ctl
   [ "${#pools[@]}" -eq 0 ] || install -o root -g root -m 0755 "$SRC/lean-pool-ctl" /usr/local/sbin/lean-pool-ctl
   install_site_env
+  # Each move remakes a Lean server or a pool and checks it: at the box's ordinary CPU weight (lift_cpu_priority).
+  lift_cpu_priority
   for dir in ${instances[@]+"${instances[@]}"}; do move_instance "$dir"; done
   for dir in ${pools[@]+"${pools[@]}"}; do move_pool "$dir"; done
+  restore_cpu_priority
   echo "MOVED TO COMPOSE'S NAMES: what each move replaced is kept beside it, ending in .$MOVED"
 }

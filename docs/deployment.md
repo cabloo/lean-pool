@@ -315,6 +315,17 @@ states how many checks fit beside the box's other work, and the box is sent no m
 measure it. The installer starts every Lean server at the box's lowest CPU priority, so the box's
 other work gets a contended CPU first (`--cpu-priority normal` for a box whose first job is Lean).
 
+An installer's own checks are the exception. At the lowest weight, a Lean server just made on a
+busy box would get almost no CPU, and its first check (a new worker importing Mathlib) would run
+past its time limit. So from just before an installer makes a Lean server until its checks are
+done (on a joining box, until the pool's admission test is done), every Lean server of the box
+runs at the box's ordinary CPU weight, set with `systemctl set-property --runtime`. The lowest
+comes back after, whether the installer succeeds, fails or is stopped with Ctrl-C. For as long as
+that takes (an admission test can take up to an hour), the box's other work shares the CPU with
+the Lean servers, and `kimina-ctl status` says so. An installer killed outright (`kill -9`, a
+power cut) leaves the ordinary weight until the next install of a Lean server at the lowest
+priority on the box, which puts the lowest back. A reboot also ends it.
+
 ### Sizing
 
 * **A Lean server box** is sized by its workers. Each is a Lean process that holds Mathlib in

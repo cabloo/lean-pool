@@ -85,8 +85,12 @@ run the REAL scripts against a fake machine:
   root: `getent passwd` and `id -gn` answer for them and for nobody else, so the door's key line is written and
   removed under the fake root, never in a real home. `visudo -cf` checks that a sudoers file holds only
   `Defaults` and user rules. `systemctl start
-  NAME.slice` makes that control group under the fake root with the CPU weight its unit names, as systemd
-  does (not where STUB_SLICE_WITHOUT_WEIGHT is set: a box whose groups do not carry a weight).
+  NAME.slice` makes that control group under the fake root with the CPU weight its unit names, and `systemctl
+  set-property --runtime NAME CPUWeight=N` gives it N until it is set again or `systemctl revert NAME`, as
+  systemd does (neither where STUB_SLICE_WITHOUT_WEIGHT is set: a box whose groups do not carry a weight).
+* A box busy with other work (STUB_BOX_BUSY): a check sent to a Lean server under leanpool.slice while that group
+  has CPU weight 1 runs past its time limit and fails, as a real one starved of CPU does (each such check is
+  recorded in `$STUB/starved-checks`).
 * `ps` is the real one, unless a test gives the host a process table (STUB_ZOMBIES: that many zombies in the PID
   namespace of the container, beside its live processes and beside zombies that are not the container's).
 * `apt-get`, `dnf`, `yum` record their call and install nothing real; `curl` is the real one except for the
@@ -126,6 +130,7 @@ HOST_PREFIXES = (
     "/etc/sudoers.d/",
     "/etc/lean-pool/",
     "/run/systemd/",
+    "/run/lean-pool/",
     "/sys/fs/cgroup/",
 )
 # The scripts without a `.sh` that name host paths.
@@ -715,7 +720,27 @@ def image_layer_list(digest):
     return ["sha256:" + hashlib.sha256((digest + f"/layer{number}").encode()).hexdigest() for number in (1, 2)]
 
 
-def inside_pool(program=""):
+def starved(container=None):
+    """A box busy with other work (STUB_BOX_BUSY) leaves almost no CPU to a Lean server under leanpool.slice while
+    that group has the lowest weight: a check's first `import Mathlib` runs past its time limit. Asked of the
+    server a check goes to, or, through a pool, of any of this box's."""
+    if not os.environ.get("STUB_BOX_BUSY"):
+        return False
+    weight = Path(os.environ["FAKE_ROOT"], "sys/fs/cgroup/leanpool.slice/cpu.weight")
+    if not weight.exists() or weight.read_text().strip() != "1":
+        return False
+    holders = [STATE / f"cgroup-parent.{container}"] if container else list(STATE.glob("cgroup-parent.*"))
+    return any(holder.exists() and holder.read_text().startswith("leanpool-") for holder in holders)
+
+
+def inside_pool(program="", container=None):
+    if "/api/check" in program and starved(container):
+        note("starved-checks", container or "through the pool")
+        print(json.dumps({"check": "FAILED", "valid_proof_accepted": False, "invalid_proof_rejected": True,
+                          "seconds": {"valid": 300.0, "invalid": 300.0}}))
+        print(json.dumps({"results": [{"id": name, "error": "Lean REPL header command timed out in 300.0 seconds"}
+                                      for name in ("valid", "invalid")]}))
+        return 1
     code = int(os.environ.get("STUB_CHECK", "0"))
     slow_start = int(os.environ.get("STUB_CHECK_FAILS_FIRST", "0"))
     if slow_start and "/api/check" in program:               # a Lean server that needs a while before it answers
@@ -852,7 +877,7 @@ def main():
             # `kimina-ctl check` against a Lean server whose workers do not start in their sandbox.
             print('{"check": "FAILED", "reason": "the server answered 500: the REPL did not start"}')
             return 1
-        return inside_pool(program)
+        return inside_pool(program, argv[-3])
     if verb == "top":                                        # top CONTAINER -o pid,args eww
         name = argv[1]
         if argv[2:] != ["-o", "pid,args", "eww"]:
@@ -1178,15 +1203,35 @@ SHELL_STAND_INS = {
         "esac\n"
     ),
     # `start NAME.slice`: systemd makes that control group and gives it the CPU weight its unit names (100
-    # with no unit). STUB_SLICE_WITHOUT_WEIGHT is a box whose groups do not carry one.
-    "systemctl": (
-        '#!/usr/bin/env bash\nprintf \'systemctl %s\\n\' "$*" >> "$STUB/calls"\n'
-        'if [ "${1:-}" = start ] && [[ "${2:-}" == *.slice ]] && [ -z "${STUB_SLICE_WITHOUT_WEIGHT:-}" ]; then\n'
-        '  weight=$(sed -n "s/^CPUWeight=//p" "$FAKE_ROOT/etc/systemd/system/$2" 2>/dev/null | head -n 1)\n'
-        '  mkdir -p "$FAKE_ROOT/sys/fs/cgroup/$2"\n'
-        '  echo "${weight:-100}" > "$FAKE_ROOT/sys/fs/cgroup/$2/cpu.weight"\n'
-        "fi\n"
-    ),
+    # with no unit). `set-property --runtime NAME CPUWeight=N`: systemd keeps N under /run (a later start
+    # gives the group N, not its unit's) and gives it to the group if it is there. STUB_SLICE_WITHOUT_WEIGHT is
+    # a box whose groups do not carry one.
+    "systemctl": r"""#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "$STUB/calls"
+[ -z "${STUB_SLICE_WITHOUT_WEIGHT:-}" ] || exit 0
+runtime() { echo "$FAKE_ROOT/run/systemd/system.control/$1.d/50-CPUWeight.conf"; }
+case "${1:-}" in
+  start)
+    [[ "${2:-}" == *.slice ]] || exit 0
+    weight=$(cat "$(runtime "$2")" "$FAKE_ROOT/etc/systemd/system/$2" 2>/dev/null | sed -n 's/^CPUWeight=//p' | head -n 1)
+    mkdir -p "$FAKE_ROOT/sys/fs/cgroup/$2"
+    echo "${weight:-100}" > "$FAKE_ROOT/sys/fs/cgroup/$2/cpu.weight" ;;
+  set-property)
+    shift
+    [ "${1:-}" != --runtime ] || shift
+    unit=$1
+    shift
+    for property in "$@"; do
+      case "$property" in
+        CPUWeight=*)
+          mkdir -p "$(dirname "$(runtime "$unit")")"
+          printf '[Slice]\n%s\n' "$property" > "$(runtime "$unit")"
+          [ ! -d "$FAKE_ROOT/sys/fs/cgroup/$unit" ] || echo "${property#CPUWeight=}" > "$FAKE_ROOT/sys/fs/cgroup/$unit/cpu.weight" ;;
+      esac
+    done ;;
+  revert) rm -rf "$(dirname "$(runtime "${2:-}")")" ;;
+esac
+""",
     "df": "#!/usr/bin/env bash\nprintf 'Avail\\n%sG\\n' \"${STUB_DISK_FREE:-500}\"\n",
     # A check (-C) answers "no such rule", so the firewall script's delete loops end; the rest succeeds.
     "iptables": '#!/usr/bin/env bash\nprintf \'iptables %s\\n\' "$*" >> "$STUB/calls"\n[ "$1" != -C ]\n',

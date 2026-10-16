@@ -39,6 +39,8 @@ warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'install-pool.sh: %s\n' "$*" >&2; exit 1; }
 # shellcheck source=pool-lib.sh
 . "$SRC/pool-lib.sh"
+# The lowest CPU weight comes back on every way out, after a lift for this installer's own checks (pool-lib.sh).
+trap restore_cpu_priority EXIT
 
 POOL=${1:-}
 [ $# -gt 0 ] && shift
@@ -355,7 +357,8 @@ install -o root -g root -m 0755 "$SRC/join_helper.py" "$SITE_HELPER_DIR/join_hel
 
 # ------------------------------------------------------------------ this box's own server: a TLS front
 # The shared function a joining box uses too. It validates the front's config before it touches a
-# container; then the instance's project is brought up with the front, once.
+# container; then the instance's project is brought up with the front, once, at the box's ordinary CPU
+# weight until the checks below are done: other work cannot starve them (lift_cpu_priority, pool-lib.sh).
 if [ "$FIREWALL" -eq 1 ]; then install_tls_front "$INSTANCE_DIR" "$POOL" "$OWN_NAME" "$DIR/pki/box" "$LEAN_TIMEOUT" "$SERVER_WAIT" "$SUBNET"
 else install_tls_front "$INSTANCE_DIR" "$POOL" "$OWN_NAME" "$DIR/pki/box" "$LEAN_TIMEOUT" "$SERVER_WAIT" ""; fi
 
@@ -399,6 +402,7 @@ if [ "$(setting_in "$INSTANCE_DIR/kimina.env" LEAN_SERVER_ROOT_READ_ONLY)" = tru
     verdict="POOL INSTALLED, BUT THIS BOX'S OWN LEAN SERVER FAILED ITS CHECK - see: sudo kimina-ctl @$POOL logs 200"
   fi
 fi
+restore_cpu_priority
 /usr/local/sbin/lean-pool-ctl "$POOL" status || true
 
 cat <<EOF

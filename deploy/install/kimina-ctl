@@ -246,6 +246,15 @@ zombies_in() {
 # gives the top-level control group. One of `lowest`, `normal`, `lowest NOT available here`, and the two
 # states in between: a server installed before control groups, and one whose container is older than its
 # setting.
+# lifted_by_an_installer : an installer here holds leanpool.slice at the box's ordinary CPU weight while it checks
+# its Lean server (pool-lib.sh, lift_cpu_priority): its lock is held. A lock that cannot be read says nothing.
+lifted_by_an_installer() {
+  local code=0
+  [ -e /run/lean-pool/cpu-priority.lock ] || return 1
+  flock -x -n -E 75 /run/lean-pool/cpu-priority.lock true 2>/dev/null || code=$?
+  [ "$code" -eq 75 ]
+}
+
 cpu_priority_line() {
   local parent weight="" priority wanted
   parent=$(docker inspect -f '{{.HostConfig.CgroupParent}}' "$CONTAINER" 2>/dev/null)
@@ -256,6 +265,8 @@ cpu_priority_line() {
       [ ! -r /sys/fs/cgroup/leanpool.slice/cpu.weight ] || weight=$(tr -d '[:space:]' < /sys/fs/cgroup/leanpool.slice/cpu.weight)
       if [ "$weight" = 1 ]; then
         echo "--- cpu priority: lowest (control group $parent under leanpool.slice, CPU weight 1: other work on this box gets a contended CPU first)"
+      elif lifted_by_an_installer; then
+        echo "--- cpu priority: lowest, at the box's ordinary weight (${weight:-unreadable}) for now: an installer here is checking its Lean server, and the lowest comes back when it ends"
       else
         echo "--- cpu priority: lowest NOT available here (the container is in $parent, but leanpool.slice has CPU weight '${weight:-unreadable}', not 1: re-run the installer)"
       fi ;;

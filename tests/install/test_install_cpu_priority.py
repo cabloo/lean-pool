@@ -7,12 +7,14 @@ weight its unit names, that Docker starts the container under it, and that the k
 other work a contended CPU first.
 """
 
+import fcntl
 import os
 import shutil
 import subprocess
 
 import pytest
 from stand_ins import (
+    ADMIT_CASES,
     Machine,
     rewritten_installers,
     tools_run_from_source,
@@ -403,6 +405,172 @@ def test_another_word_for_the_priority_is_refused_before_anything_is_touched(tmp
     assert machine.calls == [] and not machine.path(INSTANCE).exists()
 
 
+# --- a box busy with other work -----------------------------------------------------------------------------------
+# At the lowest weight, a Lean server just made on a busy box gets almost no CPU, and its first check runs past
+# its time limit (STUB_BOX_BUSY). An installer runs its own checks at the box's ordinary weight and puts the
+# lowest back after, on every way out (pool-lib.sh, lift_cpu_priority).
+
+WEIGHT = "/sys/fs/cgroup/leanpool.slice/cpu.weight"
+LIFTED = "systemctl set-property --runtime leanpool.slice CPUWeight=100"
+LOWEST = "systemctl set-property --runtime leanpool.slice CPUWeight=1"
+LOCK = "/run/lean-pool/cpu-priority.lock"
+PROTECTIONS_OFF = ("READ-ONLY ROOT: OFF", "WORKER SANDBOX: OFF")
+
+
+def weight(machine: Machine) -> str:
+    return machine.path(WEIGHT).read_text().strip()
+
+
+def starved_checks(machine: Machine) -> list[str]:
+    said = machine.stub / "starved-checks"
+    return said.read_text().splitlines() if said.exists() else []
+
+
+def keeps_its_protections(machine: Machine, result: subprocess.CompletedProcess[str]) -> bool:
+    said = settings(machine)
+    return (
+        said["LEAN_SERVER_ROOT_READ_ONLY"] == "true"
+        and "compose.worker-sandbox.yaml" in said["COMPOSE_FILE"].split(":")
+        and not any(off in result.stdout + result.stderr for off in PROTECTIONS_OFF)
+    )
+
+
+def lifted_as_a_killed_installer_left_it(machine: Machine) -> None:
+    """What an installer killed outright while its checks ran leaves: the group at the ordinary weight (systemd
+    keeps a runtime property under /run until it is set again) and the lock file, which nobody holds."""
+    runtime = machine.path("/run/systemd/system.control/leanpool.slice.d/50-CPUWeight.conf")
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text("[Slice]\nCPUWeight=100\n")
+    machine.path(WEIGHT).write_text("100\n")
+    machine.path(LOCK).parent.mkdir(parents=True, exist_ok=True)
+    machine.path(LOCK).touch()
+
+
+def test_a_busy_box_installs_and_verifies_its_lean_server_with_its_protections_and_the_lowest_weight_after(
+    tmp_path, deploy
+):
+    machine = Machine(tmp_path / "host", deploy)
+    result = installed(machine, STUB_BOX_BUSY="1")
+    # Its checks ran at the box's ordinary weight, from before the server was made until they were done.
+    calls = machine.calls
+    lifted, lowest = calls.index(LIFTED), calls.index(LOWEST)
+    started = next(
+        index
+        for index, call in enumerate(calls)
+        if "--project-name lean-server-demo " in call and call.endswith(" up -d")
+    )
+    checked = [
+        index for index, call in enumerate(calls) if call == f"docker exec -i {LEAN} python -"
+    ]
+    assert checked and lifted < started < checked[0] and checked[-1] < lowest
+    assert starved_checks(machine) == []
+    # With both protections, which a starved check would have taken away, and the lowest weight again.
+    assert keeps_its_protections(machine, result)
+    assert weight(machine) == "1"
+    assert line_of(status(machine), "--- cpu priority:").startswith("--- cpu priority: lowest (")
+
+
+def test_an_install_that_stops_puts_the_lowest_weight_back(tmp_path, deploy):
+    machine = Machine(tmp_path / "host", deploy)
+    result = machine.bash(*INSTALL, STUB_UNHEALTHY=LEAN)
+    assert result.returncode == 1 and "did not become healthy in 5 minutes" in result.stderr
+    calls = machine.calls
+    assert calls.index(LIFTED) < calls.index(LOWEST) and weight(machine) == "1"
+
+
+def test_a_lift_that_a_killed_installer_left_is_said_and_the_next_install_puts_the_lowest_back(
+    tmp_path, deploy
+):
+    machine = Machine(tmp_path / "host", deploy)
+    installed(machine)
+    lifted_as_a_killed_installer_left_it(machine)
+    assert "lowest NOT available here" in line_of(status(machine), "--- cpu priority:")
+    result = installed(machine)
+    assert "is NOT available on this box" not in result.stderr
+    assert (
+        weight(machine) == "1"
+        and settings(machine)["LEAN_SERVER_CGROUP_PARENT"] == "leanpool-demo.slice"
+    )
+    assert line_of(status(machine), "--- cpu priority:").startswith("--- cpu priority: lowest (")
+
+
+def test_an_install_beside_one_that_is_checking_leaves_the_group_lifted_until_that_one_ends(
+    tmp_path, deploy
+):
+    machine = Machine(tmp_path / "host", deploy)
+    installed(machine)
+    lifted_as_a_killed_installer_left_it(machine)
+    with open(machine.path(LOCK)) as lock:  # another installer here, still checking its Lean server
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        assert line_of(status(machine), "--- cpu priority:").startswith(
+            "--- cpu priority: lowest, at the box's ordinary weight (100) for now"
+        )
+        mark = machine.mark()
+        result = installed(machine, STUB_BOX_BUSY="1")
+        # The other's lift is not a group without a weight: the lowest stays this server's priority.
+        assert "is NOT available on this box" not in result.stderr
+        assert settings(machine)["LEAN_SERVER_CGROUP_PARENT"] == "leanpool-demo.slice"
+        assert keeps_its_protections(machine, result) and starved_checks(machine) == []
+        # Its checks ran lifted, and it leaves the group lifted for the other one, which puts the lowest back.
+        assert LIFTED in machine.calls_since(mark) and LOWEST not in machine.calls_since(mark)
+        assert weight(machine) == "100"
+
+
+def test_a_check_sent_by_hand_on_a_busy_box_is_starved_at_the_lowest_weight(tmp_path, deploy):
+    """What the tests above stand on: the fake machine starves a check of a server at the lowest weight, through
+    the same `kimina-ctl check` the installers send. A check sent by hand is not lifted."""
+    machine = Machine(tmp_path / "host", deploy)
+    installed(machine)
+    result = machine.bash(
+        machine.path("/usr/local/bin/kimina-ctl"), "@demo", "check", STUB_BOX_BUSY="1"
+    )
+    assert result.returncode == 1
+    assert "Lean REPL header command timed out in 300.0 seconds" in result.stdout
+    assert starved_checks(machine) == [LEAN] and weight(machine) == "1"
+
+
+def as_before_cpu_priority(machine: Machine) -> None:
+    """The box as an installer older than the control group left it: no unit, no group, none in the settings."""
+    machine.path(UNIT).unlink()
+    for group in ("/run/systemd/system.control/leanpool.slice.d", "/sys/fs/cgroup/leanpool.slice"):
+        shutil.rmtree(machine.path(group))
+    env = machine.path(f"{INSTANCE}/kimina.env")
+    kept = [
+        line
+        for line in env.read_text().splitlines()
+        if not line.startswith(
+            (
+                "LEAN_SERVER_CPU_PRIORITY=",
+                "LEAN_SERVER_CGROUP_PARENT=",
+                "LEANPOOL_AGENT_LEAN_CPU_STAT_PATH=",
+            )
+        )
+    ]
+    env.write_text("".join(line + "\n" for line in kept))
+
+
+@pytest.mark.parametrize(
+    "older", [False, True], ids=["after-its-instance", "unit-written-by-the-pool"]
+)
+def test_a_busy_pool_host_installs_and_verifies_its_pool_and_its_own_lean_server(
+    tmp_path, deploy, older
+):
+    """Also where the pool's own install is the first to give its server the control group (an instance an
+    older installer set up): the unit is written inside the TLS front's install, and the lift comes after it."""
+    machine = Machine(tmp_path / "host", deploy)
+    installed(machine)
+    if older:
+        as_before_cpu_priority(machine)
+    result = machine.bash(
+        "install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES, STUB_BOX_BUSY="1"
+    )
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    assert "POOL INSTALLED AND VERIFIED" in result.stdout
+    assert starved_checks(machine) == []
+    assert keeps_its_protections(machine, result)
+    assert machine.control_group(LEAN) == "leanpool-demo.slice" and weight(machine) == "1"
+
+
 # --- instance 1, and leaving --------------------------------------------------------------------------------------
 
 
@@ -424,6 +592,9 @@ def test_the_unit_goes_with_the_boxs_last_lean_server(tmp_path, deploy):
         machine.bash("install.sh", "--instance", "demo", "--uninstall", "--purge").returncode == 0
     )
     assert machine.path(UNIT).exists()  # instance 1 still runs under it
-    # Like the door: it goes when no other instance is left on the box (a kept settings file is one).
+    # Like the door: it goes when no other instance is left on the box (a kept settings file is one), and with
+    # it the weight the installers' checks set at runtime.
+    runtime = machine.path("/run/systemd/system.control/leanpool.slice.d")
+    assert runtime.exists()
     assert machine.bash("install.sh", "--uninstall").returncode == 0
-    assert not machine.path(UNIT).exists()
+    assert not machine.path(UNIT).exists() and not runtime.exists()

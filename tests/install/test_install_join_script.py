@@ -249,10 +249,10 @@ SMALL = {
 }
 
 
-def bundle() -> str:
-    """A join bundle with the REAL pool-lib.sh and join_helper.py, a stand-in installer, the site's values (as
-    pack_join_bundle puts them in site/) and just enough of the lean-pool project for build_lean_pool_image to
-    read its version."""
+def bundle(pool_lib: str | None = None) -> str:
+    """A join bundle with the REAL pool-lib.sh (or POOL_LIB, its text with host paths moved) and join_helper.py,
+    a stand-in installer, the site's values (as pack_join_bundle puts them in site/) and just enough of the
+    lean-pool project for build_lean_pool_image to read its version."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
 
@@ -263,7 +263,10 @@ def bundle() -> str:
             archive.addfile(member, io.BytesIO(data))
 
         add("install.sh", INSTALLER, 0o755)
-        add("pool-lib.sh", (INSTALLERS / "pool-lib.sh").read_text())
+        add(
+            "pool-lib.sh",
+            (INSTALLERS / "pool-lib.sh").read_text() if pool_lib is None else pool_lib,
+        )
         add("join_helper.py", (INSTALLERS / "join_helper.py").read_text())
         add("site/site.env", (SITE / "site.env").read_text())
         add("site/instances/demo.env", (SITE / "instances" / "demo.env").read_text())
@@ -272,7 +275,7 @@ def bundle() -> str:
     return base64.encodebytes(buffer.getvalue()).decode()
 
 
-def join_script() -> str:
+def join_script(pool_lib: str | None = None) -> str:
     settings = helper.ScriptSettings(
         url_base="https://workstation.lan:18110",
         token=TOKEN,
@@ -281,7 +284,9 @@ def join_script() -> str:
         lean_timeout="300",
         server_wait="120",
     )
-    return str(helper.join_script(settings, (INSTALLERS / "join-box.sh").read_text(), bundle()))
+    return str(
+        helper.join_script(settings, (INSTALLERS / "join-box.sh").read_text(), bundle(pool_lib))
+    )
 
 
 class Box:
@@ -660,6 +665,62 @@ def test_a_server_that_is_not_admitted_says_what_the_pool_found_and_how_to_remov
     )
     assert "--uninstall --purge" in result.stderr and "JOINED" not in result.stdout
     assert not box.work.exists()
+
+
+# --- the pool's test of the new server, at the box's ordinary CPU weight ------------------------------------------
+
+# Records each call with how many requests the pool had been sent by then; a runtime CPU weight goes to the
+# group's file, as systemd gives it to the group.
+SYSTEMCTL = r"""#!/usr/bin/env bash
+printf 'systemctl %s after %s requests\n' "$*" "$(wc -l < "$STUB/urls")" >> "$STUB/weights"
+[ "${1:-}" = set-property ] && [ "${4:-}" != "${4#CPUWeight=}" ] || exit 0
+echo "${4#CPUWeight=}" > "$STUB/root/sys/fs/cgroup/leanpool.slice/cpu.weight"
+"""
+
+
+def at_the_lowest_weight(box: Box) -> str:
+    """A box whose Lean servers run under leanpool.slice at CPU weight 1, and the join script whose pool-lib.sh
+    finds that group (and keeps its lock) under the stand-ins' root."""
+    root = box.stub / "root"
+    (root / "etc/systemd/system").mkdir(parents=True)
+    (root / "etc/systemd/system/leanpool.slice").write_text("[Slice]\nCPUWeight=1\n")
+    (root / "sys/fs/cgroup/leanpool.slice").mkdir(parents=True)
+    (root / "sys/fs/cgroup/leanpool.slice/cpu.weight").write_text("1\n")
+    systemctl = box.stub / "bin" / "systemctl"
+    systemctl.write_text(SYSTEMCTL)
+    systemctl.chmod(0o755)
+    pool_lib = (INSTALLERS / "pool-lib.sh").read_text()
+    for prefix in ("/etc/systemd/", "/sys/fs/cgroup/", "/run/lean-pool/"):
+        pool_lib = pool_lib.replace(prefix, f"{root}{prefix}")
+    return join_script(pool_lib)
+
+
+def weight_now(box: Box) -> str:
+    return (box.stub / "root/sys/fs/cgroup/leanpool.slice/cpu.weight").read_text().strip()
+
+
+def test_the_pools_test_of_the_new_server_runs_at_the_boxs_ordinary_cpu_weight(box):
+    """The installer runs its own checks at the box's ordinary weight (its tests show it). The pool's admission
+    test comes after it, in step 9, and a server starved of CPU by other work on the box would fail it the same
+    way: it runs lifted too, and the lowest comes back once the verdict is in."""
+    result = box.run("--workers", "3", script=at_the_lowest_weight(box))
+    assert result.returncode == 0, box.output
+    assert box.read("weights").splitlines() == [
+        f"systemctl set-property --runtime leanpool.slice CPUWeight=100 after {box.asked.index('/ready')} requests",
+        f"systemctl set-property --runtime leanpool.slice CPUWeight=1 after {len(box.asked)} requests",
+    ]
+    assert weight_now(box) == "1"
+
+
+def test_a_join_that_stops_in_its_ninth_step_puts_the_lowest_weight_back(box):
+    result = box.run("--workers", "3", script=at_the_lowest_weight(box), STUB_READY_CODE="410")
+    assert result.returncode == 1 and "step 9 failed: the pool answered 410" in result.stderr
+    assert (
+        box.read("weights")
+        .splitlines()[-1]
+        .startswith("systemctl set-property --runtime leanpool.slice CPUWeight=1 ")
+    )
+    assert weight_now(box) == "1"
 
 
 def test_a_window_that_closed_while_the_box_was_building_is_said_plainly(box):

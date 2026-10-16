@@ -52,6 +52,8 @@ IMAGE_FILE=""             # the pool's image while it is being downloaded and lo
 cleanup() {
   [ -z "$IMAGE_FILE" ] || rm -f "$IMAGE_FILE"
   [ -z "$WORK" ] || rm -rf "$WORK"
+  # The lowest CPU weight again, if the admission test below was running at the box's ordinary one.
+  if declare -F restore_cpu_priority >/dev/null; then restore_cpu_priority; fi
 }
 
 # What the pool's host serves is not what its manifest says: stop, with nothing loaded or
@@ -409,6 +411,8 @@ main() {
 
   # ------------------------------------------------------------------------------- 9. ready, admission
   say "9/10 Telling the pool this server is ready; the pool now tests it alone (admission)"
+  # The pool's test, like the installer's own checks, at the box's ordinary CPU weight (pool-lib.sh).
+  lift_cpu_priority
   code=$(join_curl /ready -o "$WORK/reply.json" -X POST --data-binary '') \
     || die "step 9 failed: the pool did not answer (did its join window close?). The pool is unchanged; open a new window there and run the new command here."
   [ "$code" = 202 ] || die "step 9 failed: the pool answered $code: $(helper reason --reply /work/reply.json). The pool is unchanged."
@@ -423,6 +427,7 @@ main() {
     esac
   done
   [ "$decided" -eq 1 ] || die "step 9 failed: no verdict within an hour. On the pool's host: sudo lean-pool-ctl $JOIN_POOL status"
+  restore_cpu_priority
 
   # ------------------------------------------------------------------------------------ 10. verdict
   say "10/10 The pool's verdict"
