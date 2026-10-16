@@ -8,7 +8,9 @@
 | [`lean-server/compose.agent.yaml`](lean-server/compose.agent.yaml) | Added after it on a box in a pool: the usage agent. |
 | [`lean-server/compose.tls.yaml`](lean-server/compose.tls.yaml) | Added after both for TLS: a front on both ports, which then publishes them instead. |
 | [`lean-server/compiled-search/`](lean-server/compiled-search) | Makes and checks linarith's search step as compiled code on the box (`make.sh`). |
-| [`lean-server/compose.compiled-search.yaml`](lean-server/compose.compiled-search.yaml) | Added last while that step is on: the workers start through it. |
+| [`lean-server/compose.compiled-search.yaml`](lean-server/compose.compiled-search.yaml) | Added after the others while that step is on: the workers start through it. |
+| [`lean-server/worker-sandbox/`](lean-server/worker-sandbox) | Asks the box's image whether each worker can have a sandbox of its own, and puts it in place (`make.sh`). |
+| [`lean-server/compose.worker-sandbox.yaml`](lean-server/compose.worker-sandbox.yaml) | Added last while the sandbox is on: every worker starts in it. |
 | [`lean-server/read-only-check.sh`](lean-server/read-only-check.sh) | Says whether a running server would keep working with its root filesystem read-only. |
 | [`pool/compose.yaml`](pool/compose.yaml) | The pool box: HAProxy and the cache. |
 | [`pool/compose.tls.yaml`](pool/compose.tls.yaml) | Added after it for TLS: the proxy's certificates. |
@@ -81,6 +83,8 @@ proxy's rendered configuration needs (from the Lean timeout and the servers' wai
 | `LEAN_SERVER_CPU_PRIORITY` | `kimina.env` | Whether the server runs at the box's lowest CPU priority. |
 | `LEAN_SERVER_READ_ONLY` | `kimina.env` | `off` keeps the root filesystem writable whatever the check says. |
 | `LEAN_SERVER_COMPILED_SEARCH` | `kimina.env` | `off` keeps the compiled search step off. |
+| `LEAN_SERVER_WORKER_SANDBOX` | `kimina.env` | `off` keeps the worker sandbox off. |
+| `LEANPOOL_WORKER_SANDBOX` | each worker's environment | Not a setting: the worker sandbox puts it (`landlock-N`) into every worker it starts, and `kimina-ctl status` reads it back. |
 | `LEAN_SERVER_NAME` | `kimina.env` | The box's name in its pool, and in its certificate. |
 | `LEANPOOL_HAPROXY_LEAN_TIMEOUT_SECONDS` | both | The renderer's own setting: the slowest check, for the front and the proxy. |
 | `LEANPOOL_HAPROXY_SERVER_WAIT_SECONDS` | both | The renderer's own setting: the servers' `LEAN_SERVER_MAX_WAIT`. |

@@ -43,6 +43,12 @@ A week of running the pool on boxes that also do other work.
 
 ### Added
 
+- **The worker sandbox** ([docs](docs/worker-sandbox.md)): every Lean worker in a Landlock domain
+  of its own (`deploy/lean-server/worker-sandbox/`, `compose.worker-sandbox.yaml`). The code a
+  check runs can no longer reach another worker's pipes, memory or environment, or Kimina's;
+  write anywhere but `/tmp`; open TCP (Landlock 4); or signal another worker (Landlock 6). Each
+  worker starts without the server's key. `make.sh` asks a container of the box's own image
+  whether the sandbox can be made there, and a worker that cannot be sandboxed does not start.
 - **A second, screened key for the cache** (`--screened-api-key-file`): for senders trusted less
   than the pool's own. Their checks must first pass [the screen](docs/cache.md#the-screened-key)
   (`leanpool/screen.py`: no `#eval`, `run_tac`, `elab`, `IO`, most attributes or imports beyond

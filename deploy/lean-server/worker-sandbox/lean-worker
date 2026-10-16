@@ -1,0 +1,21 @@
+#!/bin/sh
+# lean-worker - what Kimina starts each worker as, with the worker sandbox (docs/worker-sandbox.md).
+# make.sh installs it in ../sandbox; compose.worker-sandbox.yaml names it.
+#
+# It starts the program the worker would have been without the sandbox, inside it (sandbox.py):
+# the compiled search step's launcher where that overlay is on (/opt/lean-native/repl-native can
+# be started), else the image's own REPL, whose path make.sh read from the image (`repl-path`
+# beside this file). With the image's own Python, isolated from the environment and its site.
+here=$(dirname "$0")
+program=${LEAN_SANDBOX_NATIVE_LAUNCHER:-/opt/lean-native/repl-native}
+if [ ! -x "$program" ]; then
+  program=""
+  if [ -r "$here/repl-path" ]; then
+    IFS= read -r program < "$here/repl-path"
+  fi
+fi
+if [ -z "$program" ]; then
+  echo "lean-worker: no REPL to start: $here/repl-path is missing (run worker-sandbox/make.sh)" >&2
+  exit 127
+fi
+exec python3 -I -S -B "$here/sandbox.py" -- "$program" "$@"

@@ -114,13 +114,15 @@ jobs:
           docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml config --quiet
           cd ../lean-server
           export LEAN_SERVER_API_KEY=ci LEAN_SERVER_MAX_REPLS=2
-          mkdir -p native
+          mkdir -p native sandbox
           for files in "compose.yaml" \
                        "compose.yaml compose.agent.yaml" \
                        "compose.yaml compose.agent.yaml compose.tls.yaml" \
                        "compose.yaml compose.compiled-search.yaml" \
                        "compose.yaml compose.agent.yaml compose.compiled-search.yaml" \
-                       "compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml"; do
+                       "compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml" \
+                       "compose.yaml compose.worker-sandbox.yaml" \
+                       "compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml compose.worker-sandbox.yaml"; do
             docker compose $(printf -- '-f %s ' $files) config --quiet
           done
       - name: Docker merges the overlays as the tests' model of Compose does

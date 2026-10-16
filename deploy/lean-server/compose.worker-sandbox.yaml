@@ -1,0 +1,26 @@
+# Each worker in a sandbox of its own (docs/worker-sandbox.md): an overlay, added after compose.yaml and
+# every other overlay. Make it first, on this box, from the image this box runs:
+#
+#   worker-sandbox/make.sh
+#
+# then start the box with this file last:
+#
+#   docker compose -f compose.yaml -f compose.worker-sandbox.yaml up -d
+#
+# Kimina then starts each worker through the launcher make.sh put in ./sandbox, which puts the worker in a
+# Landlock domain of its own before it starts the REPL (or the compiled search step's launcher, where that
+# overlay is on). A worker that cannot be sandboxed does not start. Without this file the box runs exactly
+# as before.
+
+services:
+  kimina:
+    environment:
+      LEAN_SERVER_REPL_PATH: /opt/lean-sandbox/lean-worker
+    volumes:
+      # Read-only, and never created empty: without make.sh's directory the box does not start.
+      - type: bind
+        source: ./sandbox
+        target: /opt/lean-sandbox
+        read_only: true
+        bind:
+          create_host_path: false

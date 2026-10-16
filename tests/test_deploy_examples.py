@@ -33,6 +33,7 @@ COMPOSE_FILES = [
     LEAN_SERVER / "compose.agent.yaml",
     LEAN_SERVER / "compose.tls.yaml",
     LEAN_SERVER / "compose.compiled-search.yaml",
+    LEAN_SERVER / "compose.worker-sandbox.yaml",
     DEMO / "compose.yaml",
 ]
 # The settings a project cannot start without, as a reader's .env would give them.
@@ -51,6 +52,13 @@ LEAN_SERVER_PROJECTS = {
         "compose.agent.yaml",
         "compose.tls.yaml",
         "compose.compiled-search.yaml",
+    ],
+    "with every overlay": [
+        "compose.yaml",
+        "compose.agent.yaml",
+        "compose.tls.yaml",
+        "compose.compiled-search.yaml",
+        "compose.worker-sandbox.yaml",
     ],
 }
 POOL_PROJECTS = {
@@ -206,6 +214,33 @@ def test_the_compiled_step_changes_only_how_a_worker_starts() -> None:
         if key not in ("environment", "volumes")
     }
     assert rest == {key: value for key, value in without["kimina"].items() if key != "environment"}
+
+
+def test_the_sandbox_changes_only_how_a_worker_starts_and_comes_after_the_compiled_step() -> None:
+    without = services(LEAN_SERVER, LEAN_SERVER_PROJECTS["with TLS and the compiled step"])
+    with_it = services(LEAN_SERVER, LEAN_SERVER_PROJECTS["with every overlay"])
+
+    changed = {
+        key: value
+        for key, value in with_it["kimina"]["environment"].items()
+        if without["kimina"]["environment"].get(key) != value
+    }
+    # Kimina starts the sandbox's launcher, which starts the compiled step's launcher inside it.
+    assert changed == {"LEAN_SERVER_REPL_PATH": "/opt/lean-sandbox/lean-worker"}
+    targets = {mount["target"]: mount for mount in with_it["kimina"]["volumes"]}
+    assert set(targets) == {"/opt/lean-native", "/opt/lean-sandbox"}
+    assert targets["/opt/lean-sandbox"]["read_only"] is True
+    assert targets["/opt/lean-sandbox"]["bind"] == {"create_host_path": False}
+    rest = {
+        key: value
+        for key, value in with_it["kimina"].items()
+        if key not in ("environment", "volumes")
+    }
+    assert rest == {
+        key: value
+        for key, value in without["kimina"].items()
+        if key not in ("environment", "volumes")
+    }
 
 
 def test_the_tls_file_of_the_pool_only_adds_the_certificates() -> None:

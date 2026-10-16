@@ -4,6 +4,7 @@
 #   compose.agent.yaml            the lean-pool usage agent beside the server, for a box in a pool
 #   compose.tls.yaml              a TLS front on both ports; the server and the agent are then not published
 #   compose.compiled-search.yaml  linarith's search step as compiled code (docs/compiled-search.md)
+#   compose.worker-sandbox.yaml   every worker in a sandbox of its own, always last (docs/worker-sandbox.md)
 #
 # The installer copies them into the instance's directory and writes their list (COMPOSE_FILE), the project's
 # name (COMPOSE_PROJECT_NAME) and every setting into kimina.env there. deploy/README.md lists the settings.

@@ -11,6 +11,8 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 * [Admission](admission.md): testing a Lean server alone before it joins.
 * [Compiled search for linarith](compiled-search.md): an optional step on each Lean server
   box that makes Lean itself faster on the proofs that take it longest.
+* [The worker sandbox](worker-sandbox.md): an optional step on each Lean server box that puts
+  every worker in a sandbox of its own.
 * [Configuration reference](configuration.md): every flag and environment variable.
 
 **Using**
