@@ -36,6 +36,10 @@
 # once (screened-api-key beside the pool's key); with --screened-key-copy DIR it is also written, with the pool
 # authority's certificate, into DIR for the program that hands it out (lean-pool-ctl NAME screened-key).
 #
+# With --pool-key-copy DIR (kept once given) the pool's own key is written at every run, with the authority's
+# certificate, into DIR for a program on this host that hands it to boxes of its own (lean-pool-ctl NAME
+# pool-key copy). DIR may be neither the screened key's copy nor inside it, nor hold it.
+#
 # Apart from step 1b's one-time move, it never touches instance 1 (/srv/kimina, the instance with no name): not
 # its container, its settings, its compose files or its firewall rules.
 set -euo pipefail
@@ -66,6 +70,7 @@ PURGE=0
 FRONT_NAMES=()
 SCREENED_DOOR=""
 SCREENED_KEY_COPY=""
+POOL_KEY_COPY=""
 # The screened door's port, as the proxy and the host both see it.
 SCREENED_DOOR_PORT=18120
 while [ $# -gt 0 ]; do
@@ -80,13 +85,14 @@ while [ $# -gt 0 ]; do
     --screened-door) SCREENED_DOOR=on; shift ;;
     --no-screened-door) SCREENED_DOOR=off; shift ;;
     --screened-key-copy) SCREENED_KEY_COPY=$2; shift 2 ;;
+    --pool-key-copy) POOL_KEY_COPY=$2; shift 2 ;;
     --no-firewall) FIREWALL=0; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
-[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--screened-door [--screened-key-copy DIR] | --no-screened-door] [--no-firewall] [--uninstall [--purge]]"
+[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--screened-door [--screened-key-copy DIR] | --no-screened-door] [--pool-key-copy DIR] [--no-firewall] [--uninstall [--purge]]"
 # The site's values: --site DIR, else the site/ a join bundle carries beside this file.
 [ -n "$SITE" ] || [ ! -f "$SRC/site/site.env" ] || SITE=$SRC/site
 [ -n "$SITE" ] || die "--site DIR is needed: the directory of this site's values (site.env, instances/NAME.env)"
@@ -101,6 +107,8 @@ if [ -n "$SCREENED_KEY_COPY" ]; then
     || die "--screened-key-copy must be an absolute directory path (parts of letters, digits, '.', '_' and '-', none '.' or '..')"
   [ "$SCREENED_DOOR" != off ] || die "--screened-key-copy goes with the screened door, which --no-screened-door closes"
 fi
+[ -z "$POOL_KEY_COPY" ] || valid_copy_directory "$POOL_KEY_COPY" \
+  || die "--pool-key-copy must be an absolute directory path (parts of letters, digits, '.', '_' and '-', none '.' or '..')"
 [ "$(id -u)" -eq 0 ] || die "run with sudo: sudo bash install.sh --proxy $POOL"
 
 DIR=/srv/lean-pool-$POOL
@@ -186,6 +194,16 @@ if [ -z "$SCREENED_DOOR" ] && [ -f "$DIR/pool.env" ]; then SCREENED_DOOR=$(setti
 [ "$SCREENED_DOOR" = on ] || SCREENED_DOOR=off
 [ -z "$SCREENED_KEY_COPY" ] || [ "$SCREENED_DOOR" = on ] \
   || die "--screened-key-copy goes with the screened door, which pool $POOL has closed: add --screened-door"
+# The two copies, as this run gives them, else as the pool keeps them (a closed door keeps its copy's directory):
+# one directory, or one inside the other, would hand the pool's own key out with the screened one.
+screened_copy=$SCREENED_KEY_COPY
+pool_copy=$POOL_KEY_COPY
+if [ -f "$DIR/pool.env" ]; then
+  [ -n "$screened_copy" ] || screened_copy=$(setting_in "$DIR/pool.env" LEANPOOL_SCREENED_KEY_COPY)
+  [ -n "$pool_copy" ] || pool_copy=$(setting_in "$DIR/pool.env" LEANPOOL_POOL_KEY_COPY)
+fi
+copies_apart "$screened_copy" "$pool_copy" \
+  || die "the screened key's copy ($screened_copy) and the pool's key's copy ($pool_copy) are one directory, or one is inside the other: the pool's key would be handed out with the screened one. Nothing was installed"
 if [ "$SCREENED_DOOR" = on ]; then
   [ -n "$BRIDGE" ] || die "the screened door is published on the docker0 bridge's address alone, and this host's could not be read (docker network inspect bridge); nothing was installed"
   echo "screened door: on, at $BRIDGE:$SCREENED_DOOR_PORT (the docker bridges only)"
@@ -255,6 +273,8 @@ if [ "$SCREENED_DOOR" = on ]; then
 fi
 # Where the screened key's copy is written: kept once given, so a re-run without the option writes it there too.
 [ -z "$SCREENED_KEY_COPY" ] || set_env_in "$DIR/pool.env" LEANPOOL_SCREENED_KEY_COPY "$SCREENED_KEY_COPY"
+# And the pool's own key's copy: kept once given too.
+[ -z "$POOL_KEY_COPY" ] || set_env_in "$DIR/pool.env" LEANPOOL_POOL_KEY_COPY "$POOL_KEY_COPY"
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE "$LEAN_POOL_IMAGE"
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE_GID "$POOL_GID"
 set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_IMAGE "$HAPROXY_IMAGE"
@@ -444,6 +464,17 @@ if [ "$SCREENED_DOOR" = on ]; then
     SCREENED_SAID="$SCREENED_SAID; ITS KEY'S COPY WAS NOT WRITTEN to $copy"
   fi
 fi
+# The pool's own key's copy, where the pool names a directory for it: at every run, as the key itself is written.
+POOL_KEY_SAID=""
+copy=$(pool_setting LEANPOOL_POOL_KEY_COPY)
+if [ -n "$copy" ]; then
+  if /usr/local/sbin/lean-pool-ctl "$POOL" pool-key copy; then
+    POOL_KEY_SAID="the pool's key and the authority's certificate are copied to $copy"
+  else
+    warn "the pool's key's copy was not written to $copy: sudo lean-pool-ctl $POOL pool-key copy"
+    POOL_KEY_SAID="ITS COPY WAS NOT WRITTEN to $copy"
+  fi
+fi
 
 if [ "$FIREWALL" -eq 1 ]; then
   say "Firewall"
@@ -504,4 +535,6 @@ EOF
 [ -z "${WORKER_SANDBOX_SAID:-}" ] || echo "  sandbox     $WORKER_SANDBOX_SAID"
 # And the screened door, where it is open.
 [ -z "$SCREENED_SAID" ] || echo "  screened    $SCREENED_SAID"
+# And where the pool's own key's copy is, where it names one.
+[ -z "$POOL_KEY_SAID" ] || echo "  pool key    $POOL_KEY_SAID"
 [ "$verdict" = "POOL INSTALLED AND VERIFIED" ]

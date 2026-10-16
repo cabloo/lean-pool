@@ -16,7 +16,9 @@ only to clients you would let run code there.
 
 **One key for the whole pool.** Clients send it, the cache checks it in constant time before it
 answers anything from its store, and every Lean server checks it again. No command takes a key
-or a token as an argument, and none logs one.
+or a token as an argument, and none logs one. The installer writes it into a directory of your
+choosing only when asked (`--pool-key-copy`), for a program that hands it on: whoever can read
+that directory holds the key.
 
 **A second key, screened, for senders trusted less.** The cache can hold one more key. A check
 sent with it must first pass [the screen](docs/cache.md#the-screened-key), a list of what a proof

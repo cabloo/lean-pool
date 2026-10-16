@@ -31,6 +31,8 @@
 #                                                                old key is refused from then on
 #   lean-pool-ctl NAME screened-key copy                         the key and the authority's certificate written
 #                                                                again into the pool's copy directory
+#   lean-pool-ctl NAME pool-key copy                             the pool's own key and the authority's certificate
+#                                                                written again into the directory named for them
 #   lean-pool-ctl NAME cache-stop | cache-start                  the cache only: the front door's checks keep flowing,
 #                                                                uncached; the screened door answers 503
 #
@@ -75,6 +77,9 @@ valid_minutes()     { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le
 # The screened key's copy: an absolute path of letters, digits, '.', '_' and '-' parts, none '.' or '..'
 # (the same line as pool-lib.sh's).
 valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
+# The two copies hold files of the same names: neither directory may be the other or lie inside it, or the pool's
+# own key would be handed out with the screened one (pool-lib.sh has the same).
+copies_apart() { [ -z "$1" ] || [ -z "$2" ] || { [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]; }; }
 
 # Validate the whole request before touching anything.
 case "$verb" in
@@ -92,6 +97,7 @@ case "$verb" in
   set-workers) [ "$#" -eq 2 ] && valid_listed_name "$1" && valid_count "$2" || usage ;;
   join-open) [ "$#" -eq 0 ] || { [ "$#" -eq 2 ] && [ "$1" = --minutes ] && valid_minutes "$2"; } || usage ;;
   screened-key) [ "$#" -eq 1 ] && { [ "$1" = new ] || [ "$1" = copy ]; } || usage ;;
+  pool-key) [ "$#" -eq 1 ] && [ "$1" = copy ] || usage ;;
   *) usage ;;
 esac
 
@@ -123,6 +129,8 @@ SCREENED_DOOR_ADDRESS=$(setting LEANPOOL_SCREENED_DOOR_ADDRESS)
 SCREENED_DOOR_PORT=$(setting LEANPOOL_SCREENED_DOOR_PORT)
 SCREENED_KEY_COPY=$(setting LEANPOOL_SCREENED_KEY_COPY)
 SCREENED_KEY=$DIR/screened-api-key
+# Where the pool's own key's copy is written (docs/deployment.md), for a program on this host that hands it on.
+POOL_KEY_COPY=$(setting LEANPOOL_POOL_KEY_COPY)
 if [ "$SCREENED_DOOR" = on ]; then
   valid_port "$SCREENED_DOOR_PORT" && [[ "$SCREENED_DOOR_ADDRESS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
     || die "$ENV_FILE opens the screened door without a usable LEANPOOL_SCREENED_DOOR_ADDRESS and LEANPOOL_SCREENED_DOOR_PORT - re-run install.sh --proxy $POOL"
@@ -361,24 +369,24 @@ PY
   else
     echo "--- screened door: off"
   fi
+  [ -z "$POOL_KEY_COPY" ] || echo "--- the pool's key: copied to $POOL_KEY_COPY"
 }
 
-# The screened key's copy (docs/cache.md): the key and the pool authority's certificate, written into the directory
-# the pool names, for the program there that hands the key to its clients. Its path is walked from / one directory
-# at a time, none of them a link, so nobody who owns a directory on the way can send the copy elsewhere. A missing
-# last directory is made, 0700, with its parent's owner; its parent must exist. Each file is owned by the
-# directory's owner and is made new beside the old one, then moved over it, and is never written, chowned or
-# chmodded by name, so a link the owner planted in the directory changes nothing outside it.
-write_screened_copy() {
-  [ -n "$SCREENED_KEY_COPY" ] \
-    || die "pool $POOL names no directory for the screened key's copy: re-run install.sh --proxy $POOL --screened-key-copy DIR"
-  valid_copy_directory "$SCREENED_KEY_COPY" \
-    || die "$ENV_FILE names an unusable LEANPOOL_SCREENED_KEY_COPY - re-run install.sh --proxy $POOL --screened-key-copy DIR"
-  [ -s "$SCREENED_KEY" ] || die "the screened door has no key ($SCREENED_KEY) - re-run install.sh --proxy $POOL"
-  command -v python3 >/dev/null || die "python3 is needed to write the screened key's copy"
+# A key's copy: the key and the pool authority's certificate, written into the directory the pool names, for the
+# program there that hands them to its clients. Its path is walked from / one directory at a time, none of them a
+# link, so nobody who owns a directory on the way can send the copy elsewhere. A missing last directory is made,
+# 0700, with its parent's owner; its parent must exist. Each file is owned by the directory's owner and is made new
+# beside the old one, then moved over it, and is never written, chowned or chmodded by name, so a link the owner
+# planted in the directory changes nothing outside it.
+copies_together() {
+  echo "pool $POOL names one directory for the screened key's copy and its own key's copy, or one inside the other ($SCREENED_KEY_COPY, $POOL_KEY_COPY): the pool's key would be handed out with the screened one. Re-run install.sh --proxy $POOL with another --pool-key-copy DIR"
+}
+
+write_key_copy() {        # COPY KEY
+  command -v python3 >/dev/null || die "python3 is needed to write a key's copy"
+  copies_apart "$SCREENED_KEY_COPY" "$POOL_KEY_COPY" || die "$(copies_together)"
   # -I: the current directory, and every PYTHON variable, are kept out of a program run as root.
-  python3 -I - "$SCREENED_KEY_COPY" "$SCREENED_KEY" "$DIR/certs/ca.crt" <<'PY' \
-    || die "the screened key's copy could not be written to $SCREENED_KEY_COPY"
+  python3 -I - "$1" "$2" "$DIR/certs/ca.crt" <<'PY'
 import errno
 import os
 import secrets
@@ -436,7 +444,30 @@ except OSError as error:
     why = "a link or a file is in its path" if error.errno in (errno.ELOOP, errno.ENOTDIR) else error.strerror
     sys.exit(f"lean-pool-ctl: {copy}: {why} ({error.filename or 'its path'})")
 PY
+}
+
+# The screened key's copy (docs/cache.md), for the program that hands it to the machines sent to the screened door.
+write_screened_copy() {
+  [ -n "$SCREENED_KEY_COPY" ] \
+    || die "pool $POOL names no directory for the screened key's copy: re-run install.sh --proxy $POOL --screened-key-copy DIR"
+  valid_copy_directory "$SCREENED_KEY_COPY" \
+    || die "$ENV_FILE names an unusable LEANPOOL_SCREENED_KEY_COPY - re-run install.sh --proxy $POOL --screened-key-copy DIR"
+  [ -s "$SCREENED_KEY" ] || die "the screened door has no key ($SCREENED_KEY) - re-run install.sh --proxy $POOL"
+  write_key_copy "$SCREENED_KEY_COPY" "$SCREENED_KEY" \
+    || die "the screened key's copy could not be written to $SCREENED_KEY_COPY"
   echo "the screened key and the pool's authority are copied to $SCREENED_KEY_COPY (api-key, ca.crt), owned by $(stat -c '%U:%G' "$SCREENED_KEY_COPY")"
+}
+
+# The pool's own key's copy (docs/deployment.md), for a program that hands it to boxes the pool's key is meant for.
+write_pool_key_copy() {
+  [ -n "$POOL_KEY_COPY" ] \
+    || die "pool $POOL names no directory for its key's copy: re-run install.sh --proxy $POOL --pool-key-copy DIR"
+  valid_copy_directory "$POOL_KEY_COPY" \
+    || die "$ENV_FILE names an unusable LEANPOOL_POOL_KEY_COPY - re-run install.sh --proxy $POOL --pool-key-copy DIR"
+  [ -s "$DIR/api-key" ] || die "the pool has no key ($DIR/api-key) - re-run install.sh --proxy $POOL"
+  write_key_copy "$POOL_KEY_COPY" "$DIR/api-key" \
+    || die "the pool's key's copy could not be written to $POOL_KEY_COPY"
+  echo "the pool's key and its authority are copied to $POOL_KEY_COPY (api-key, ca.crt), owned by $(stat -c '%U:%G' "$POOL_KEY_COPY")"
 }
 
 case "$verb" in
@@ -779,6 +810,10 @@ EOF
 
   cache-start)
     docker start "$CACHE" >/dev/null && echo "cache started"
+    ;;
+
+  pool-key)
+    write_pool_key_copy
     ;;
 
   screened-key)

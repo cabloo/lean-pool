@@ -67,6 +67,11 @@ A week of running the pool on boxes that also do other work.
   the second key once and keeps it, and with `--screened-key-copy DIR` writes it, with the pool
   authority's certificate, into DIR for the program that hands it on. `lean-pool-ctl NAME
   screened-key new|copy` makes a new key or writes the copy again.
+- **A copy of the pool's own key** ([docs](docs/deployment.md#a-copy-of-the-pools-key)):
+  `install.sh --proxy NAME --pool-key-copy DIR` writes the pool's key and the authority's
+  certificate into DIR at every run, as the screened key's copy is written, for a program on the
+  host that hands it to boxes of its own; never into the screened key's copy's directory, nor
+  one inside or around it. `lean-pool-ctl NAME pool-key copy` writes it again.
 - **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
   its pool and its joining boxes with, now in this repository, with their tests
   (`tests/install/`, on a fake machine). A deployment's own values live in a site directory

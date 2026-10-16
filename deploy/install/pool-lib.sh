@@ -157,6 +157,9 @@ has_overlay() { [[ ":$(setting_in "$1" COMPOSE_FILE):" == *":$2:"* ]]; }
 # valid_copy_directory PATH : a directory for the screened key's copy, named by its whole path: parts of letters,
 # digits, '.', '_' and '-', none of them '.' or '..' (the same line as lean-pool-ctl's).
 valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
+# copies_apart A B : true unless directories A and B (either may be empty) are one, or one lies inside the other.
+# The screened key's copy and the pool's own key's copy hold files of the same names (lean-pool-ctl has the same).
+copies_apart() { [ -z "$1" ] || [ -z "$2" ] || { [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]; }; }
 
 # lean_container ENV_FILE : the Lean server's container of the instance whose settings ENV_FILE holds.
 lean_container() { echo "$(setting_in "$1" COMPOSE_PROJECT_NAME)-kimina-1"; }

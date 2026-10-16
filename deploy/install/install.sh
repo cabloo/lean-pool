@@ -88,7 +88,8 @@ Options:
   --proxy NAME      install the lean-pool front door (HAProxy + cache) for instance NAME's pool, all of it
                     TLS; only --site may come before it, and it takes its own options (--port, --subnet,
                     --dns, --lean-timeout, --front-name NAME, --admit-cases DIR, --screened-door
-                    [--screened-key-copy DIR] | --no-screened-door (both kept once given), --no-firewall,
+                    [--screened-key-copy DIR] | --no-screened-door (both kept once given), --pool-key-copy
+                    DIR (kept once given), --no-firewall,
                     --uninstall [--purge]);
                     every install of a pool needs --admit-cases
   --api-key-file F  install the server with the API key in file F (a pool's key) instead of generating one

@@ -133,7 +133,8 @@ the pool needs `--admit-cases DIR`, and it replaces the pool's copy of the cases
 Every step of both is safe to run again. A re-run keeps the API key, the authority, every
 certificate, the server list, what the instance's `kimina.env` holds (workers, CPUs, CPU
 priority, a TLS front), and the pool's [screened door](#a-screened-door) as it was, open or
-closed, with its key and its copy's directory. Other options are not remembered: run each line
+closed, with its key and its copy's directory, and the directory of the pool's key's copy
+([below](#a-copy-of-the-pools-key)). Other options are not remembered: run each line
 again with the options it had. Left out, the pool's `--port` and `--lean-timeout` and the instance's `--port` go back to
 their defaults, a run without `--operator-key` removes the operator's SSH door (a key that runs
 `kimina-ctl` alone; `install.sh --help`), and one without `--no-agent` or `--no-firewall` adds
@@ -146,6 +147,7 @@ What they leave on the host:
 | `/srv/kimina-NAME` | The instance: `kimina.env` (its settings and its key, readable by root only; `COMPOSE_FILE` names the files it runs), the compose files of `deploy/lean-server`, and its build files. Instance 1 is `/srv/kimina`. |
 | `/srv/lean-pool-NAME` | The pool: `pool.env`, the server list, the certificates, the admission cases, the join bundle, and with the screened door its key (`screened-api-key`). |
 | the screened key's copy | With `--screened-key-copy DIR`: `api-key` and `ca.crt` in DIR, owned by DIR's owner. An uninstall, even with `--purge`, leaves them. |
+| the pool's key's copy | With `--pool-key-copy DIR`: the same two files, holding the pool's own key, in DIR. An uninstall, even with `--purge`, leaves them. |
 | `/usr/local/bin/kimina-ctl` | Every operation on the Lean servers of this host. |
 | `/usr/local/sbin/lean-pool-ctl` | Every operation on a pool. |
 
@@ -318,6 +320,26 @@ and where its key went; a copy that could not be written is a warning there, not
 through every re-run until `--no-screened-door`. Closing it does not retire the key: `screened-key
 new` does, open or closed. The door takes as many checks as the pool's workers, counted at the
 install (a server that joins later counts at the next install run).
+
+### A copy of the pool's key
+
+A program on the pool's host that starts work on other boxes, and hands those it trusts the
+pool's own key, can be given a copy that follows the key:
+
+```sh
+sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases \
+  --pool-key-copy /srv/hand-out/lean-pool-home
+sudo lean-pool-ctl upstream pool-key copy        # the key and the authority written to the copy again
+```
+
+Every install run writes the pool's key (`api-key`, 0600) and the pool authority's certificate
+(`ca.crt`, 0644) into DIR, as the [screened key's copy](cache.md#the-screened-door) is written:
+owned by DIR's owner, its path walked with no link followed, each file made beside the old one
+and moved over it. DIR is kept once given. It may not be the screened key's copy's directory,
+lie inside it or hold it, since both copies hold files of the same names: the installer refuses
+that before it changes anything. The summary has a `pool key` line; a copy that could not be
+written is a warning there, not a failed install. Whoever can read DIR holds the pool's key,
+which runs code on every Lean server of the pool ([SECURITY.md](../SECURITY.md)).
 
 ### Watching it
 

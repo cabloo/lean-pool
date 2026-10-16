@@ -126,6 +126,7 @@ module = [
     "test_install_join_helper",
     "test_install_join_script",
     "test_install_memory_ceiling",
+    "test_install_pool_key_copy",
     "test_install_read_only",
     "test_install_reaping",
     "test_install_run",
