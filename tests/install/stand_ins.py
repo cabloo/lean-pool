@@ -19,7 +19,7 @@ run the REAL scripts against a fake machine:
     readable by HAProxy's group, and so must a file an answer is returned from, beside the config), says
     what its HAProxy was built with (`haproxy -vv`: with the Prometheus exporter, unless
     STUB_HAPROXY_NO_EXPORTER), `docker compose` (the compose file and env file must exist, every
-    `${VAR:?}` must be set, a container is "recreated" only when its resolved config changed), and the
+    `${VAR:?}` must be set, the file of every secret a service it makes is given must exist, a container is "recreated" only when its resolved config changed), and the
     admission test (a scenario);
   - remembers how each container was MADE, as Docker does: whether its service said `init: true` when it was
     last (re)created, which is what `inspect -f '{{.HostConfig.Init}}'` answers, and the control group it was
@@ -292,6 +292,17 @@ def compose(args):
         for volume, settings in (resolved.get("volumes") or {}).items():
             if not (settings or {}).get("external"):
                 made_volume((settings or {}).get("name") or project + "_" + volume, project)
+        # A secret is a bind mount of its file, beside the first compose file: Compose makes no container
+        # whose secret file is missing.
+        here = files[0].parent if files else Path(".")
+        for _, (service_name, service) in containers.items():
+            if wanted and service_name not in wanted:
+                continue
+            for secret in service.get("secrets") or []:
+                secret_name = secret if isinstance(secret, str) else secret.get("source")
+                source = ((resolved.get("secrets") or {}).get(secret_name) or {}).get("file")
+                if not source or not (here / source).is_file():
+                    fail(f"Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: {here / str(source)}")
         for name, (service_name, service) in containers.items():
             if wanted and service_name not in wanted:
                 continue
@@ -1303,6 +1314,7 @@ PROJECT_FILES = (
     "deploy/pool/compose.yaml",
     "deploy/pool/compose.tls.yaml",
     "deploy/pool/compose.dns.yaml",
+    "deploy/pool/compose.screened-door.yaml",
 )
 
 
@@ -1442,6 +1454,12 @@ class Machine:
         self, script: str | Path, *arguments: str, **extra: str
     ) -> subprocess.CompletedProcess[str]:
         """Run one of the (rewritten) scripts as root on this machine, for at most three minutes."""
+        return self.bash_in(None, script, *arguments, **extra)
+
+    def bash_in(
+        self, directory: Path | None, script: str | Path, *arguments: str, **extra: str
+    ) -> subprocess.CompletedProcess[str]:
+        """As ``bash``, started in ``directory`` (the tests' own when None)."""
         path = script if isinstance(script, Path) else self.script(script)
         return subprocess.run(
             ["bash", str(path), *arguments],
@@ -1450,6 +1468,7 @@ class Machine:
             timeout=180,
             stdin=subprocess.DEVNULL,
             env=self.environment(**extra),
+            cwd=directory,
         )
 
     def start(self, script: str, *arguments: str, **extra: str) -> subprocess.Popen[str]:

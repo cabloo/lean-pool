@@ -26,8 +26,15 @@
 #   6. the door: lean-pool-ctl and its helper (root-owned), and the kimina-ctl that knows `@proxy-NAME`
 #   7. this box's own Lean server goes behind a TLS front (the server and its usage agent stop publishing
 #      their ports), then the proxy and the cache start with the new config
-#   8. firewall: the pool port and the join port (18110) from the LAN subnet and the docker bridges only
+#   8. firewall: the pool port and the join port (18110) from the LAN subnet and the docker bridges only, and
+#      the screened door's (18120), while it is open, from the docker bridges alone
 #   9. verifies: a valid and an invalid proof THROUGH the pool, over HTTPS
+#
+# With --screened-door (kept until --no-screened-door) the pool also opens the screened door (docs/cache.md): a
+# second HTTPS port, 18120, published on the docker0 bridge's address alone and reachable from the docker bridges
+# alone, that leads to the cache, which takes a second key there and screens what comes with it. The key is made
+# once (screened-api-key beside the pool's key); with --screened-key-copy DIR it is also written, with the pool
+# authority's certificate, into DIR for the program that hands it out (lean-pool-ctl NAME screened-key).
 #
 # Apart from step 1b's one-time move, it never touches instance 1 (/srv/kimina, the instance with no name): not
 # its container, its settings, its compose files or its firewall rules.
@@ -57,6 +64,10 @@ FIREWALL=1
 UNINSTALL=0
 PURGE=0
 FRONT_NAMES=()
+SCREENED_DOOR=""
+SCREENED_KEY_COPY=""
+# The screened door's port, as the proxy and the host both see it.
+SCREENED_DOOR_PORT=18120
 while [ $# -gt 0 ]; do
   case "$1" in
     --site) SITE=$2; shift 2 ;;
@@ -66,13 +77,16 @@ while [ $# -gt 0 ]; do
     --dns) DNS=$2; shift 2 ;;
     --lean-timeout) LEAN_TIMEOUT=$2; shift 2 ;;
     --front-name) FRONT_NAMES+=("$2"); shift 2 ;;
+    --screened-door) SCREENED_DOOR=on; shift ;;
+    --no-screened-door) SCREENED_DOOR=off; shift ;;
+    --screened-key-copy) SCREENED_KEY_COPY=$2; shift 2 ;;
     --no-firewall) FIREWALL=0; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
-[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--no-firewall] [--uninstall [--purge]]"
+[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--screened-door [--screened-key-copy DIR] | --no-screened-door] [--no-firewall] [--uninstall [--purge]]"
 # The site's values: --site DIR, else the site/ a join bundle carries beside this file.
 [ -n "$SITE" ] || [ ! -f "$SRC/site/site.env" ] || SITE=$SRC/site
 [ -n "$SITE" ] || die "--site DIR is needed: the directory of this site's values (site.env, instances/NAME.env)"
@@ -82,6 +96,11 @@ load_site "$SITE"
 for front_name in ${FRONT_NAMES[@]+"${FRONT_NAMES[@]}"}; do
   [[ "$front_name" =~ $LEAN_POOL_DNS_NAME ]] || die "--front-name must be a DNS name in lower case (a name clients use for the pool)"
 done
+if [ -n "$SCREENED_KEY_COPY" ]; then
+  valid_copy_directory "$SCREENED_KEY_COPY" \
+    || die "--screened-key-copy must be an absolute directory path (parts of letters, digits, '.', '_' and '-', none '.' or '..')"
+  [ "$SCREENED_DOOR" != off ] || die "--screened-key-copy goes with the screened door, which --no-screened-door closes"
+fi
 [ "$(id -u)" -eq 0 ] || die "run with sudo: sudo bash install.sh --proxy $POOL"
 
 DIR=/srv/lean-pool-$POOL
@@ -102,6 +121,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
   remove_lan_firewall "proxy-$POOL"
   remove_lan_firewall "join-$POOL"
+  remove_lan_firewall "door-$POOL"
   if [ "$PURGE" -eq 1 ]; then
     docker volume rm "${PROJECT}_cache-data" 2>/dev/null || true
     docker volume rm "$SITE_PREFIX-cache-$POOL" 2>/dev/null || true     # an older installer's
@@ -156,6 +176,20 @@ if [ -z "$DNS" ]; then
 fi
 [[ "$DNS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "--dns must be an IPv4 address"
 echo "resolver for the proxy (other boxes are named on the LAN): $DNS"
+# The docker0 bridge's address: where a container on this host reaches the proxy. The front door's certificate
+# names it, and the screened door is published there alone.
+BRIDGE=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+[ -n "$BRIDGE" ] || BRIDGE=$({ ip -4 -o addr show dev docker0 2>/dev/null || true; } | awk '{split($4, parts, "/"); print parts[1]; exit}')
+[[ "$BRIDGE" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || BRIDGE=""
+# The screened door: as this run's option says, else as the pool has it.
+if [ -z "$SCREENED_DOOR" ] && [ -f "$DIR/pool.env" ]; then SCREENED_DOOR=$(setting_in "$DIR/pool.env" LEANPOOL_SCREENED_DOOR); fi
+[ "$SCREENED_DOOR" = on ] || SCREENED_DOOR=off
+[ -z "$SCREENED_KEY_COPY" ] || [ "$SCREENED_DOOR" = on ] \
+  || die "--screened-key-copy goes with the screened door, which pool $POOL has closed: add --screened-door"
+if [ "$SCREENED_DOOR" = on ]; then
+  [ -n "$BRIDGE" ] || die "the screened door is published on the docker0 bridge's address alone, and this host's could not be read (docker network inspect bridge); nothing was installed"
+  echo "screened door: on, at $BRIDGE:$SCREENED_DOOR_PORT (the docker bridges only)"
+fi
 # This box's own Lean server is recreated below if its compose file changed, and that file gives the container
 # an init process: a Docker that cannot start one is found out here, before anything is written.
 if [ -n "$(docker image inspect -f '{{.Id}}' "$LEAN_IMAGE" 2>/dev/null || true)" ] && ! init_starts "$LEAN_IMAGE"; then
@@ -195,13 +229,32 @@ install_compose_files "$DIR" pool
 ( umask 077; instance_setting LEAN_SERVER_API_KEY > "$DIR/api-key" )
 [ -s "$DIR/api-key" ] || die "the instance has no API key"
 chown root:"$POOL_GID" "$DIR/api-key"; chmod 0640 "$DIR/api-key"
+# The screened door's key: made once, kept across runs (a closed door keeps it, for when it opens again), and
+# readable as the pool's key is. Only the cache and the copy below hold it: no Lean server, no join bundle.
+if [ "$SCREENED_DOOR" = on ]; then
+  if [ ! -s "$DIR/screened-api-key" ]; then
+    ( umask 077; python3 -I -c 'import secrets; print(secrets.token_hex(32))' > "$DIR/screened-api-key" ) \
+      || die "could not make the screened door's key"
+    echo "made the screened door's key ($DIR/screened-api-key; it is never printed)"
+  fi
+  chown root:"$POOL_GID" "$DIR/screened-api-key"; chmod 0640 "$DIR/screened-api-key"
+fi
 
 ( umask 077; : >> "$DIR/pool.env" )
 chown root:root "$DIR/pool.env"; chmod 0600 "$DIR/pool.env"
 pool_setting() { setting_in "$DIR/pool.env" "$1"; }
 pool_default() { grep -q "^$1=" "$DIR/pool.env" || echo "$1=$2" >> "$DIR/pool.env"; }
 set_env_in "$DIR/pool.env" COMPOSE_PROJECT_NAME "$PROJECT"
-set_env_in "$DIR/pool.env" COMPOSE_FILE "$(IFS=:; echo "${LEAN_POOL_COMPOSE_FILES[*]}")"
+compose_list=$(IFS=:; echo "${LEAN_POOL_COMPOSE_FILES[*]}")
+[ "$SCREENED_DOOR" = off ] || compose_list=$compose_list:$LEAN_POOL_SCREENED_DOOR_OVERLAY
+set_env_in "$DIR/pool.env" COMPOSE_FILE "$compose_list"
+set_env_in "$DIR/pool.env" LEANPOOL_SCREENED_DOOR "$SCREENED_DOOR"
+if [ "$SCREENED_DOOR" = on ]; then
+  set_env_in "$DIR/pool.env" LEANPOOL_SCREENED_DOOR_ADDRESS "$BRIDGE"
+  set_env_in "$DIR/pool.env" LEANPOOL_SCREENED_DOOR_PORT "$SCREENED_DOOR_PORT"
+fi
+# Where the screened key's copy is written: kept once given, so a re-run without the option writes it there too.
+[ -z "$SCREENED_KEY_COPY" ] || set_env_in "$DIR/pool.env" LEANPOOL_SCREENED_KEY_COPY "$SCREENED_KEY_COPY"
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE "$LEAN_POOL_IMAGE"
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE_GID "$POOL_GID"
 set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_IMAGE "$HAPROXY_IMAGE"
@@ -289,9 +342,7 @@ fi
 # The front door: every name and address a client uses for the pool. The names are DNS names; the two
 # addresses are loopback (lean-pool-ctl checks the pool through it) and the docker0 bridge (where a
 # container on this host reaches it). A changed set of names is the only thing that makes a new one.
-BRIDGE=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
-[ -n "$BRIDGE" ] || BRIDGE=$({ ip -4 -o addr show dev docker0 2>/dev/null || true; } | awk '{split($4, parts, "/"); print parts[1]; exit}')
-[[ "$BRIDGE" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { warn "could not read the docker0 bridge address: the front door's certificate will not name it"; BRIDGE=""; }
+[ -n "$BRIDGE" ] || warn "could not read the docker0 bridge address: the front door's certificate will not name it"
 front_arguments=(--name "$SHORT" --dns "$SHORT.$SITE_LAN_DOMAIN")
 wanted_names="$SHORT, $SHORT.$SITE_LAN_DOMAIN"
 if [ -n "$EXTRA_FRONT_NAMES" ]; then
@@ -367,17 +418,48 @@ say "Installing the config and starting the proxy and the cache"
 rendered=$(/usr/local/sbin/lean-pool-ctl "$POOL" render --no-reload) || die "could not install the HAProxy config"
 upstream_timeout=$(echo "$rendered" | sed -n 's/^cache_upstream_timeout=//p')
 [ -z "$upstream_timeout" ] || set_env_in "$DIR/pool.env" LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS "$upstream_timeout"
+# The screened door's limit, for the cache too: the workers the pool lists that are not paused, as of this run.
+pool_workers=$(echo "$rendered" | sed -n 's/^pool_workers=//p')
+if [ "$SCREENED_DOOR" = on ]; then
+  [[ "$pool_workers" =~ ^[0-9]{1,5}$ ]] && [ "$pool_workers" -ge 1 ] \
+    || die "the rendered config states no worker count for the screened door; nothing was started"
+  set_env_in "$DIR/pool.env" LEANPOOL_CACHE_SCREENED_IN_FLIGHT "$pool_workers"
+  set_env_in "$DIR/pool.env" LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS "$LEAN_TIMEOUT"
+fi
 proxy_before=$(docker inspect -f '{{.Id}}' "$PROXY" 2>/dev/null || true)
 compose up -d
 reload_if_kept "$PROXY" "$proxy_before"     # a proxy that kept running loads the config now
+
+# The screened key's copy, for the program that hands it out, where the pool names a directory for it.
+SCREENED_SAID=""
+if [ "$SCREENED_DOOR" = on ]; then
+  copy=$(pool_setting LEANPOOL_SCREENED_KEY_COPY)
+  SCREENED_SAID="https://$BRIDGE:$SCREENED_DOOR_PORT (the docker bridges only)"
+  if [ -z "$copy" ]; then
+    SCREENED_SAID="$SCREENED_SAID; its key is in $DIR/screened-api-key alone (no --screened-key-copy)"
+  elif /usr/local/sbin/lean-pool-ctl "$POOL" screened-key copy; then
+    SCREENED_SAID="$SCREENED_SAID; its key and the authority's certificate are copied to $copy"
+  else
+    warn "the screened key's copy was not written to $copy: sudo lean-pool-ctl $POOL screened-key copy"
+    SCREENED_SAID="$SCREENED_SAID; ITS KEY'S COPY WAS NOT WRITTEN to $copy"
+  fi
+fi
 
 if [ "$FIREWALL" -eq 1 ]; then
   say "Firewall"
   install_lan_firewall "proxy-$POOL" "$PORT" "$SUBNET"
   # The join service runs only while a window is open; its port is LAN-only all the time.
   install_lan_firewall "join-$POOL" "$JOIN_PORT" "$SUBNET"
+  # The screened door is published on the bridge's address alone, and reachable from the docker bridges alone:
+  # a host on the LAN that routes to that address is still turned away.
+  if [ "$SCREENED_DOOR" = on ]; then install_lan_firewall "door-$POOL" "$SCREENED_DOOR_PORT" ""
+  else remove_lan_firewall "door-$POOL"; fi
 else
-  warn "--no-firewall: ports $PORT and $JOIN_PORT are reachable from every network this host is on"
+  if [ "$SCREENED_DOOR" = on ]; then
+    warn "--no-firewall: ports $PORT and $JOIN_PORT, and the screened door's $SCREENED_DOOR_PORT, are reachable from every network this host is on (the door's rule, if an earlier run set one, is left as it was)"
+  else
+    warn "--no-firewall: ports $PORT and $JOIN_PORT are reachable from every network this host is on"
+  fi
 fi
 
 # --------------------------------------------------------------------------------------------- verify
@@ -420,4 +502,6 @@ EOF
 [ -z "${READ_ONLY_SAID:-}" ] || echo "  read-only   $READ_ONLY_SAID"
 # And whether each of its workers starts in a sandbox of its own.
 [ -z "${WORKER_SANDBOX_SAID:-}" ] || echo "  sandbox     $WORKER_SANDBOX_SAID"
+# And the screened door, where it is open.
+[ -z "$SCREENED_SAID" ] || echo "  screened    $SCREENED_SAID"
 [ "$verdict" = "POOL INSTALLED AND VERIFIED" ]

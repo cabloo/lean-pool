@@ -22,7 +22,8 @@ Start with the [front page](../README.md) for what lean-pool is and why, and wit
 
 **How it works**
 
-* [Cache semantics](cache.md): the key, what is stored and what never is, bypass, single flight.
+* [Cache semantics](cache.md): the key, what is stored and what never is, bypass, single flight,
+  and the screened door: a second way in, through the screen, for machines you do not own.
 * [The usage agent](usage-agent.md): the weight formula, what HAProxy does with it, and the
   open slots of a box that also does other work.
 * [The generated HAProxy configuration](haproxy.md): pausing a server, the health check,

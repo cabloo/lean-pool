@@ -15,6 +15,7 @@
 | [`pool/compose.yaml`](pool/compose.yaml) | The pool box: HAProxy and the cache. |
 | [`pool/compose.tls.yaml`](pool/compose.tls.yaml) | Added after it for TLS: the proxy's certificates. |
 | [`pool/compose.dns.yaml`](pool/compose.dns.yaml) | Added after them where the Lean servers are named on a LAN: a DNS server for the proxy. |
+| [`pool/compose.screened-door.yaml`](pool/compose.screened-door.yaml) | Added last where the pool opens the [screened door](../docs/cache.md#the-screened-door): its port on one host address, and the cache's second key. |
 | [`pool/servers.example`](pool/servers.example) | The format of the server list. |
 
 The installers run the compose files exactly as they are here: they copy the ones a box needs into its
@@ -62,8 +63,12 @@ the box they belong to.
 | `LEANPOOL_CACHE_MAX_BYTES` | `pool.env` | `4294967296` | The cache's own setting. |
 | `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` | `pool.env` | `1800` | The cache's own setting. |
 | `LEANPOOL_CACHE_MAX_REQUEST_BYTES` | `pool.env` | `16777216` | The cache's own setting. |
+| `LEANPOOL_CACHE_SCREENED_IN_FLIGHT` | `pool.env` | required by `compose.screened-door.yaml` | The cache's own setting: how many checks the screened door's senders may have at the servers at once. |
+| `LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` | `pool.env` | `300` | The cache's own setting: the longest Lean timeout those senders may ask for. |
 | `LEANPOOL_SUBNET` | `pool.env` | `172.29.55.0/24` | The pool's network. |
 | `LEANPOOL_DNS` | `pool.env` | required by `compose.dns.yaml` | The proxy's DNS server. |
+| `LEANPOOL_SCREENED_DOOR_ADDRESS` | `pool.env` | required by `compose.screened-door.yaml` | The one host address the [screened door](../docs/cache.md#the-screened-door) is published on. |
+| `LEANPOOL_SCREENED_DOOR_PORT` | `pool.env` | `18120` | The screened door's port, on the host and in the proxy. |
 
 The defaults are the compose files' own, for a box run by hand. The installers write some of these
 settings with values of their own: `LEAN_SERVER_MAX_WAIT` 120, `LEAN_SERVER_MEM_LIMIT` 36g,
@@ -72,7 +77,10 @@ the instance file, `LEAN_SERVER_FRONT_ADDRESS` the `.250` of the instance's subn
 `LEANPOOL_CACHE_MAX_REQUEST_BYTES` 262144, `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` what the
 proxy's rendered configuration needs (from the Lean timeout and the servers' wait), and
 `LEANPOOL_AGENT_VERSION` the installer's own version
-([the installer's version](../docs/usage-agent.md#the-installers-version)).
+([the installer's version](../docs/usage-agent.md#the-installers-version)). With the screened door
+open, every run writes `LEANPOOL_SCREENED_DOOR_ADDRESS` (the docker0 bridge's), `LEANPOOL_SCREENED_DOOR_PORT`
+(18120), `LEANPOOL_CACHE_SCREENED_IN_FLIGHT` (the pool's workers) and
+`LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` (the Lean timeout): a hand edit of them is lost.
 
 ### What the installer's programs also keep
 
@@ -93,3 +101,5 @@ proxy's rendered configuration needs (from the Lean timeout and the servers' wai
 | `LEANPOOL_JOIN_PUBLIC_HOST` | `pool.env` | The host name a new box is told to fetch its join script from. |
 | `LEANPOOL_JOIN_PUBLIC_PORT` | `pool.env` | The port the join service is published on while a window is open. |
 | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | `pool.env` | The renderer's own setting: the installer's version, which the pool's `GET /health` carries. |
+| `LEANPOOL_SCREENED_DOOR` | `pool.env` | `on` while the [screened door](../docs/cache.md#the-screened-door) is open (`--screened-door`), `off` once closed. |
+| `LEANPOOL_SCREENED_KEY_COPY` | `pool.env` | The directory the screened key's copy is written to (`--screened-key-copy`). |

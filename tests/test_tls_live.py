@@ -37,6 +37,7 @@ from support import API_KEY, AUTHORIZED, StartLeanServer
 from tls_support import ThrowawayAuthority
 
 from leanpool.agent import AgentSettings, UsageAgent
+from leanpool.doors import DOOR_HEADER, SCREENED_DOOR
 from leanpool.pki import (
     Usage,
     issue_certificate,
@@ -627,3 +628,172 @@ async def test_admission_fails_through_a_boxs_front_with_a_client_certificate_no
     # Nothing from any of them reached the Lean server: no check, no key, not even a health
     # request.
     assert (lean.requests, lean.health_checks) == ([], 0)
+
+
+# --- the screened door: a second way in, to the cache alone (docs/cache.md) ---------------------
+
+SCREENED_KEY = "screened-door-key"
+SCREENED_AUTHORIZED = {"Authorization": f"Bearer {SCREENED_KEY}"}
+RUNS_CODE = '#eval IO.println "hello"'
+
+
+async def screened_pool(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    behaviour: Any = None,
+) -> tuple[FakeLeanServer, TlsLivePool]:
+    """One box behind a TLS pool with its screened door open and the cache's screened key set."""
+    lean = await start_lean_server(behaviour)
+    pool = await start_tls_pool(
+        await start_box("box-a", lean),
+        screened_door_port=free_port(),
+        screened_api_key=SCREENED_KEY,
+    )
+    await server_is(pool, "box-a", "UP")
+    return lean, pool
+
+
+async def send(
+    session: aiohttp.ClientSession,
+    url: str,
+    code: str,
+    headers: dict[str, str],
+) -> tuple[int, Any]:
+    """POST one check to ``url``: the status, and the body as JSON or as text."""
+    body = {"snippets": [{"id": "attempt", "code": code}], "timeout": 60}
+    async with session.post(f"{url}/api/check", json=body, headers=headers) as reply:
+        if "json" in reply.headers.get("Content-Type", ""):
+            return reply.status, await reply.json()
+        return reply.status, await reply.text()
+
+
+async def test_the_screened_door_screens_a_check_and_sends_it_on_with_the_pools_key(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+
+    status, reply = await send(session, pool.door_url, proof("one"), SCREENED_AUTHORIZED)
+    assert status == 200, reply
+    (request,) = lean.requests
+    assert request.headers["Authorization"] == AUTHORIZED["Authorization"]
+    assert DOOR_HEADER not in request.headers
+    # The front door's client is answered from the answer the screened door's check stored.
+    assert (await pool.check(session, proof("one"))).result["cached"] is True
+
+    status, reply = await send(session, pool.door_url, RUNS_CODE, SCREENED_AUTHORIZED)
+    assert status == 422, reply
+    assert len(lean.requests) == 1
+
+
+async def test_each_key_is_taken_at_its_own_door_alone_whatever_a_sender_writes(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+    at_the_door = {DOOR_HEADER: SCREENED_DOOR}
+
+    # The pool's key at the screened door.
+    assert await send(session, pool.door_url, proof("a"), AUTHORIZED) == (
+        401,
+        {"detail": "the screened door takes the screened key alone"},
+    )
+    # The screened key at the front door, also with the door's header written by the sender.
+    for headers in (SCREENED_AUTHORIZED, {**SCREENED_AUTHORIZED, **at_the_door}):
+        assert await send(session, pool.url, proof("b"), headers) == (
+            401,
+            {"detail": "the screened key is taken at the screened door alone"},
+        )
+    # A sender's loop guard at the screened door does not take a check past the screen.
+    loop_guard = {**SCREENED_AUTHORIZED, "X-Lean-Pool-Hop": "checkers"}
+    status, _reply = await send(session, pool.door_url, RUNS_CODE, loop_guard)
+    assert status == 422
+    assert lean.requests == []
+
+
+async def test_the_screened_door_answers_health_as_the_front_door_and_takes_checks_alone(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+
+    healths = []
+    for url in (pool.url, pool.door_url):
+        async with session.get(f"{url}/health") as reply:
+            healths.append((reply.status, await reply.json(), reply.headers["X-Lean-Pool-Workers"]))
+    assert (
+        healths[0]
+        == healths[1]
+        == (200, {"status": "ok", "workers": WORKERS, "queued": 0, "servers": 1}, str(WORKERS))
+    )
+
+    for method, path in (
+        ("GET", "/status"),
+        ("GET", "/metrics"),
+        ("GET", "/metrics/cache"),
+        ("GET", "/api/check"),
+        ("POST", "/verify"),
+    ):
+        async with session.request(method, f"{pool.door_url}{path}", headers=AUTHORIZED) as reply:
+            assert reply.status == 404, (method, path)
+            assert await reply.json() == {"detail": "this door takes checks alone"}
+    assert lean.asked == []
+
+
+async def test_while_the_cache_is_down_the_screened_door_answers_503_and_reaches_no_server(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+    await pool.stop_cache()
+
+    async def door_is_down() -> bool:
+        return (await pool.server_state("screened_cache", "cache"))["status"].startswith("DOWN")
+
+    await eventually(door_is_down)
+    status, _reply = await send(session, pool.door_url, proof("a"), SCREENED_AUTHORIZED)
+    assert status == 503
+    # The front door goes round the cache, as it always has.
+    assert (await pool.check(session, proof("b"))).status == 200
+    assert lean.checked_codes == [proof("b")]
+
+
+async def test_the_screened_door_holds_the_pools_workers_and_as_many_waiting_then_says_full(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    session: aiohttp.ClientSession,
+) -> None:
+    release = asyncio.Event()
+
+    async def held(_snippet: dict[str, Any]) -> SnippetReply:
+        await release.wait()
+        return lean_answer()
+
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool, held)
+    sent = [
+        asyncio.create_task(send(session, pool.door_url, proof(index), SCREENED_AUTHORIZED))
+        for index in range(2 * WORKERS)
+    ]
+
+    async def door_is_full() -> bool:
+        backend = await pool.server_state("screened_cache", "BACKEND")
+        return lean.in_flight == WORKERS and backend["qcur"] == str(WORKERS)
+
+    await eventually(door_is_full)
+    assert await send(session, pool.door_url, proof("one more"), SCREENED_AUTHORIZED) == (
+        503,
+        {"detail": "the screened door is full"},
+    )
+    release.set()
+    assert [status for status, _reply in await asyncio.gather(*sent)] == [200] * (2 * WORKERS)
+    assert lean.peak_in_flight == WORKERS

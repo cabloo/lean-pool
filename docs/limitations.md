@@ -116,3 +116,17 @@ item follows from a rule described on another page.
   network that keeps source addresses (a port published through a userland proxy shows every
   caller at the bridge's gateway). A box behind address translation is seen at the translator's
   address, which every machine behind it shares.
+* The screened door's limits count requests and checks, not senders: one sender with the screened
+  key can take all of them, and while it does, every other sender at that door is answered 503. Its
+  checks share the pool's workers with everyone's, at whatever priority it asks for, so at most as
+  many as the pool has workers can be its at once. The cache's count of those workers is the one of
+  the pool's last install run.
+* The screened door hands its key to no one: a program on the pool's host must pass the door and
+  the key on, and whoever holds the key can send checks through the door until a new key is made.
+  Closing the door does not retire it; `screened-key new` does.
+* A check sent through the screened door that passes the screen and stays inside its worker's
+  sandbox can still change what that worker answers later checks, the pool's own included, until
+  the worker is recycled, and such an answer is stored and served from the cache
+  ([what the sandbox does not hold](worker-sandbox.md#what-it-does-not-hold)).
+* The screened door's `/health` and capacity headers tell whoever reaches it the pool's size and
+  its installer's version, without a key, as the front door's do.

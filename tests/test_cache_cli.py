@@ -165,16 +165,48 @@ def test_there_is_no_screened_key_by_default() -> None:
 def test_the_screened_key_is_read_from_a_file_or_the_environment(tmp_path: Path) -> None:
     key_file = tmp_path / "screened"
     key_file.write_text("screened-key\n")
-    from_flag = parse_settings(["--screened-api-key-file", str(key_file)], KEY_ENVIRONMENT)
+    environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_IN_FLIGHT": "8"}
+    from_flag = parse_settings(["--screened-api-key-file", str(key_file)], environment)
     assert from_flag.screened_api_key == "screened-key"
     from_file_variable = parse_settings(
-        [], {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY_FILE": str(key_file)}
+        [], {**environment, "LEANPOOL_CACHE_SCREENED_API_KEY_FILE": str(key_file)}
     )
     assert from_file_variable.screened_api_key == "screened-key"
     from_variable = parse_settings(
-        [], {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
+        [], {**environment, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
     )
     assert from_variable.screened_api_key == "screened-key"
+    assert (from_variable.screened_in_flight, from_variable.screened_max_timeout_seconds) == (
+        8,
+        300,
+    )
+
+
+def test_the_screened_doors_limits_are_read_from_flags_or_the_environment() -> None:
+    environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
+    from_flags = parse_settings(
+        ["--screened-in-flight", "3", "--screened-max-timeout", "120"], environment
+    )
+    assert (from_flags.screened_in_flight, from_flags.screened_max_timeout_seconds) == (3, 120)
+    from_variables = parse_settings(
+        [],
+        {
+            **environment,
+            "LEANPOOL_CACHE_SCREENED_IN_FLIGHT": "5",
+            "LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS": "60",
+        },
+    )
+    assert (from_variables.screened_in_flight, from_variables.screened_max_timeout_seconds) == (
+        5,
+        60,
+    )
+
+
+def test_a_screened_key_without_a_limit_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
+    environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
+    error = usage_error([], environment, capsys)
+    assert "a screened key needs --screened-in-flight" in error
+    assert "screened-key" not in error.replace("a screened key", "")
 
 
 @pytest.mark.parametrize(

@@ -286,6 +286,15 @@ def _add_render_command(commands: Subparsers, environment: Mapping[str, str]) ->
         'digits), added to the body of GET /health as "version"',
         optional=True,
     )
+    settings.add(
+        "--screened-door-port",
+        "LEANPOOL_HAPROXY_SCREENED_DOOR_PORT",
+        parse_port,
+        None,
+        "with TLS, open the screened door on this port: a second HTTPS way in for checks sent "
+        "with the cache's screened key, which leads to the cache alone (docs/cache.md)",
+        optional=True,
+    )
 
 
 def _add_render_box_command(commands: Subparsers, environment: Mapping[str, str]) -> None:
@@ -436,6 +445,7 @@ def _render(options: argparse.Namespace) -> None:
         tls=_tls_settings(options),
         pool_metrics_file=None if pool_metrics is None else pool_metrics.name,
         installer_version=options.installer_version,
+        screened_door_port=options.screened_door_port,
     )
     config = render_haproxy_config(servers, settings)
     if pool_metrics is not None:

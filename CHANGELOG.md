@@ -57,7 +57,16 @@ A week of running the pool on boxes that also do other work.
   (`leanpool/screen.py`: no `#eval`, `run_tac`, `elab`, `IO`, most attributes or imports beyond
   Mathlib and Aesop), or the whole request is answered 422 and reaches nothing; those that pass
   are served like any other and forwarded with the pool's key, so no Lean server holds the
-  second one.
+  second one. Such a request carries Kimina's plain fields alone, at most `--screened-in-flight`
+  snippets and a timeout of at most `--screened-max-timeout` seconds, and the checks its senders
+  start hold at most `--screened-in-flight` places at the servers, with as many waiting.
+- **The screened door** ([docs](docs/cache.md#the-screened-door)): the second key's one way in, a
+  second HTTPS port of the proxy (`--screened-door-port`) that leads to the cache alone, with no
+  backup, and marks what it passes (`X-Lean-Pool-Door`). `install.sh --proxy NAME --screened-door`
+  opens it on port 18120 of the docker0 bridge's address, firewalled to the docker bridges, makes
+  the second key once and keeps it, and with `--screened-key-copy DIR` writes it, with the pool
+  authority's certificate, into DIR for the program that hands it on. `lean-pool-ctl NAME
+  screened-key new|copy` makes a new key or writes the copy again.
 - **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
   its pool and its joining boxes with, now in this repository, with their tests
   (`tests/install/`, on a fake machine). A deployment's own values live in a site directory

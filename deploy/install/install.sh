@@ -87,8 +87,10 @@ Options:
                     (NAME: 1-16 lower-case letters and digits, and neither 'default' nor 'main')
   --proxy NAME      install the lean-pool front door (HAProxy + cache) for instance NAME's pool, all of it
                     TLS; only --site may come before it, and it takes its own options (--port, --subnet,
-                    --dns, --lean-timeout, --front-name NAME, --admit-cases DIR, --no-firewall,
-                    --uninstall [--purge]); every install of a pool needs --admit-cases
+                    --dns, --lean-timeout, --front-name NAME, --admit-cases DIR, --screened-door
+                    [--screened-key-copy DIR] | --no-screened-door (both kept once given), --no-firewall,
+                    --uninstall [--purge]);
+                    every install of a pool needs --admit-cases
   --api-key-file F  install the server with the API key in file F (a pool's key) instead of generating one
   --cpus N          CPU ceiling to write into kimina.env (default: the instance's INSTANCE_CPUS; later:
                     kimina-ctl set-cpus N)

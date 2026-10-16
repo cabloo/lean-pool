@@ -17,14 +17,27 @@ cases.
   including that a refused or failed edit leaves the file byte-identical;
 * the cache: an identical second check never reaches the upstream; what is and is not stored;
   bypass; single flight; request order; eviction order and the size cap; authentication; that
-  the cache does not cap concurrency (150 checks in flight at once);
+  the cache does not cap the pool's own concurrency (150 checks in flight at once);
 * the [screen](cache.md#the-screened-key): each rule with checks it refuses and the nearest
   ones it lets through (a refused word inside a longer name, an attribute the list allows, an
   import of one of Mathlib's modules); through the cache, that a request with one refused
   snippet is answered 422 whole and reaches and stores nothing, that one which passes is
   answered like any other and reaches Lean with the pool's own key, sharing the stored answer
-  of the same check sent with that key, that `/status` takes the pool's key alone, and that
-  neither key reaches a log line or an error;
+  of the same check sent with that key, that `/status` takes the pool's key alone, that each
+  key is refused at the other's [door](cache.md#the-screened-door), and that neither key
+  reaches a log line or an error; that a screened request with any field but Kimina's plain ones,
+  `reuse` false, `no_cache`, a timeout past the limit or more snippets than the limit is answered
+  422 and reaches nothing, while one with Kimina's plain fields is taken; that its checks hold no
+  more places at the servers than the limit, as many more wait, and the next is answered 503,
+  while a check sent with the pool's key goes straight on; that a sender who hangs up keeps its
+  places until its checks end, whose answers are stored; and that a check sent with the pool's key
+  never waits on a screened flight, while a screened check joins one of the pool's;
+* the screened door's configuration: absent, the file is the one rendered before it existed;
+  present, its one backend is the cache with no backup, it refuses all but checks, counts its
+  queue, keeps a share of the proxy's connections of its own, marks what it passes and takes the
+  loop guard away, the front door takes its mark away,
+  and its health and numbers are the front door's; refused without TLS and on a port the pool
+  already uses, and no agent tunnel takes its port;
 * the agent: the formula, the reply format, that the CPU share needs two readings, `drain`;
   open slots from made-up readings of a 16-CPU box with 13 workers (other work on 0, 9.6 and
   14.2 CPUs gives 13, 5 and none; the Lean server's own use lowers none), down at once and up
@@ -105,8 +118,16 @@ cases.
   container's user could not make. A host with two Lean servers, the pool put in front of one,
   the control commands,
   joins over real HTTPS with the real join service, refreshes, the compose plugin's install,
-  the firewall rules, uninstalls; the worker sandbox's probe with each of its outcomes, and a
-  server whose check fails with one protection taken away at a time; every refusal before root
+  the firewall rules, uninstalls; an existing pool opening its screened door (published on the
+  bridge's address alone, firewalled to the bridges' interfaces, its own key, the cache given the
+  pool's workers and Lean timeout as its limits, its copy owned by the copy's directory's owner,
+  the key in that file and the copy and nowhere else on the machine, kept through a re-run,
+  renewed with only the cache made again, renewed while closed with no container made, a renewal
+  the cache was not made again with reported as a failure, closed and opened again, a copy's
+  directory refused while it is closed) and the copy written through no link planted in its
+  directory or above it, with no file left behind when it cannot be moved into place, and no
+  module imported from the directory the control script was started in; the worker sandbox's
+  probe with each of its outcomes, and a server whose check fails with one protection taken away at a time; every refusal before root
   is asked for; an instance whose
   image is pulled by name instead of built; and a box set up by the installers of an older
   version, made by those installers themselves, moved to the compose files of `deploy/` with
@@ -184,7 +205,14 @@ processes on the generated configurations, with throwaway certificates made by `
 * a check that is silent for as long as the Lean timeout allows passes through both proxies
   (with the durations scaled down to seconds);
 * where `curl` is installed, `curl -k --pinnedpubkey` with the pin `leanpool-pki pin` prints
-  reaches the front door, and with another pin exits 90 having fetched nothing.
+  reaches the front door, and with another pin exits 90 having fetched nothing;
+* the screened door: a check sent there with the screened key is screened (422 for `#eval`) and
+  answered through the cache and the pool's Lean servers with the pool's key, sharing the stored
+  answer with the front door; each key is refused at the other's door, also with the door's
+  mark forged at the front door; `/health` there is the front door's and other paths are 404;
+  with the cache stopped it answers 503 while the front door goes round the cache; with as many
+  requests in flight as the pool has workers and as many waiting, the next is answered 503, and
+  every one of the others is then answered.
 
 The metrics paths (`tests/test_metrics_live.py`), on a real HAProxy in front of the real cache:
 

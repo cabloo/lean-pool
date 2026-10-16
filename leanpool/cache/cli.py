@@ -75,10 +75,17 @@ def parse_settings(
         patterns = _resolve_patterns(options, environment)
     except ValueError as error:
         parser.error(str(error))
+    if screened_api_key is not None and options.screened_in_flight is None:
+        parser.error(
+            "a screened key needs --screened-in-flight (or LEANPOOL_CACHE_SCREENED_IN_FLIGHT): "
+            "how many of its checks may be at the servers at once"
+        )
     return CacheSettings(
         pin=options.pin,
         api_key=api_key,
         screened_api_key=screened_api_key,
+        screened_in_flight=options.screened_in_flight,
+        screened_max_timeout_seconds=options.screened_max_timeout,
         database_path=options.database,
         host=options.host,
         port=options.port,
@@ -124,6 +131,21 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
         "a file holding a second key, for senders trusted less than the pool's own (or put the "
         f"key itself in {_SCREENED_API_KEY_VARIABLE}): their checks must pass the screen and are "
         "forwarded with the pool's key; none by default",
+    )
+    settings.add(
+        "--screened-in-flight",
+        "LEANPOOL_CACHE_SCREENED_IN_FLIGHT",
+        parse_positive_integer,
+        None,
+        "with a screened key, required: the most checks its senders started that are at the "
+        "servers at once (as many again may wait), and the most snippets in one of their requests",
+    )
+    settings.add(
+        "--screened-max-timeout",
+        "LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS",
+        parse_positive_integer,
+        defaults.screened_max_timeout_seconds,
+        "the longest Lean timeout, in seconds, a check sent with the screened key may ask for",
     )
     settings.add_switch(
         "--allow-unauthenticated",

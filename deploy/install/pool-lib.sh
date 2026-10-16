@@ -78,7 +78,8 @@ lean_pool_source() {
 #                        compose.tls.yaml (the TLS front; the server and the agent then publish nothing),
 #                        compose.compiled-search.yaml (linarith's search step, compiled) and
 #                        compose.worker-sandbox.yaml (every worker in a sandbox of its own)
-#   deploy/pool/         compose.yaml (the proxy and the cache), compose.tls.yaml and compose.dns.yaml
+#   deploy/pool/         compose.yaml (the proxy and the cache), compose.tls.yaml and compose.dns.yaml, and
+#                        compose.screened-door.yaml (the screened door, where the pool opens it)
 # The env file beside them (kimina.env, pool.env) names the files the box runs, in order (COMPOSE_FILE), and the
 # project (COMPOSE_PROJECT_NAME), and every program passes both to `docker compose` itself. Containers, networks
 # and volumes have Compose's own names: lean-server-NAME-kimina-1, lean-server-NAME_default,
@@ -88,6 +89,8 @@ LEAN_POOL_COMPOSE_DIR=deploy/pool
 LEAN_SERVER_COMPOSE_FILES=(compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml
   compose.worker-sandbox.yaml)
 LEAN_POOL_COMPOSE_FILES=(compose.yaml compose.tls.yaml compose.dns.yaml)
+# The screened door's overlay: copied with the pool's files, and in COMPOSE_FILE, last, where the door is open.
+LEAN_POOL_SCREENED_DOOR_OVERLAY=compose.screened-door.yaml
 
 # lean_server_project INSTANCE : the compose project of a Lean server instance (lean-server for instance 1).
 lean_server_project() { echo "lean-server${1:+-$1}"; }
@@ -101,7 +104,10 @@ install_compose_files() {
     install -o root -g root -m 0644 "$from/$file" "$dir/$file"
   done
 }
-compose_names() { if [ "$1" = pool ]; then echo "${LEAN_POOL_COMPOSE_FILES[*]}"; else echo "${LEAN_SERVER_COMPOSE_FILES[*]}"; fi; }
+compose_names() {
+  if [ "$1" = pool ]; then echo "${LEAN_POOL_COMPOSE_FILES[*]} $LEAN_POOL_SCREENED_DOOR_OVERLAY"
+  else echo "${LEAN_SERVER_COMPOSE_FILES[*]}"; fi
+}
 # compose_source server|pool : the lean-pool project's directory of those compose files, once each one is
 # there (a pre-flight asks this before anything is written).
 compose_source() {
@@ -147,6 +153,10 @@ set_overlay() {
 
 # has_overlay ENV_FILE FILE : whether the instance runs the overlay FILE.
 has_overlay() { [[ ":$(setting_in "$1" COMPOSE_FILE):" == *":$2:"* ]]; }
+
+# valid_copy_directory PATH : a directory for the screened key's copy, named by its whole path: parts of letters,
+# digits, '.', '_' and '-', none of them '.' or '..' (the same line as lean-pool-ctl's).
+valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
 
 # lean_container ENV_FILE : the Lean server's container of the instance whose settings ENV_FILE holds.
 lean_container() { echo "$(setting_in "$1" COMPOSE_PROJECT_NAME)-kimina-1"; }
@@ -874,7 +884,9 @@ require_firewall_tools() {
 }
 
 # A LAN-only inbound rule for one published container port, re-applied at boot. Separate from
-# kimina-firewall on purpose: it never touches a Lean server's own rules.
+# kimina-firewall on purpose: it never touches a Lean server's own rules. With no LAN_SUBNET (an empty
+# argument) the port is the docker bridges' alone, told by the interface a packet comes in on (docker0 and
+# Compose's br-*), so no host of a LAN is let in, whatever its addresses.
 #   install_lan_firewall NAME PORT LAN_SUBNET
 install_lan_firewall() {
   local name=$1 port=$2 subnet=$3
@@ -883,9 +895,10 @@ install_lan_firewall() {
   printf 'LEANPOOL_FW_PORT=%s\nLEANPOOL_FW_SUBNET=%s\n' "$port" "$subnet" > "/srv/lean-pool-firewall/$name.conf"
   cat > /usr/local/sbin/lean-pool-firewall <<'EOF'
 #!/usr/bin/env bash
-# Installed by the lean-pool installers. One inbound rule per NAME: the port only from the LAN subnet and the
-# docker bridges. Docker-published ports are forwarded, so ufw's INPUT rules never see them; DOCKER-USER
-# does, and it matches the ORIGINAL destination port.
+# Installed by the lean-pool installers. One inbound rule per NAME: the port only from the LAN subnet and the docker
+# bridges' addresses, or, for a rule that names no subnet, only from the docker bridges' interfaces. Docker-published
+# ports are forwarded, so ufw's INPUT rules never see them; DOCKER-USER does, and it matches the ORIGINAL
+# destination port.
 set -euo pipefail
 name=${2:-}
 [[ "$name" =~ ^[a-z0-9-]{1,24}$ ]] || { echo "usage: lean-pool-firewall apply|remove NAME" >&2; exit 2; }
@@ -904,8 +917,13 @@ case "${1:-}" in
     iptables -nL DOCKER-USER >/dev/null 2>&1 || { echo "lean-pool-firewall: no DOCKER-USER chain (is docker running?)" >&2; exit 1; }
     remove
     iptables -N "$chain"
-    iptables -A "$chain" -s "$LEANPOOL_FW_SUBNET" -j RETURN
-    iptables -A "$chain" -s 172.16.0.0/12 -j RETURN      # docker bridge networks
+    if [ -n "$LEANPOOL_FW_SUBNET" ]; then
+      iptables -A "$chain" -s "$LEANPOOL_FW_SUBNET" -j RETURN
+      iptables -A "$chain" -s 172.16.0.0/12 -j RETURN    # docker bridge networks
+    else
+      iptables -A "$chain" -i docker0 -j RETURN          # docker bridge networks, by their interfaces
+      iptables -A "$chain" -i br-+ -j RETURN
+    fi
     iptables -A "$chain" -s 127.0.0.0/8 -j RETURN
     iptables -A "$chain" -j DROP
     iptables -I DOCKER-USER 1 "${match[@]}" -j "$chain"
@@ -933,11 +951,11 @@ WantedBy=multi-user.target docker.service
 EOF
   systemctl daemon-reload
   if systemctl enable "lean-pool-firewall@$name.service" >/dev/null 2>&1 && systemctl restart "lean-pool-firewall@$name.service"; then
-    echo "port $port: reachable from $subnet and the docker bridges only (lean-pool-firewall@$name)"
+    echo "port $port: reachable from ${subnet:+$subnet and }the docker bridges only (lean-pool-firewall@$name)"
   else
     warn "could not apply the LAN rule for port $port (systemctl status lean-pool-firewall@$name)"
   fi
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  if [ -n "$subnet" ] && command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active'; then
     ufw allow from "$subnet" to any port "$port" proto tcp comment "$SITE_LABEL $name" >/dev/null
   fi
 }

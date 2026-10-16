@@ -14,6 +14,10 @@ from typing import Any
 
 NO_CACHE_FIELD = "no_cache"
 _INTERPRETED_FIELDS = frozenset({"snippets", NO_CACHE_FIELD})
+# What a check sent with the screened key may carry: the fields its answer is keyed or shaped by,
+# and Kimina's `reuse` left at its default. Nothing that bypasses the store, asks for a costlier
+# answer, or changes what an answer stored for the pool's own checks would hold.
+SCREENED_FIELDS = frozenset({"snippets", "timeout", "debug", "reuse", NO_CACHE_FIELD})
 
 
 class InvalidRequestError(ValueError):
@@ -58,6 +62,29 @@ def parse_check_request(body: object) -> CheckRequest:
             name: value for name, value in body.items() if name not in _INTERPRETED_FIELDS
         },
     )
+
+
+def screened_refusal(
+    body: Mapping[str, Any], request: CheckRequest, *, max_snippets: int, max_timeout: int
+) -> str | None:
+    """Return why the screened door does not take this request, or None if it does.
+
+    A screened request carries ``snippets``, ``timeout``, ``debug`` and ``reuse`` alone, with
+    ``reuse`` true and ``no_cache`` false where they are given, at most ``max_snippets``
+    snippets, and a timeout of at most ``max_timeout`` seconds.
+    """
+    unknown = sorted(name for name in body if name not in SCREENED_FIELDS)
+    if unknown:
+        return f"the screened door does not take `{unknown[0]}`"
+    if body.get("reuse", True) is not True:
+        return "the screened door takes `reuse` true alone"
+    if request.bypass_cache:
+        return "the screened door does not take `no_cache`"
+    if len(request.snippets) > max_snippets:
+        return f"a check at the screened door carries at most {max_snippets} snippets"
+    if request.timeout is not None and request.timeout > max_timeout:
+        return f"a check at the screened door has a timeout of at most {max_timeout} seconds"
+    return None
 
 
 def _read_snippets(raw_snippets: object) -> tuple[Snippet, ...]:

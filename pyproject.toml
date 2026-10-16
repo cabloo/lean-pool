@@ -129,6 +129,7 @@ module = [
     "test_install_read_only",
     "test_install_reaping",
     "test_install_run",
+    "test_install_screened_door",
     "test_install_tls_front",
     "test_install_worker_sandbox",
 ]

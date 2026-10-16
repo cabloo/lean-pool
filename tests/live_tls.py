@@ -27,6 +27,7 @@ import aiohttp
 from live_pool import WORKERS, LivePool, RunningHaproxy, free_port, free_port_run
 from tls_support import ThrowawayAuthority, strict_client_context
 
+from leanpool.cache import CacheSettings
 from leanpool.haproxy import BoxSettings, LeanServer, PoolSettings, TlsSettings, render_box_config
 
 PROXY_CLIENT_NAME = "lean-pool-proxy"
@@ -116,7 +117,11 @@ class BoxFront:
 
 @dataclass(kw_only=True)
 class TlsLivePool(LivePool):
-    """The pool proxy with TLS, in front of the cache and of the boxes' TLS fronts."""
+    """The pool proxy with TLS, in front of the cache and of the boxes' TLS fronts.
+
+    With ``screened_door_port`` the proxy also opens the screened door there, and with
+    ``screened_api_key`` the cache takes that second key.
+    """
 
     certificates: PoolCertificates
     boxes: list[BoxFront]
@@ -124,6 +129,9 @@ class TlsLivePool(LivePool):
     lean_timeout_seconds: int = 60
     server_wait_seconds: int = 60
     margin_seconds: int = 30
+    screened_door_port: int | None = None
+    screened_api_key: str | None = None
+    screened_in_flight: int = WORKERS  # as the installer gives it: the pool's workers
 
     def __post_init__(self) -> None:
         if self.agent_tunnel_port == 0:
@@ -132,6 +140,11 @@ class TlsLivePool(LivePool):
     @property
     def url(self) -> str:
         return f"https://127.0.0.1:{self.public_port}"
+
+    @property
+    def door_url(self) -> str:
+        assert self.screened_door_port is not None, "this pool has no screened door"
+        return f"https://127.0.0.1:{self.screened_door_port}"
 
     @property
     def settings(self) -> PoolSettings:
@@ -146,6 +159,15 @@ class TlsLivePool(LivePool):
                 client_pem=str(self.certificates.proxy_client_pem),
                 agent_tunnel_port=self.agent_tunnel_port,
             ),
+            screened_door_port=self.screened_door_port,
+        )
+
+    @property
+    def cache_settings(self) -> CacheSettings:
+        return dataclasses.replace(
+            super().cache_settings,
+            screened_api_key=self.screened_api_key,
+            screened_in_flight=None if self.screened_api_key is None else self.screened_in_flight,
         )
 
     @property

@@ -12,11 +12,17 @@ from collections.abc import AsyncIterator, Sequence
 from aiohttp import web
 
 from leanpool.cache.metrics import render_cache_metrics
-from leanpool.cache.request import InvalidRequestError, Snippet, parse_check_request
+from leanpool.cache.request import (
+    InvalidRequestError,
+    Snippet,
+    parse_check_request,
+    screened_refusal,
+)
 from leanpool.cache.service import CheckService
 from leanpool.cache.settings import CacheSettings
 from leanpool.cache.store import AsyncResultStore
 from leanpool.cache.upstream import UpstreamClient, UpstreamFailure, new_upstream_session
+from leanpool.doors import DOOR_HEADER, SCREENED_DOOR
 from leanpool.metrics import CACHE_METRICS_PATH, CONTENT_TYPE
 from leanpool.screen import screen
 from leanpool.signals import PRIORITY_HEADER, is_background
@@ -52,6 +58,7 @@ async def _service_lifetime(application: web.Application) -> AsyncIterator[None]
         upstream=UpstreamClient(session, settings.upstream_url, settings.hop_header),
         pin=settings.pin,
         exhaustion_patterns=settings.exhaustion_patterns,
+        screened_in_flight=settings.screened_in_flight,
     )
     yield
     await session.close()
@@ -66,9 +73,12 @@ async def _handle_check(request: web.Request) -> web.Response:
     status and body. The snippets that did get a definitive answer are already stored, so the
     client's retry costs the Lean servers only what was missing.
 
-    A request sent with the screened key is read by the screen first; it is then served like any
-    other, from the store or the servers, and shares flights and stored answers with the pool's
-    own checks (an answer is the servers' work, whoever asked).
+    A request sent with the screened key must keep to the screened door's fields and limits
+    (``screened_refusal``) and pass the screen; it is then served like any other, from the store
+    or the servers, and shares stored answers with the pool's own checks (an answer is the
+    servers' work, whoever asked). The checks it starts at the servers take places of their own
+    (``CheckService``). Each key is taken at its own door alone (``leanpool.doors``): the
+    screened key at the screened door, the pool's everywhere else.
     """
     settings = request.app[_SETTINGS]
     sender = _authenticate(request, settings)
@@ -77,11 +87,24 @@ async def _handle_check(request: web.Request) -> web.Response:
     if settings.hop_header in request.headers:
         return _error(_LOOP_DETECTED, "this request has already passed through the cache")
     try:
-        check_request = parse_check_request(await _read_json(request))
+        body = await _read_json(request)
+        check_request = parse_check_request(body)
     except InvalidRequestError as error:
         return _error(_UNPROCESSABLE, str(error))
     authorization = request.headers.get("Authorization")
-    if sender is _Sender.SCREENED:
+    screened = sender is _Sender.SCREENED
+    if screened:
+        # parse_check_request took only an object, and settings with a screened key have a limit.
+        assert isinstance(body, dict)
+        assert settings.screened_in_flight is not None
+        reason = screened_refusal(
+            body,
+            check_request,
+            max_snippets=settings.screened_in_flight,
+            max_timeout=settings.screened_max_timeout_seconds,
+        )
+        if reason is not None:
+            return _error(_UNPROCESSABLE, reason)
         refusal = _refuse_unscreened(check_request.snippets)
         if refusal is not None:
             return refusal
@@ -91,7 +114,9 @@ async def _handle_check(request: web.Request) -> web.Response:
     background = is_background(request.headers.get(PRIORITY_HEADER))
     outcomes = await asyncio.gather(
         *(
-            service.check(snippet, check_request, authorization, background=background)
+            service.check(
+                snippet, check_request, authorization, background=background, screened=screened
+            )
             for snippet in check_request.snippets
         )
     )
@@ -107,6 +132,8 @@ async def _handle_check(request: web.Request) -> web.Response:
 
 async def _handle_status(request: web.Request) -> web.Response:
     settings = request.app[_SETTINGS]
+    if _at_screened_door(request):
+        return _error(_UNAUTHORIZED, "the screened door takes checks alone")
     refusal = _refuse_unauthenticated(request, settings.api_key)
     if refusal is not None:
         return refusal
@@ -139,25 +166,41 @@ class _Sender(enum.Enum):
     SCREENED = enum.auto()
 
 
+def _at_screened_door(request: web.Request) -> bool:
+    """Whether the proxy says this request came in by the screened door (``leanpool.doors``)."""
+    return request.headers.get(DOOR_HEADER) == SCREENED_DOOR
+
+
 def _authenticate(request: web.Request, settings: CacheSettings) -> _Sender | web.Response:
     """Return which key the request carries, or a 401.
 
-    Both keys are compared, each in constant time, whichever matches, so the reply's timing says
-    nothing about either key or about which one a token came close to.
+    Each key is taken at its own door alone: the screened key only from a request the screened
+    door forwarded, the pool's key only from one it did not. A token that is the other door's key
+    is refused like any other. Both keys are compared, each in constant time, whichever matches,
+    so the reply's timing says nothing about either key or about which one a token came close to.
     """
+    screened_door = _at_screened_door(request)
     if settings.screened_api_key is None:
         refusal = _refuse_unauthenticated(request, settings.api_key)
-        return _Sender.POOL if refusal is None else refusal
+        if refusal is not None:
+            return refusal
+        if screened_door:
+            return _error(_UNAUTHORIZED, "the screened door takes the screened key alone")
+        return _Sender.POOL
     authorization = request.headers.get("Authorization")
     if not authorization:
         return _error(_UNAUTHORIZED, "Missing API key")
     token = authorization.removeprefix(_BEARER_PREFIX).strip().encode("utf-8")
     pool = hmac.compare_digest(token, (settings.api_key or "").encode("utf-8"))
     screened = hmac.compare_digest(token, settings.screened_api_key.encode("utf-8"))
-    if pool:
+    if pool and not screened_door:
         return _Sender.POOL
-    if screened:
+    if screened and screened_door:
         return _Sender.SCREENED
+    if pool:
+        return _error(_UNAUTHORIZED, "the screened door takes the screened key alone")
+    if screened:
+        return _error(_UNAUTHORIZED, "the screened key is taken at the screened door alone")
     return _error(_UNAUTHORIZED, "Invalid API key")
 
 

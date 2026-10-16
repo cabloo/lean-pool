@@ -21,12 +21,14 @@ clients| HAProxy :18100 (HTTPS)               |   mutual   | TLS front :18001 --
 |---|---|---|
 | 18100 | the pool's host | The one address clients use, over HTTPS. |
 | 18110 | the pool's host, while a join window is open | The [join service](joining.md). |
+| 18120 | the pool's host, on the docker0 bridge's address, where the pool opens it | The [screened door](#a-screened-door): checks alone, through the cache's screen, for machines you do not own. |
 | the instance's port (18001 in the example site) | every box | The box's TLS front, to its Lean server. It lets in the pool proxy's certificate and nothing else. |
 | that port + 200 | every box | The same front, to the box's usage agent. |
 | 18101, 18102, 18103 | inside the proxy's network namespace | The proxy's door to the Lean servers, the cache, HAProxy's statistics. Loopback only; never published. |
 
-The installers' firewall lets the LAN subnet and the Docker bridges reach the published ports,
-and nothing else. Nothing in the pool needs a GPU.
+The installers' firewall lets the LAN subnet and the Docker bridges reach the published ports
+(the screened door: what arrives from a Docker bridge's interface alone), and nothing else. Nothing
+in the pool needs a GPU.
 
 ## What a box needs
 
@@ -129,9 +131,10 @@ only checks on the Mathlib you pinned is what catches a box that has another. Ev
 the pool needs `--admit-cases DIR`, and it replaces the pool's copy of the cases.
 
 Every step of both is safe to run again. A re-run keeps the API key, the authority, every
-certificate, the server list, and what the instance's `kimina.env` holds (workers, CPUs, CPU
-priority, a TLS front). Options are not remembered: run each line again with the options it
-had. Left out, the pool's `--port` and `--lean-timeout` and the instance's `--port` go back to
+certificate, the server list, what the instance's `kimina.env` holds (workers, CPUs, CPU
+priority, a TLS front), and the pool's [screened door](#a-screened-door) as it was, open or
+closed, with its key and its copy's directory. Other options are not remembered: run each line
+again with the options it had. Left out, the pool's `--port` and `--lean-timeout` and the instance's `--port` go back to
 their defaults, a run without `--operator-key` removes the operator's SSH door (a key that runs
 `kimina-ctl` alone; `install.sh --help`), and one without `--no-agent` or `--no-firewall` adds
 the usage agent or the firewall back.
@@ -141,7 +144,8 @@ What they leave on the host:
 | Where | What |
 |---|---|
 | `/srv/kimina-NAME` | The instance: `kimina.env` (its settings and its key, readable by root only; `COMPOSE_FILE` names the files it runs), the compose files of `deploy/lean-server`, and its build files. Instance 1 is `/srv/kimina`. |
-| `/srv/lean-pool-NAME` | The pool: `pool.env`, the server list, the certificates, the admission cases, the join bundle. |
+| `/srv/lean-pool-NAME` | The pool: `pool.env`, the server list, the certificates, the admission cases, the join bundle, and with the screened door its key (`screened-api-key`). |
+| the screened key's copy | With `--screened-key-copy DIR`: `api-key` and `ca.crt` in DIR, owned by DIR's owner. An uninstall, even with `--purge`, leaves them. |
 | `/usr/local/bin/kimina-ctl` | Every operation on the Lean servers of this host. |
 | `/usr/local/sbin/lean-pool-ctl` | Every operation on a pool. |
 
@@ -214,7 +218,8 @@ health check until it is resumed, and the pause survives a reload and a restart.
 A reload is not a restart: HAProxy starts new workers on the new configuration while the old
 ones finish the checks they hold, so a reload drops none. `lean-pool-ctl upstream reload`
 reloads by hand, `restart` restarts the proxy and the cache, and `cache-stop` and `cache-start`
-stop and start the cache alone: checks keep flowing while it is stopped, uncached.
+stop and start the cache alone: checks at the front door keep flowing while it is stopped,
+uncached, and the screened door answers 503.
 
 ### On a Lean server box
 
@@ -288,6 +293,31 @@ server runs with; the next installer run tries both again. `kimina-ctl [@NAME] s
 `sandbox off` keeps it off through every later install. `sandbox on` turns it back on where
 this box's last probe passed; elsewhere it says why, exits 1, and clears the `off` setting, so
 that the installer's next run asks the image again.
+
+### A screened door
+
+For machines whose owner you do not know, such as rented ones, the pool can open a second way in
+that takes checks alone, through the cache's [screen](cache.md#the-screened-key), with a key of its
+own ([the screened door](cache.md#the-screened-door)):
+
+```sh
+sudo bash install.sh --site ~/my-site --proxy upstream --admit-cases ../../examples/admission-cases \
+  --screened-door --screened-key-copy /srv/hand-out/lean-pool
+sudo lean-pool-ctl upstream screened-key new     # a new key; the old one is refused from then on
+sudo lean-pool-ctl upstream screened-key copy    # the key and the authority written to the copy again
+```
+
+It is published on the docker0 bridge's address alone (port 18120) and firewalled to what arrives
+from a docker bridge's interface: only the containers and the programs of the pool's host reach it,
+and something there passes it on (an SSH tunnel to the machine, say). `--screened-key-copy DIR`
+names the directory that program reads the key and the pool authority's certificate from; the
+files are owned by that directory's owner. DIR's parent must exist, belong to that program's user,
+and be reached through no link. The install's summary has a `screened` line, with where the door is
+and where its key went; a copy that could not be written is a warning there, not a failed install.
+`lean-pool-ctl upstream status` says the same, and never prints the key. The door stays open
+through every re-run until `--no-screened-door`. Closing it does not retire the key: `screened-key
+new` does, open or closed. The door takes as many checks as the pool's workers, counted at the
+install (a server that joins later counts at the next install run).
 
 ### Watching it
 
@@ -425,6 +455,7 @@ at its join; take it out of the server list with `remove-backend` on the pool's 
 | One server takes many times longer than the others, or drops in and out | Its box is busy with other work and is sent more than fits beside it: [a box that also does other work](#a-box-that-also-does-other-work). |
 | The pool answers 503 at once, with servers up | Every server is drained: no box has room beside its other work, or its memory is short ([the pool's size](clients.md#the-pools-size)). It ends by itself. |
 | A server answers from the LAN but not from a container on its host | The firewall lets in the LAN subnet and Docker's bridge networks (172.16.0.0/12) only. |
+| The screened door answers 503 `the screened door is full` | Its senders have as many checks at the servers and waiting as the pool has workers ([the screened key](cache.md#the-screened-key)); the client retries. |
 
 ## Without the installers
 

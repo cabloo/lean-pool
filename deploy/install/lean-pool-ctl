@@ -26,7 +26,13 @@
 #   lean-pool-ctl NAME join-open [--minutes N]                   let ONE new box join: prints the command to run
 #                                                                there, then waits for it (default 120 minutes)
 #   lean-pool-ctl NAME logs [N] | restart | reload | render [--check|--no-reload]
-#   lean-pool-ctl NAME cache-stop | cache-start                  the cache only: checks keep flowing, uncached
+#   lean-pool-ctl NAME screened-key new                          a new key for the screened door: the cache is
+#                                                                made again with it, the copy rewritten, and the
+#                                                                old key is refused from then on
+#   lean-pool-ctl NAME screened-key copy                         the key and the authority's certificate written
+#                                                                again into the pool's copy directory
+#   lean-pool-ctl NAME cache-stop | cache-start                  the cache only: the front door's checks keep flowing,
+#                                                                uncached; the screened door answers 503
 #
 # A server joins ONLY after the admission test passes against it alone, and a config is installed ONLY
 # after HAProxy itself has validated it: a failure at any step leaves the pool exactly as it was.
@@ -66,6 +72,9 @@ valid_address()     { [[ "$1" =~ ^[A-Za-z0-9.-]{1,120}:[0-9]{2,5}$ ]]; }
 valid_count()       { [[ "$1" =~ ^[0-9]{1,3}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 256 ]; }
 valid_port()        { [[ "$1" =~ ^[0-9]{2,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 valid_minutes()     { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 1440 ]; }
+# The screened key's copy: an absolute path of letters, digits, '.', '_' and '-' parts, none '.' or '..'
+# (the same line as pool-lib.sh's).
+valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
 
 # Validate the whole request before touching anything.
 case "$verb" in
@@ -82,6 +91,7 @@ case "$verb" in
   remove-backend|pause|resume) [ "$#" -eq 1 ] && valid_listed_name "$1" || usage ;;
   set-workers) [ "$#" -eq 2 ] && valid_listed_name "$1" && valid_count "$2" || usage ;;
   join-open) [ "$#" -eq 0 ] || { [ "$#" -eq 2 ] && [ "$1" = --minutes ] && valid_minutes "$2"; } || usage ;;
+  screened-key) [ "$#" -eq 1 ] && { [ "$1" = new ] || [ "$1" = copy ]; } || usage ;;
   *) usage ;;
 esac
 
@@ -107,6 +117,16 @@ MAX_REQUEST_BYTES=$(setting LEANPOOL_CACHE_MAX_REQUEST_BYTES)
 JOIN_HOST=$(setting LEANPOOL_JOIN_PUBLIC_HOST)
 JOIN_PORT=$(setting LEANPOOL_JOIN_PUBLIC_PORT)
 INSTALLER_VERSION=$(setting LEANPOOL_HAPROXY_INSTALLER_VERSION)
+# The screened door (docs/cache.md): open or not, where it is published, and where its key's copy is written.
+SCREENED_DOOR=$(setting LEANPOOL_SCREENED_DOOR)
+SCREENED_DOOR_ADDRESS=$(setting LEANPOOL_SCREENED_DOOR_ADDRESS)
+SCREENED_DOOR_PORT=$(setting LEANPOOL_SCREENED_DOOR_PORT)
+SCREENED_KEY_COPY=$(setting LEANPOOL_SCREENED_KEY_COPY)
+SCREENED_KEY=$DIR/screened-api-key
+if [ "$SCREENED_DOOR" = on ]; then
+  valid_port "$SCREENED_DOOR_PORT" && [[ "$SCREENED_DOOR_ADDRESS" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+    || die "$ENV_FILE opens the screened door without a usable LEANPOOL_SCREENED_DOOR_ADDRESS and LEANPOOL_SCREENED_DOOR_PORT - re-run install.sh --proxy $POOL"
+fi
 # The site this host was installed for (written by the installer): its name prefix, which names its images and
 # its helpers' directory, and its LAN's domain. Containers, the network and the volume have Compose's own names.
 SITE_ENV=/etc/lean-pool/site.env
@@ -169,12 +189,14 @@ stage_certificates() {    # WORKDIR : the pool's public certificates, as WORKDIR
 }
 
 render_and_validate() {   # WORKDIR holds `servers`; writes WORKDIR/haproxy.cfg and the facts it names; fails unless HAProxy accepts them
-  local work=$1
+  local work=$1 door_port=""
+  [ "$SCREENED_DOOR" != on ] || door_port=$SCREENED_DOOR_PORT
   stage_certificates "$work" || { echo "the pool's public certificates could not be read; nothing changed" >&2; return 1; }
   tool "$work" leanpool-haproxy-config render --servers /work/servers --public-port "$PUBLIC_PORT" \
       --lean-timeout "$LEAN_TIMEOUT" --server-wait "$SERVER_WAIT" ${MAX_REQUEST_BYTES:+--max-request-bytes "$MAX_REQUEST_BYTES"} \
       --tls-front-door-pem "$TLS_MOUNT/front.pem" --tls-ca-file "$TLS_MOUNT/ca.crt" --tls-client-pem "$TLS_MOUNT/proxy-client.pem" \
       --pool-metrics "/work/$POOL_METRICS" --certificates /work/certs ${INSTALLER_VERSION:+--installer-version "$INSTALLER_VERSION"} \
+      ${door_port:+--screened-door-port "$door_port"} \
       > "$work/haproxy.cfg" || { echo "the server list was refused; nothing changed" >&2; return 1; }
   # A pool is always rendered with TLS: a config that says it is unencrypted is never installed.
   if grep -q '^# UNENCRYPTED' "$work/haproxy.cfg"; then echo "the generated config is not TLS; nothing changed" >&2; return 1; fi
@@ -333,6 +355,88 @@ for path in sorted(pathlib.Path("/certs").rglob("*.crt")):
     print(f"--- certificate {str(path.relative_to('/certs')):32s} {days or 'unreadable':>6s} days left")
 PY
   if container_runs "$JOIN_SERVICE"; then echo "--- a join window is open (port $JOIN_PORT)"; fi
+  # The screened door: where it is open and where its key's copy goes. Never the key itself.
+  if [ "$SCREENED_DOOR" = on ]; then
+    echo "--- screened door: on, https://$SCREENED_DOOR_ADDRESS:$SCREENED_DOOR_PORT; key copy ${SCREENED_KEY_COPY:-not written (no directory named)}"
+  else
+    echo "--- screened door: off"
+  fi
+}
+
+# The screened key's copy (docs/cache.md): the key and the pool authority's certificate, written into the directory
+# the pool names, for the program there that hands the key to its clients. Its path is walked from / one directory
+# at a time, none of them a link, so nobody who owns a directory on the way can send the copy elsewhere. A missing
+# last directory is made, 0700, with its parent's owner; its parent must exist. Each file is owned by the
+# directory's owner and is made new beside the old one, then moved over it, and is never written, chowned or
+# chmodded by name, so a link the owner planted in the directory changes nothing outside it.
+write_screened_copy() {
+  [ -n "$SCREENED_KEY_COPY" ] \
+    || die "pool $POOL names no directory for the screened key's copy: re-run install.sh --proxy $POOL --screened-key-copy DIR"
+  valid_copy_directory "$SCREENED_KEY_COPY" \
+    || die "$ENV_FILE names an unusable LEANPOOL_SCREENED_KEY_COPY - re-run install.sh --proxy $POOL --screened-key-copy DIR"
+  [ -s "$SCREENED_KEY" ] || die "the screened door has no key ($SCREENED_KEY) - re-run install.sh --proxy $POOL"
+  command -v python3 >/dev/null || die "python3 is needed to write the screened key's copy"
+  # -I: the current directory, and every PYTHON variable, are kept out of a program run as root.
+  python3 -I - "$SCREENED_KEY_COPY" "$SCREENED_KEY" "$DIR/certs/ca.crt" <<'PY' \
+    || die "the screened key's copy could not be written to $SCREENED_KEY_COPY"
+import errno
+import os
+import secrets
+import sys
+
+copy, key, authority = sys.argv[1:]
+*above, name = copy.strip("/").split("/")
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def write(directory, source, target, mode, owner):
+    with open(source, "rb") as given:
+        data = given.read()
+    temporary = f".{target}.{secrets.token_hex(8)}"
+    out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    try:
+        try:
+            os.fchown(out, owner.st_uid, owner.st_gid)
+            os.fchmod(out, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(out, view):]
+            os.fsync(out)
+        finally:
+            os.close(out)
+        os.rename(temporary, target, src_dir_fd=directory, dst_dir_fd=directory)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except OSError:
+            pass
+        raise
+
+
+try:
+    parent = os.open("/", DIRECTORY)
+    for part in above:
+        following = os.open(part, DIRECTORY, dir_fd=parent)
+        os.close(parent)
+        parent = following
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent)
+        made = True
+    except FileExistsError:
+        made = False
+    directory = os.open(name, DIRECTORY, dir_fd=parent)
+    if made:
+        top = os.fstat(parent)
+        os.fchown(directory, top.st_uid, top.st_gid)
+        os.fchmod(directory, 0o700)
+    owner = os.fstat(directory)
+    for source, target, mode in ((key, "api-key", 0o600), (authority, "ca.crt", 0o644)):
+        write(directory, source, target, mode, owner)
+except OSError as error:
+    why = "a link or a file is in its path" if error.errno in (errno.ELOOP, errno.ENOTDIR) else error.strerror
+    sys.exit(f"lean-pool-ctl: {copy}: {why} ({error.filename or 'its path'})")
+PY
+  echo "the screened key and the pool's authority are copied to $SCREENED_KEY_COPY (api-key, ca.crt), owned by $(stat -c '%U:%G' "$SCREENED_KEY_COPY")"
 }
 
 case "$verb" in
@@ -677,6 +781,40 @@ EOF
     docker start "$CACHE" >/dev/null && echo "cache started"
     ;;
 
+  screened-key)
+    if [ "$1" = copy ]; then
+      [ "$SCREENED_DOOR" = on ] || die "pool $POOL's screened door is closed: open it with install.sh --proxy $POOL --screened-door"
+      write_screened_copy
+      exit 0
+    fi
+    # new: made beside the old key and moved over it. With the door open, the cache is then made again to read
+    # it, and from then on the old key is refused; with it closed no cache holds a screened key, and the new one
+    # is the one taken when it opens. The pool's own key and every other container are left as they are.
+    [ "$SCREENED_DOOR" = on ] || [ -e "$SCREENED_KEY" ] \
+      || die "pool $POOL has no screened key: open its door with install.sh --proxy $POOL --screened-door"
+    [[ "$IMAGE_GID" =~ ^[0-9]{1,10}$ ]] || die "$ENV_FILE has no usable LEANPOOL_IMAGE_GID - re-run install.sh --proxy $POOL"
+    fresh=$(mktemp "$DIR/.screened-api-key.XXXXXX") || die "could not make the new key's file"
+    python3 -I -c 'import secrets; print(secrets.token_hex(32))' > "$fresh" && [ -s "$fresh" ] \
+      && chown root:"$IMAGE_GID" "$fresh" && chmod 0640 "$fresh" \
+      || { rm -f "$fresh"; die "could not make a new screened key; the old one is unchanged"; }
+    mv -f "$fresh" "$SCREENED_KEY" || { rm -f "$fresh"; die "could not put the new screened key in place; the old one is unchanged"; }
+    echo "made a new screened key ($SCREENED_KEY; it is never printed)"
+    if [ "$SCREENED_DOOR" = on ]; then
+      # The old container holds the old key's file: only a NEW container, running, proves the old key refused.
+      before=$(docker inspect -f '{{.Id}}' "$CACHE" 2>/dev/null || true)
+      said=$("${COMPOSE[@]}" up -d --force-recreate --no-deps cache 2>&1); made=$?
+      echo "$said" | tail -n 3
+      after=$(docker inspect -f '{{.Id}}' "$CACHE" 2>/dev/null || true)
+      [ "$made" -eq 0 ] && [ -n "$after" ] && [ "$after" != "$before" ] && container_runs "$CACHE" \
+        || die "the cache was not made again with the new key, so it may still take the old one: sudo lean-pool-ctl $POOL logs 100"
+    else
+      echo "the screened door is closed: the new key is the one its cache takes when it opens"
+    fi
+    if [ -n "$SCREENED_KEY_COPY" ]; then write_screened_copy
+    else echo "pool $POOL names no directory for a copy: the new key is in $SCREENED_KEY alone"
+    fi
+    ;;
+
   render)
     # Rebuild haproxy.cfg from the current server list and settings (install, or after a settings change).
     # --check validates and installs nothing; --no-reload installs without telling the running proxy.
@@ -685,7 +823,9 @@ EOF
     render_and_validate "$WORK" || exit 5
     [ "${1:-}" != --check ] || { echo "the config is valid; nothing was installed"; exit 0; }
     if [ "${1:-}" = --no-reload ]; then install_and_reload "$WORK" keep; else install_and_reload "$WORK"; fi
-    # The generator states how long the cache must wait for the checkers; install-pool.sh reads it here.
-    sed -n 's/^# The cache must wait at least \([0-9]*\)s.*/cache_upstream_timeout=\1/p' "$DIR/haproxy/haproxy.cfg"
+    # The generator states how long the cache must wait for the checkers, and the workers the pool lists that are
+    # not paused (the screened door's limit, which the cache is given too); install-pool.sh reads both here.
+    sed -n -e 's/^# The cache must wait at least \([0-9]*\)s.*/cache_upstream_timeout=\1/p' \
+      -e 's/^# Pool: [0-9]* Lean servers, \([0-9]*\) workers\.$/pool_workers=\1/p' "$DIR/haproxy/haproxy.cfg"
     ;;
 esac

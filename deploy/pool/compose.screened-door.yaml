@@ -1,0 +1,28 @@
+# The screened door (docs/cache.md), added after the other files where the pool opens it:
+#
+#   docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml -f compose.screened-door.yaml up -d
+#
+# with haproxy/haproxy.cfg rendered with --screened-door-port. The door is a second HTTPS port of the proxy,
+# published on ONE address of this host (the installer gives it the docker0 bridge's, which containers on this
+# host reach and the LAN does not), and it leads to the cache alone. The cache takes a second key, beside this
+# file in ./screened-api-key, readable by the cache's group (10001) and nobody else: a check sent with it is
+# screened, and it is taken at this door alone. LEANPOOL_CACHE_SCREENED_IN_FLIGHT bounds the checks those senders
+# start (the installer gives it the pool's workers), and LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS the longest Lean
+# timeout they may ask for (the installer gives it the pool's).
+
+services:
+  haproxy:
+    ports:
+      - "${LEANPOOL_SCREENED_DOOR_ADDRESS:?set LEANPOOL_SCREENED_DOOR_ADDRESS to the one host address the screened door is published on}:${LEANPOOL_SCREENED_DOOR_PORT:-18120}:${LEANPOOL_SCREENED_DOOR_PORT:-18120}"
+
+  cache:
+    environment:
+      LEANPOOL_CACHE_SCREENED_API_KEY_FILE: /run/secrets/screened_api_key
+      LEANPOOL_CACHE_SCREENED_IN_FLIGHT: "${LEANPOOL_CACHE_SCREENED_IN_FLIGHT:?set LEANPOOL_CACHE_SCREENED_IN_FLIGHT to how many checks the screened door's senders may have at the servers at once}"
+      LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS: "${LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS:-300}"
+    secrets:
+      - screened_api_key
+
+secrets:
+  screened_api_key:
+    file: ./screened-api-key

@@ -15,11 +15,15 @@ from leanpool.cache.keys import check_key
 from leanpool.cache.policy import is_storable
 from leanpool.cache.request import CheckRequest, Snippet
 from leanpool.cache.store import AsyncResultStore
-from leanpool.cache.upstream import UpstreamClient, UpstreamFailure
+from leanpool.cache.upstream import UpstreamAnswer, UpstreamClient, UpstreamFailure
 
 logger = logging.getLogger(__name__)
 
 CACHED_FIELD = "cached"
+_SERVICE_UNAVAILABLE = 503
+DOOR_FULL = UpstreamFailure(
+    status=_SERVICE_UNAVAILABLE, body=b'{"detail":"the screened door is full"}'
+)
 
 
 @dataclass
@@ -49,10 +53,46 @@ class _SharedAnswer:
 
 @dataclass(frozen=True)
 class _Flight:
-    """One check on its way to the Lean servers, and the priority it was sent with."""
+    """One check on its way to the Lean servers, the priority it was sent with, and whether a
+    sender of the screened key started it."""
 
     task: asyncio.Task[_SharedAnswer | UpstreamFailure]
     background: bool
+    screened: bool = False
+
+
+class _ScreenedPlaces:
+    """How many checks the screened key's senders started may be at the Lean servers at once.
+
+    A flight they started takes one of ``limit`` places for as long as it is at the servers, and
+    keeps it after its sender has gone, since the flight runs on. At most ``limit`` more wait for a
+    place; one past that is refused at once (``DOOR_FULL``), and the client retries. An answer
+    from the store, or a flight already under way, takes no place.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.waiting = 0
+        self._places = asyncio.Semaphore(limit)
+
+    async def forward(
+        self,
+        upstream: UpstreamClient,
+        body: dict[str, Any],
+        authorization: str | None,
+        background: bool,
+    ) -> UpstreamAnswer | UpstreamFailure:
+        if self._places.locked() and self.waiting >= self.limit:
+            return DOOR_FULL
+        self.waiting += 1
+        try:
+            await self._places.acquire()
+        finally:
+            self.waiting -= 1
+        try:
+            return await upstream.check(body, authorization, background=background)
+        finally:
+            self._places.release()
 
 
 class CheckService:
@@ -69,12 +109,14 @@ class CheckService:
         upstream: UpstreamClient,
         pin: str,
         exhaustion_patterns: Sequence[str],
+        screened_in_flight: int | None = None,
     ) -> None:
         self._store = store
         self._upstream = upstream
         self._pin = pin
         self._exhaustion_patterns = tuple(exhaustion_patterns)
         self._flights: dict[bytes, _Flight] = {}
+        self._screened = None if screened_in_flight is None else _ScreenedPlaces(screened_in_flight)
         self.counters = CheckCounters()
 
     async def check(
@@ -84,16 +126,21 @@ class CheckService:
         authorization: str | None,
         *,
         background: bool = False,
+        screened: bool = False,
     ) -> dict[str, Any] | UpstreamFailure:
         """Return the result for ``snippet`` under its own id, or the upstream failure.
 
         ``background`` is the caller's priority: a background check waits behind every normal
-        check for a Lean worker, and is forwarded saying so.
+        check for a Lean worker, and is forwarded saying so. ``screened`` says the caller sent
+        the screened key, whose checks the service was given a limit for; such a request never
+        bypasses the store (``leanpool.cache.request.screened_refusal``).
         """
+        if screened and (self._screened is None or request.bypass_cache):
+            raise ValueError("a screened check needs the service's limit, and the store")
         if request.bypass_cache:
             self.counters.bypasses += 1
             return await self._forward_untouched(snippet, request, authorization, background)
-        outcome = await self._shared_answer(snippet, request, authorization, background)
+        outcome = await self._shared_answer(snippet, request, authorization, background, screened)
         if isinstance(outcome, UpstreamFailure):
             return outcome
         return _result_for_caller(snippet.identifier, outcome, include_diagnostics=request.debug)
@@ -119,6 +166,7 @@ class CheckService:
         request: CheckRequest,
         authorization: str | None,
         background: bool,
+        screened: bool,
     ) -> _SharedAnswer | UpstreamFailure:
         """Wait for the one answer to this check, starting the work only if nobody has.
 
@@ -131,16 +179,22 @@ class CheckService:
         which may sit behind every normal check in the proxy's queue. It starts its own, later
         callers join that one, and the background caller keeps the flight it started. A
         background check that meets a normal flight joins it.
+
+        Across the two keys, the same way: a check sent with the pool's key never waits on a
+        flight a screened sender started, which may be refused for want of a place; it starts
+        its own. A screened check that meets one of the pool's flights joins it.
         """
         key = check_key(self._pin, snippet.code, request.timeout)
         flight = self._flights.get(key)
-        if flight is not None and flight.background and not background:
+        if flight is not None and (
+            (flight.background and not background) or (flight.screened and not screened)
+        ):
             flight = None
         if flight is None:
             task = asyncio.create_task(
-                self._answer(key, snippet, request, authorization, background)
+                self._answer(key, snippet, request, authorization, background, screened)
             )
-            flight = _Flight(task=task, background=background)
+            flight = _Flight(task=task, background=background, screened=screened)
             self._flights[key] = flight
             task.add_done_callback(functools.partial(self._forget, key, flight))
         else:
@@ -159,6 +213,7 @@ class CheckService:
         request: CheckRequest,
         authorization: str | None,
         background: bool,
+        screened: bool,
     ) -> _SharedAnswer | UpstreamFailure:
         stored_fields = await self._lookup(key)
         if stored_fields is not None:
@@ -167,9 +222,11 @@ class CheckService:
         self.counters.misses += 1
         # Diagnostics are always requested, so the stored answer can serve a later caller who
         # asks for them; a caller who did not ask has them removed from its own copy.
-        reply = await self._upstream.check(
-            _upstream_body(snippet, request, debug=True), authorization, background=background
-        )
+        body = _upstream_body(snippet, request, debug=True)
+        if screened and self._screened is not None:
+            reply = await self._screened.forward(self._upstream, body, authorization, background)
+        else:
+            reply = await self._upstream.check(body, authorization, background=background)
         if isinstance(reply, UpstreamFailure):
             return reply
         fields = {name: value for name, value in reply.result.items() if name != "id"}

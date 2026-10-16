@@ -12,8 +12,12 @@ The generated configuration (HAProxy 3.0 syntax) has these parts:
   configuration (``PoolSettings.pool_metrics_file``), and ``GET /metrics/cache`` with a 503
   while the cache is down.
 * frontend ``checkers_door`` on loopback, where the cache sends what it could not answer.
+* frontend ``screened_door``, when the settings open it (``PoolSettings.screened_door_port``): a
+  second HTTPS way in, for checks sent with the cache's screened key. It answers ``GET /health``
+  as the front door does and sends ``POST /api/check`` to the cache alone, with no way round it.
 * backend ``cache``: the cache service, with the checkers door as its backup.
 * backend ``cache_metrics``: the cache service alone, for ``GET /metrics/cache``.
+* backend ``screened_cache``, with the screened door: the cache service alone, no backup.
 * backend ``checkers``: the Lean servers, least connections first, never more concurrent checks
   per server than it has workers, or than the open slots its usage agent states; weighted by
   what the agent reports. A health check that waits for a slow answer: a busy server is slow,
@@ -45,6 +49,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from leanpool.doors import DOOR_HEADER, SCREENED_DOOR
 from leanpool.environment import MAXIMUM_PORT, parse_installer_version
 from leanpool.haproxy.servers import (
     LeanServer,
@@ -110,6 +115,9 @@ CACHE_RETRIES = 3
 EXPORTER_QUERY = "scope=global&scope=frontend&scope=backend&scope=server"
 # The backend that holds the cache server alone, for GET /metrics/cache.
 CACHE_METRICS_BACKEND = "cache_metrics"
+# The screened door (docs/cache.md): its frontend, and its backend, the cache server alone.
+SCREENED_DOOR_FRONTEND = "screened_door"
+SCREENED_CACHE_BACKEND = "screened_cache"
 # HAProxy keeps a file it returns in one buffer, and warns when less than its rewrite reserve
 # is left beside it. Half a buffer is far more than a pool's facts take and always leaves that.
 POOL_METRICS_BUFFER_SHARE = 2
@@ -167,6 +175,11 @@ class PoolSettings:
 
     ``installer_version`` is the version of the installer that set up the pool's host. With it
     the body of ``GET /health`` ends ``"version":"V"``; without it the body is as before.
+
+    ``screened_door_port`` opens the screened door on that port: a second HTTPS way in, with the
+    front door's certificate, for checks sent with the cache's screened key, which it sends to
+    the cache alone. It needs TLS. Without it the configuration has no such door and is exactly
+    what it was before the door existed.
     """
 
     public_port: int = 18100
@@ -183,6 +196,7 @@ class PoolSettings:
     tls: TlsSettings | None = None
     pool_metrics_file: str | None = None
     installer_version: str | None = None
+    screened_door_port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +285,8 @@ def agent_tunnel_ports(servers: Sequence[LeanServer], settings: PoolSettings) ->
         return {}
     taken = {settings.public_port, settings.checkers_port, settings.stats_port}
     taken.add(parse_address(settings.cache_address)[1])
+    if settings.screened_door_port is not None:
+        taken.add(settings.screened_door_port)
     ports: dict[str, int] = {}
     candidate = settings.tls.agent_tunnel_port
     for server in servers:
@@ -298,6 +314,14 @@ def render_haproxy_config(
     validate_pool(servers, settings)
     timeouts = derive_timeouts(settings)
     tunnel_ports = agent_tunnel_ports(servers, settings)
+    screened_door = (
+        []
+        if settings.screened_door_port is None or settings.tls is None
+        else [
+            _screened_door(settings, settings.tls, settings.screened_door_port, servers),
+            _screened_cache_backend(settings, timeouts, servers),
+        ]
+    )
     sections = [
         _header_comment(servers, settings, timeouts),
         _global_section(settings),
@@ -307,6 +331,7 @@ def render_haproxy_config(
         _checkers_door(settings),
         _cache_backend(settings, timeouts),
         _cache_metrics_backend(settings),
+        *screened_door,
         _checkers_backend(servers, settings.tls, tunnel_ports),
         _stats_listener(settings),
     ]
@@ -352,6 +377,11 @@ def validate_pool(servers: Sequence[LeanServer], settings: PoolSettings) -> None
             parse_installer_version(settings.installer_version)
         except ValueError as error:
             raise PoolSettingsError(str(error)) from error
+    if settings.screened_door_port is not None and settings.tls is None:
+        raise PoolSettingsError(
+            "the screened door is served over TLS alone: give the TLS settings, or no "
+            "screened-door port"
+        )
     if settings.tls is not None:
         _validate_tls(servers, settings, settings.tls)
 
@@ -396,6 +426,16 @@ def _validate_ports(settings: PoolSettings) -> None:
             raise PoolSettingsError(f"{name} port {port} is outside 1-{MAXIMUM_PORT}")
     if len(set(ports.values())) != len(ports):
         raise PoolSettingsError(f"the public, checkers and stats ports must differ: {ports}")
+    door = settings.screened_door_port
+    if door is not None:
+        if not 1 <= door <= MAXIMUM_PORT:
+            raise PoolSettingsError(f"screened-door port {door} is outside 1-{MAXIMUM_PORT}")
+        cache_port = parse_address(settings.cache_address)[1]
+        if door in {*ports.values(), cache_port}:
+            raise PoolSettingsError(
+                f"the screened-door port {door} must differ from the public, checkers, stats "
+                f"and cache ports: {ports}, cache {cache_port}"
+            )
 
 
 def _validate_durations(settings: PoolSettings) -> None:
@@ -446,6 +486,12 @@ def _header_comment(
         f"{timeouts.minimum_cache_upstream_seconds}s for the checkers",
         "# (LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS).",
     ]
+    if settings.screened_door_port is not None:
+        lines += [
+            f"# The screened door, on port {settings.screened_door_port}: checks sent with the "
+            "cache's screened key,",
+            "# to the cache alone, which screens them.",
+        ]
     if settings.tls is None:
         return "\n".join([UNENCRYPTED_NOTICE, *lines])
     return "\n".join(
@@ -635,8 +681,6 @@ def metrics_rules(settings: PoolSettings) -> list[str]:
 
 def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> str:
     reply = "http-request return status {status} content-type application/json string"
-    health = "http-request return status {status} content-type application/json lf-string"
-    version = settings.installer_version
     bind = f"bind :{settings.public_port}"
     if settings.tls is not None:
         bind = f"{bind} {bind_options(settings.tls.front_door_pem)}"
@@ -644,6 +688,14 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
         []
         if settings.pool_metrics_file is None
         else [f"acl is_pool_metrics path {POOL_METRICS_PATH}"]
+    )
+    door_header_rules = (
+        []
+        if settings.screened_door_port is None
+        else [
+            "# Only the screened door may tell the cache that a check came in by it.",
+            f"http-request del-header {DOOR_HEADER}",
+        ]
     )
     return section(
         "frontend lean_pool",
@@ -659,25 +711,9 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             "acl checkers_up nbsrv(checkers) gt 0",
             "# The cache server itself: nbsrv(cache) would also count its backup.",
             "acl cache_up srv_is_up(cache/cache)",
+            *door_header_rules,
             *metrics_rules(settings),
-            "# What the pool says about itself, for clients that size themselves by it: the",
-            "# open slots on servers taking checks (a server's worker count, or the lower number",
-            "# its usage agent states), the checks waiting for a worker, and the servers taking",
-            "# checks (up, and not drained by their usage agent).",
-            "# Advisory: nothing here or behind reads these numbers back.",
-            *open_slots_rules("http-request", _REQUEST_WORKERS, servers),
-            "# Answered here, so a health probe never queues behind proofs or needs the cache.",
-            health.format(status=200)
-            + f" {_capacity_body('ok', version)} if METH_GET is_health checkers_up",
-            health.format(status=503)
-            + f" {_capacity_body('no Lean server is taking checks', version)}"
-            + " if METH_GET is_health",
-            "# The same three numbers on every answer that leaves this door, summed again as the",
-            "# answer leaves: a check may have waited minutes since its request was read.",
-            *open_slots_rules("http-after-response", _RESPONSE_WORKERS, servers),
-            f"http-after-response set-header {WORKERS_HEADER} %[var({_RESPONSE_WORKERS})]",
-            f"http-after-response set-header {QUEUED_HEADER} %[queue(checkers)]",
-            f"http-after-response set-header {SERVERS_HEADER} %[nbsrv(checkers)]",
+            *_pool_numbers_rules(settings, servers),
             "# The cache's own counters. While it is down there are none to report, and its",
             "# backup (a Lean server) must not be asked for them.",
             reply.format(status=503)
@@ -692,6 +728,105 @@ def _public_frontend(settings: PoolSettings, servers: Sequence[LeanServer]) -> s
             "# The cache is optional at run time: without it checks keep flowing, uncached.",
             "use_backend checkers if !cache_up",
             "default_backend cache",
+        ],
+    )
+
+
+def _pool_numbers_rules(settings: PoolSettings, servers: Sequence[LeanServer]) -> list[str]:
+    """What a door says about the pool: ``GET /health``, and the three numbers on every answer.
+
+    The front door and the screened door say the same, read from the same backend ``checkers``.
+    """
+    health = "http-request return status {status} content-type application/json lf-string"
+    version = settings.installer_version
+    return [
+        "# What the pool says about itself, for clients that size themselves by it: the",
+        "# open slots on servers taking checks (a server's worker count, or the lower number",
+        "# its usage agent states), the checks waiting for a worker, and the servers taking",
+        "# checks (up, and not drained by their usage agent).",
+        "# Advisory: nothing here or behind reads these numbers back.",
+        *open_slots_rules("http-request", _REQUEST_WORKERS, servers),
+        "# Answered here, so a health probe never queues behind proofs or needs the cache.",
+        health.format(status=200)
+        + f" {_capacity_body('ok', version)} if METH_GET is_health checkers_up",
+        health.format(status=503)
+        + f" {_capacity_body('no Lean server is taking checks', version)}"
+        + " if METH_GET is_health",
+        "# The same three numbers on every answer that leaves this door, summed again as the",
+        "# answer leaves: a check may have waited minutes since its request was read.",
+        *open_slots_rules("http-after-response", _RESPONSE_WORKERS, servers),
+        f"http-after-response set-header {WORKERS_HEADER} %[var({_RESPONSE_WORKERS})]",
+        f"http-after-response set-header {QUEUED_HEADER} %[queue(checkers)]",
+        f"http-after-response set-header {SERVERS_HEADER} %[nbsrv(checkers)]",
+    ]
+
+
+def _screened_door(
+    settings: PoolSettings, tls: TlsSettings, port: int, servers: Sequence[LeanServer]
+) -> str:
+    """The screened door: checks sent with the cache's screened key, to the cache alone.
+
+    It is served with the front door's certificate, answers ``GET /health`` and states the
+    pool's numbers as the front door does, and takes nothing but ``POST /api/check``. It holds
+    as many requests in the cache at once as the listed servers that are not paused have
+    workers, W (the cache server's limit in ``backend screened_cache``), and as many again
+    waiting; one past that is answered 503 at once. A request may carry several snippets: the
+    cache bounds the checks themselves (``leanpool.cache.service``). The door keeps at most
+    2W + 8 connections open at once, so its senders cannot use up the proxy's own. Every
+    request it forwards says, in one header, that it came in by this door, and a sender's own
+    copy of that header, or of the loop guard, never reaches the cache.
+    """
+    workers = total_workers(servers)
+    refusal = "http-request return status {status} content-type application/json string"
+    return section(
+        f"frontend {SCREENED_DOOR_FRONTEND}",
+        [
+            f"bind :{port} {bind_options(tls.front_door_pem)}",
+            "# Its own share of the proxy's connections: the requests below, and a few more.",
+            f"maxconn {2 * workers + 8}",
+            "acl is_health path /health",
+            "acl is_check path /api/check /api/check/",
+            "acl checkers_up nbsrv(checkers) gt 0",
+            *_pool_numbers_rules(settings, servers),
+            "# Checks only: the cache's counters, the metrics and every other path a Lean server",
+            "# offers are the front door's.",
+            refusal.format(status=404)
+            + """ '{"detail":"this door takes checks alone"}' unless METH_POST is_check""",
+            f"# At most {workers} requests in the cache at once from here (the listed workers of",
+            "# servers not paused) and as many waiting; past that, an answer at once, which a",
+            "# client retries. The cache bounds the checks the requests carry.",
+            refusal.format(status=503)
+            + """ '{"detail":"the screened door is full"}'"""
+            + f" if {{ queue({SCREENED_CACHE_BACKEND}) ge {workers} }}",
+            "# The proxy's word to the cache that this check came in by the screened door, the one",
+            "# door where the cache takes the screened key. A sender's own copy is replaced.",
+            f"http-request set-header {DOOR_HEADER} {SCREENED_DOOR}",
+            "# A sender's loop guard is taken away: nothing here leads past the cache.",
+            f"http-request del-header {settings.hop_header}",
+            f"default_backend {SCREENED_CACHE_BACKEND}",
+        ],
+    )
+
+
+def _screened_cache_backend(
+    settings: PoolSettings, timeouts: PoolTimeouts, servers: Sequence[LeanServer]
+) -> str:
+    """The screened door's backend: the cache server, and nothing to fall back on.
+
+    Backend ``cache`` falls back to the Lean servers while the cache is down, which would take
+    a screened check past the screen. Here the cache server stands alone, with the state of
+    ``cache/cache``: while it is down the door answers 503, and the client retries.
+    """
+    workers = total_workers(servers)
+    return section(
+        f"backend {SCREENED_CACHE_BACKEND}",
+        [
+            "# The cache server alone, with no backup: while it is down this door answers 503,",
+            "# where the front door would go round the cache, past the screen. It takes the state",
+            "# of cache/cache. The cache holds a request for the queue wait and the check.",
+            f"timeout server {timeouts.cache_seconds}s",
+            default_server_line(),
+            f"server cache {settings.cache_address} track cache/cache maxconn {workers}",
         ],
     )
 

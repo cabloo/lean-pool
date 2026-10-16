@@ -41,6 +41,8 @@ read one beside this page: [the demo's](../examples/demo/haproxy.cfg) is a compl
   `http-request set-priority-class int(100)` for a check that carries
   `X-Lean-Priority: background`, which puts it behind every normal check in this backend's queue.
 * `listen stats` on `127.0.0.1` only.
+* With TLS and `--screened-door-port`, the [screened door](#the-screened-door): `frontend screened_door`
+  and `backend screened_cache`.
 
 ## A paused server
 
@@ -164,7 +166,8 @@ server by IPv4 address, or use a name the DNS server answers as written.
 
 ## Losing the cache
 
-Losing the cache is meant to cost no check:
+Losing the cache is meant to cost no check at the front door (the [screened door](#the-screened-door)
+answers 503 instead, since its checks may not go round the cache):
 
 * The first failed connection to the cache marks it down at once
   (`observe layer4 error-limit 1 on-error mark-down`) instead of waiting for its health check.
@@ -297,14 +300,15 @@ differences, and nothing else changes:
   `check check-ssl check-sni <name>` so that the health check is the same mutual TLS;
 * the agent check of each server becomes
   `agent-check agent-addr 127.0.0.1 agent-port <tunnel port>`;
+* with `--screened-door-port`, the [screened door](#the-screened-door), which is served over TLS alone;
 * after every other section, `defaults agent_tunnels` (TCP mode, 10 s timeouts, only failures
   logged) and one `listen agent_tunnel_<name>` per server: bound to `127.0.0.1:<tunnel port>`,
   with one server, the box's agent port, reached with the same mutual TLS options and the same
   name check as the Lean server.
 
 **Tunnel ports** are the first free ports counting up from `--agent-tunnel-port` (18300), in the
-order of the server list, skipping the pool's own ports (public, checkers, statistics and the
-cache's). The same list and options always give the same ports, and a server appended to the
+order of the server list, skipping the pool's own ports (public, checkers, statistics, the
+cache's and the screened door's). The same list and options always give the same ports, and a server appended to the
 list changes no other server's port. Removing a server moves the ports of the servers after it;
 the listeners and the agent checks that use them are always rendered together.
 
@@ -316,6 +320,33 @@ With TLS these are refused, each because it would leave a hop unencrypted or an 
 unclear: a cache that is not on a loopback address; a server name that is not a DNS name; two
 server names that differ only in letter case; a certificate path that is not a plain absolute
 path; tunnels that do not fit below port 65535.
+
+## The screened door
+
+With TLS and `--screened-door-port N`, `render` adds a second way in, for the cache's
+[screened key](cache.md#the-screened-key). Besides its two sections it adds one rule to the front
+door, with a comment, and two lines to the file's opening comment. W below is the workers of the
+listed servers that are not paused:
+
+* `frontend screened_door`: `bind :N ssl crt <front door> ssl-min-ver TLSv1.3`, the front door's
+  certificate, and `maxconn` 2W + 8, its own share of the proxy's connections. `/health` and the
+  three capacity headers are answered exactly as at the front door. Anything but `POST /api/check`
+  is answered 404 `{"detail":"this door takes checks alone"}`. With W requests waiting
+  (`queue(screened_cache)`), the next is answered 503 `{"detail":"the screened door is full"}`:
+  HAProxy has no limit on a backend's queue, so the door counts it. It sets
+  `X-Lean-Pool-Door: screened`, takes a sender's loop-guard header away, and uses `screened_cache`
+  for everything it passes.
+* `backend screened_cache`: the cache server alone, `track cache/cache` (the cache's own health
+  check, no second one), `maxconn` W, and **no backup**: while the cache is down this door answers
+  503, where the front door goes round the cache.
+* `frontend lean_pool` takes `X-Lean-Pool-Door` away from every request, so only this door can
+  tell the cache that a check came in by it.
+
+These limits count requests, and a request may carry several snippets. The cache bounds the checks
+themselves ([what its checks may cost](cache.md#the-screened-key)).
+
+Its port must differ from the public, checkers, statistics and cache ports, and no agent tunnel
+takes it. Without the option the file is the one rendered before the door existed.
 
 ## A box's TLS front
 

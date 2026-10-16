@@ -12,7 +12,9 @@ reference.
 | `--api-key-file` | `LEANPOOL_CACHE_API_KEY_FILE` | none | A file holding the pool's API key. |
 | (no flag) | `LEANPOOL_CACHE_API_KEY` | none | The key itself. There is deliberately no flag for it: command lines are visible to every user of the machine. Give the file or the variable, not both. |
 | `--screened-api-key-file` | `LEANPOOL_CACHE_SCREENED_API_KEY_FILE` | none | A file holding a second key, for senders trusted less than the pool's own. Their checks must pass [the screen](cache.md#the-screened-key) and are forwarded with the pool's key. Needs the pool's key, and must differ from it. |
-| (no flag) | `LEANPOOL_CACHE_SCREENED_API_KEY` | none | The second key itself. Give the file or the variable, not both. |
+| (no flag) | `LEANPOOL_CACHE_SCREENED_API_KEY` | none | The second key itself. Give the file or the variable, not both. The second key is taken only from a request marked `X-Lean-Pool-Door: screened`, which only [the screened door](cache.md#the-screened-door) can send when the proxy is rendered with `--screened-door-port`: give the cache this key only behind such a proxy. |
+| `--screened-in-flight` | `LEANPOOL_CACHE_SCREENED_IN_FLIGHT` | none; required with the second key | How many checks the second key's senders may have at the servers at once; as many more may wait, and the next is answered 503. Also the most snippets one of their requests may carry. The installer gives it the pool's workers. |
+| `--screened-max-timeout` | `LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` | `300` | The longest Lean timeout, in seconds, a check sent with the second key may ask for. The installer gives it the pool's `--lean-timeout`. |
 | `--allow-unauthenticated` | `LEANPOOL_CACHE_ALLOW_UNAUTHENTICATED` | off | Serve without checking a key, for a pool whose Lean servers have none. Without a key and without this, the cache refuses to start. |
 | `--database` | `LEANPOOL_CACHE_DATABASE` | `leanpool-cache.sqlite3` (the image sets `/var/lib/leanpool/cache.sqlite3`) | The SQLite file holding the stored results. |
 | `--max-bytes` | `LEANPOOL_CACHE_MAX_BYTES` | `4294967296` (4 GiB) | The size cap. Above it the least recently used results are evicted. |
@@ -89,6 +91,7 @@ Options of `render`:
 | `--pool-metrics` | `LEANPOOL_HAPROXY_POOL_METRICS` | none | Also write the pool's facts for a Prometheus scraper to this file, and have HAProxy answer `GET /metrics/pool` with it. Install the file beside `haproxy.cfg` under the same name. See [Metrics for Prometheus](haproxy.md#metrics-for-prometheus). |
 | `--certificates` | `LEANPOOL_HAPROXY_CERTIFICATES` | none | With `--pool-metrics`: a directory of public certificates. The end of validity of every `*.crt` file under it is written to the facts, under the file's path there. |
 | `--installer-version` | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | none | The version of the installer that set up the pool's host, 1 to 64 lower-case hex digits. `GET /health` then ends `"version":"V"`. Not set: the body is without it. |
+| `--screened-door-port` | `LEANPOOL_HAPROXY_SCREENED_DOOR_PORT` | none | Opens [the screened door](cache.md#the-screened-door) on this port: a second HTTPS way in, with the front door's certificate, for checks sent with the cache's screened key, which leads to the cache alone. Needs the TLS files. Not set: there is no such door, and the configuration is as without the option. |
 
 The three TLS files are paths as HAProxy sees them (inside its container). They are written into
 the configuration, not read by `render`, so they are absolute paths of letters, digits, `.`,

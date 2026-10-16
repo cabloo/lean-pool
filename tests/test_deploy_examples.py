@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from compose_files import read, resolve
+from compose_files import MissingSettingError, read, resolve
 
 from leanpool.admit.cases import Expectation, load_cases
 from leanpool.haproxy import PoolSettings, parse_server_list
@@ -29,6 +29,7 @@ COMPOSE_FILES = [
     POOL / "compose.yaml",
     POOL / "compose.tls.yaml",
     POOL / "compose.dns.yaml",
+    POOL / "compose.screened-door.yaml",
     LEAN_SERVER / "compose.yaml",
     LEAN_SERVER / "compose.agent.yaml",
     LEAN_SERVER / "compose.tls.yaml",
@@ -42,6 +43,8 @@ REQUIRED = {
     "LEAN_SERVER_MAX_REPLS": "4",
     "LEANPOOL_CACHE_PIN": "pin",
     "LEANPOOL_DNS": "192.0.2.53",
+    "LEANPOOL_SCREENED_DOOR_ADDRESS": "172.17.0.1",
+    "LEANPOOL_CACHE_SCREENED_IN_FLIGHT": "12",
 }
 LEAN_SERVER_PROJECTS = {
     "plain": ["compose.yaml"],
@@ -65,6 +68,12 @@ POOL_PROJECTS = {
     "plain": ["compose.yaml"],
     "with TLS": ["compose.yaml", "compose.tls.yaml"],
     "with TLS and a DNS server": ["compose.yaml", "compose.tls.yaml", "compose.dns.yaml"],
+    "with the screened door": [
+        "compose.yaml",
+        "compose.tls.yaml",
+        "compose.dns.yaml",
+        "compose.screened-door.yaml",
+    ],
 }
 PROJECTS = [
     *((LEAN_SERVER, name, files) for name, files in LEAN_SERVER_PROJECTS.items()),
@@ -165,6 +174,37 @@ def test_the_pools_key_is_a_secret_the_cache_reads_from_its_file() -> None:
         pool["services"]["cache"]["environment"]["LEANPOOL_CACHE_API_KEY_FILE"]
         == "/run/secrets/pool_api_key"
     )
+
+
+def test_the_screened_door_is_published_on_one_address_and_its_key_is_the_caches_alone() -> None:
+    without = project(POOL, POOL_PROJECTS["with TLS and a DNS server"])
+    pool = project(POOL, POOL_PROJECTS["with the screened door"])
+    door = [
+        port
+        for port in pool["services"]["haproxy"]["ports"]
+        if port not in without["services"]["haproxy"]["ports"]
+    ]
+
+    assert door == ["172.17.0.1:18120:18120"]
+    assert pool["secrets"]["screened_api_key"] == {"file": "./screened-api-key"}
+    assert pool["services"]["cache"]["secrets"] == ["pool_api_key", "screened_api_key"]
+    environment = pool["services"]["cache"]["environment"]
+    assert environment["LEANPOOL_CACHE_SCREENED_API_KEY_FILE"] == "/run/secrets/screened_api_key"
+    # Its senders' limits: as many checks at the servers as it is told, and the pool's Lean timeout.
+    assert environment["LEANPOOL_CACHE_SCREENED_IN_FLIGHT"] == "12"
+    assert environment["LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS"] == "300"
+    assert "secrets" not in pool["services"]["haproxy"]
+
+
+@pytest.mark.parametrize(
+    "setting", ["LEANPOOL_SCREENED_DOOR_ADDRESS", "LEANPOOL_CACHE_SCREENED_IN_FLIGHT"]
+)
+def test_the_screened_door_will_not_start_without_its_address_or_its_limit(setting: str) -> None:
+    with pytest.raises(MissingSettingError, match=setting):
+        resolve(
+            [POOL / name for name in POOL_PROJECTS["with the screened door"]],
+            {key: value for key, value in REQUIRED.items() if key != setting},
+        )
 
 
 def test_the_example_server_list_is_valid() -> None:

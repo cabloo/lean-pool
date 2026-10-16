@@ -184,7 +184,7 @@ the cache's counters, and each certificate's last day
 | [Using a pool](docs/clients.md) | The API, how to read each reply, priorities, the pool's stated size. |
 | [TLS](docs/tls.md) | The pool's own certificate authority: what is encrypted and who holds which key. |
 | [Joining over the network](docs/joining.md) | What happens when a new box joins, and the rules the join service keeps. |
-| [Cache semantics](docs/cache.md) | The key, what is stored and what never is, bypass, single flight. |
+| [Cache semantics](docs/cache.md) | The key, what is stored and what never is, bypass, single flight, and the screened door: a second way in, through the screen, for machines you do not own. |
 | [The usage agent](docs/usage-agent.md) | The weight formula, what HAProxy does with it, and open slots for a box that also does other work. |
 | [The generated HAProxy configuration](docs/haproxy.md) | Pausing a server, the health check, failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus. |
 | [Admission](docs/admission.md) | Testing a Lean server alone before it joins. |

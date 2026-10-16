@@ -121,11 +121,12 @@ jobs:
         run: |
           docker compose -f examples/demo/compose.yaml config --quiet
           cd deploy/pool
-          touch api-key
-          export LEANPOOL_CACHE_PIN=ci LEANPOOL_DNS=192.0.2.53
+          touch api-key screened-api-key
+          export LEANPOOL_CACHE_PIN=ci LEANPOOL_DNS=192.0.2.53 LEANPOOL_SCREENED_DOOR_ADDRESS=172.17.0.1 LEANPOOL_CACHE_SCREENED_IN_FLIGHT=4
           docker compose -f compose.yaml config --quiet
           docker compose -f compose.yaml -f compose.tls.yaml config --quiet
           docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml config --quiet
+          docker compose -f compose.yaml -f compose.tls.yaml -f compose.dns.yaml -f compose.screened-door.yaml config --quiet
           cd ../lean-server
           export LEAN_SERVER_API_KEY=ci LEAN_SERVER_MAX_REPLS=2
           mkdir -p native sandbox
