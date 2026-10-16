@@ -492,7 +492,10 @@ case "$verb" in
     fi
     if has_overlay compose.tls.yaml; then
       # A pool member: only the front is published, and it lets in the pool proxy's certificate alone.
-      echo "--- tls front: $(docker inspect -f '{{.State.Status}}' "$FRONT" 2>&1) as '$(setting LEAN_SERVER_NAME)' on ports $(setting LEAN_SERVER_PUBLISHED_PORT) and $(setting LEAN_SERVER_AGENT_PORT); its certificate has $(docker run --rm --network none --user 0:0 -v "$DIR/tls/box.crt":/box.crt:ro "$(setting LEAN_SERVER_AGENT_IMAGE)" leanpool-pki expiry /box.crt 2>/dev/null || echo '?') days left (renewal is joining again)"
+      # The pool's own host issues its server's certificate itself; every other box was signed at its join.
+      renewal="renewal is joining again"
+      [ ! -f "/srv/lean-pool-$INSTANCE/pool.env" ] || renewal="renewal: remove pki/box/box.* in /srv/lean-pool-$INSTANCE and run the pool's install line again"
+      echo "--- tls front: $(docker inspect -f '{{.State.Status}}' "$FRONT" 2>&1) as '$(setting LEAN_SERVER_NAME)' on ports $(setting LEAN_SERVER_PUBLISHED_PORT) and $(setting LEAN_SERVER_AGENT_PORT); its certificate has $(docker run --rm --network none --user 0:0 -v "$DIR/tls/box.crt":/box.crt:ro "$(setting LEAN_SERVER_AGENT_IMAGE)" leanpool-pki expiry /box.crt 2>/dev/null || echo '?') days left ($renewal)"
     fi
     ;;
 
