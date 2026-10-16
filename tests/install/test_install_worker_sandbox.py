@@ -172,6 +172,7 @@ def test_the_compiled_search_step_is_on_inside_the_sandbox(machine):
     [
         ("no-landlock", "this kernel has no Landlock (Linux 5.13 or later)"),
         ("no-python", "the probe did not run: sh: 1: exec: python3: not found"),
+        ("no-python-error-first", "the probe did not run: sh: 1: exec: python3: not found"),
         (
             "relative-repl",
             "this image does not name its REPL by an absolute path in LEAN_SERVER_REPL_PATH ('repl')",

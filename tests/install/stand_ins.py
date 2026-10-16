@@ -49,8 +49,8 @@ run the REAL scripts against a fake machine:
     /tmp:... -v DIR:/opt/lean-sandbox:ro --entrypoint sh IMAGE -c '... sandbox.py --probe'`): it refuses a
     container not made as the server is, and one whose source mount lacks sandbox.py or lean-worker, then says
     the image's REPL and what the real probe says: Landlock 6, or what a test says (STUB_SANDBOX: `no-landlock`,
-    a kernel without it; `no-python`, an image without python3; `relative-repl`, an image that names its REPL by
-    a relative path). `kimina-ctl check` fails against the container STUB_SANDBOX_CHECK_FAILS names while its
+    a kernel without it; `no-python`, an image without python3, and `no-python-error-first` the same with the
+    error in the log before the REPL's path; `relative-repl`, an image that names its REPL by a relative path). `kimina-ctl check` fails against the container STUB_SANDBOX_CHECK_FAILS names while its
     workers are started through the sandbox. `top CONTAINER -o pid,args eww` lists a running Lean server's
     processes with their environment, as the daemon's ps does: Kimina's (the API key in it), and for each
     worker (STUB_WORKERS_RUNNING, 4) its `lake env` and the REPL itself, which carries the sandbox's mark where
@@ -690,7 +690,13 @@ def sandbox_probe(image, name, given, bare, mount_of):
         fail(f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.', 125)
     note("sandbox-probes", image)
     outcome = os.environ.get("STUB_SANDBOX", "ok")
-    print("LEAN_SERVER_REPL_PATH=" + ("repl" if outcome == "relative-repl" else IMAGE_REPL))
+    said_repl = "LEAN_SERVER_REPL_PATH=" + ("repl" if outcome == "relative-repl" else IMAGE_REPL)
+    if outcome == "no-python-error-first":
+        # Docker copies a container's output and its errors separately: the error can reach the log first.
+        print("sh: 1: exec: python3: not found", file=sys.stderr, flush=True)
+        print(said_repl, flush=True)
+        return 127
+    print(said_repl, flush=True)       # as the container's printf: written before python3 is started
     if outcome == "no-python":
         fail("sh: 1: exec: python3: not found", 127)
     if outcome == "no-landlock":

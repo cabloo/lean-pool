@@ -124,5 +124,10 @@ fi
 
 reason=$({ grep -a "^$SAID_FAILED" "$LOG" || true; } | tail -n 1)
 reason=${reason#"$SAID_FAILED"}
-[ -n "$reason" ] || reason="the probe did not run: $({ grep -av '^\s*$' "$LOG" || true; } | tail -n 1)"
+# Else its last line, but the REPL's path: Docker copies the container's output and its errors separately,
+# so the error that stopped the probe may come before that path in the log.
+if [ -z "$reason" ]; then
+  last=$({ grep -av -e '^\s*$' -e "^$SAID_REPL" "$LOG" || true; } | tail -n 1)
+  reason="the probe did not run: ${last:-it said nothing (exit $status)}"
+fi
 off "$reason"
