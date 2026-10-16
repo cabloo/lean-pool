@@ -388,7 +388,9 @@ PY
 # sticky or not (as sshd's StrictModes asks of a key's path): nobody else can then have made any directory on it, so
 # nobody else can make themselves the owner the copy is written for. /tmp, and anything under it, is refused. The
 # walk starts at LEANPOOL_KEY_COPY_WALK_ROOT instead of / when root's own environment names one: a seam for the
-# tests and for packaging into a staging root, read by this writer alone, which never loosens the rule. It is never
+# tests and for packaging into a staging root, read by this writer alone. The directories above it are then not
+# walked, a link among them included, so only root can name it: sudo resets the environment, and pool.env is read,
+# never sourced. It is never
 # the other key's copy's directory, nor inside it or around it, compared as directories (a bind mount, say), and
 # never one whose api-key is the other key. Each file is owned by the directory's owner and is made new beside the
 # old one, then moved over it, and is never written, chowned or chmodded by name, so a link the owner planted in the
@@ -559,6 +561,8 @@ try:
         except FileExistsError:
             raise Refused("it appeared while it was being made") from None
         directory = os.open(name, DIRECTORY, dir_fd=parent)
+        if os.fstat(directory).st_uid != os.geteuid():
+            raise Refused("it was replaced while it was being made")
         top = parents[-1]
         os.fchown(directory, top.st_uid, top.st_gid)
         os.fchmod(directory, 0o700)
