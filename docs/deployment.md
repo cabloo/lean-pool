@@ -227,8 +227,9 @@ sudo kimina-ctl @upstream logs 200
 ```
 
 `kimina-ctl` without `@NAME` acts on instance 1. Its header lists every command, among them
-[compiled search](compiled-search.md) on and off, [the read-only root](#a-read-only-root), and
-`set-beside` for [a box that also does other work](#a-box-that-also-does-other-work).
+[compiled search](compiled-search.md) on and off, [the read-only root](#a-read-only-root),
+[the worker sandbox](#each-worker-in-a-sandbox), and `set-beside` for
+[a box that also does other work](#a-box-that-also-does-other-work).
 
 ### The container's processes
 
@@ -259,8 +260,22 @@ which. `kimina-ctl [@NAME] status` has a `read-only root:` line; `read-only off`
 server writable through every later install, and `read-only on` turns it back on where a
 reading passed.
 
-It does not cover a program a check leaves running: that can reach the next checks of the same
-server until the container is made again.
+It does not cover a program a check leaves running. With [the worker
+sandbox](#each-worker-in-a-sandbox), that program can reach the next checks of its own worker
+only; without it, those of the whole server, until the container is made again.
+
+### Each worker in a sandbox
+
+Kimina runs its workers in one container, as one user. The installer puts each worker in a
+[sandbox of its own](worker-sandbox.md), where this box's kernel and Docker allow it: a check
+then reaches no other worker, nor Kimina, nor the server's key. It asks a container of the
+box's own image first, and sends the server a real check after; where the check fails, the
+sandbox is taken away again, the server is made again without it and checked again. If it
+fails without the sandbox too, the sandbox was not the cause: it comes back, and the read-only
+root is taken away instead. The last lines of the install say which. `kimina-ctl [@NAME] status`
+has a `worker sandbox:` line, with how many of the running workers carry the sandbox's mark;
+`sandbox off` keeps it off through every later install, and `sandbox on` turns it back on
+where this box's probe passed.
 
 ### Watching it
 

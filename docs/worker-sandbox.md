@@ -47,7 +47,8 @@ A box the [installers](deployment.md) set up has it already, where it works: the
 container of the box's own image whether this kernel and this Docker can make the sandbox, adds
 it only where they can, and then sends the server a real check. Where the check fails, the
 sandbox is taken away again, the server is made again without it and checked again, and the
-installer says why. `sudo kimina-ctl [@NAME] sandbox off` turns it off and `on` turns it back on;
+installer says why; where it fails without the sandbox too, the sandbox was not the cause and
+comes back ([one protection at a time](deployment.md#each-worker-in-a-sandbox)). `sudo kimina-ctl [@NAME] sandbox off` turns it off and `on` turns it back on;
 each makes the Lean server again and nothing else. `kimina-ctl status` says what the running
 server's workers are started as, and how many of them carry the sandbox's mark:
 

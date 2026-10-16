@@ -388,13 +388,14 @@ for _ in $(seq 1 30); do
   sleep 10
 done
 [ "$checked" -eq 1 ] || verdict="POOL INSTALLED, BUT THE CHECK THROUGH IT FAILED - see: sudo lean-pool-ctl $POOL status ; sudo lean-pool-ctl $POOL logs 200"
-# This box's own Lean server with its root read-only, checked by itself: through the pool,
-# another server could have answered. One that fails is made writable again and checked once more. It runs
-# after a failed check through the pool too (a pool whose only server the read-only root broke is put back),
-# and the first failure stays the verdict.
-if [ "$(setting_in "$INSTANCE_DIR/kimina.env" LEAN_SERVER_ROOT_READ_ONLY)" = true ]; then
-  say "Verifying this box's own Lean server by itself, with its root read-only"
-  if ! confirm_read_only_root "$INSTANCE_DIR" "$POOL" && [ "$checked" -eq 1 ]; then
+# This box's own Lean server with its protections (each worker in a sandbox, the root read-only), checked by
+# itself: through the pool, another server could have answered. One that fails loses one protection at a time
+# and is checked once more. It runs after a failed check through the pool too (a pool whose only server a
+# protection broke is put back), and the first failure stays the verdict.
+if [ "$(setting_in "$INSTANCE_DIR/kimina.env" LEAN_SERVER_ROOT_READ_ONLY)" = true ] \
+   || has_overlay "$INSTANCE_DIR/kimina.env" "$LEAN_SANDBOX_OVERLAY"; then
+  say "Verifying this box's own Lean server by itself, with its protections"
+  if ! confirm_lean_server "$INSTANCE_DIR" "$POOL" && [ "$checked" -eq 1 ]; then
     verdict="POOL INSTALLED, BUT THIS BOX'S OWN LEAN SERVER FAILED ITS CHECK - see: sudo kimina-ctl @$POOL logs 200"
   fi
 fi
@@ -413,4 +414,6 @@ EOF
 [ -z "${COMPILED_SEARCH_SAID:-}" ] || echo "  search      $COMPILED_SEARCH_SAID"
 # And whether its root filesystem is read-only.
 [ -z "${READ_ONLY_SAID:-}" ] || echo "  read-only   $READ_ONLY_SAID"
+# And whether each of its workers starts in a sandbox of its own.
+[ -z "${WORKER_SANDBOX_SAID:-}" ] || echo "  sandbox     $WORKER_SANDBOX_SAID"
 [ "$verdict" = "POOL INSTALLED AND VERIFIED" ]

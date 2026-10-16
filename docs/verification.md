@@ -18,6 +18,13 @@ cases.
 * the cache: an identical second check never reaches the upstream; what is and is not stored;
   bypass; single flight; request order; eviction order and the size cap; authentication; that
   the cache does not cap concurrency (150 checks in flight at once);
+* the [screen](cache.md#the-screened-key): each rule with checks it refuses and the nearest
+  ones it lets through (a refused word inside a longer name, an attribute the list allows, an
+  import of one of Mathlib's modules); through the cache, that a request with one refused
+  snippet is answered 422 whole and reaches and stores nothing, that one which passes is
+  answered like any other and reaches Lean with the pool's own key, sharing the stored answer
+  of the same check sent with that key, that `/status` takes the pool's key alone, and that
+  neither key reaches a log line or an error;
 * the agent: the formula, the reply format, that the CPU share needs two readings, `drain`;
   open slots from made-up readings of a 16-CPU box with 13 workers (other work on 0, 9.6 and
   14.2 CPUs gives 13, 5 and none; the Lean server's own use lowers none), down at once and up
@@ -84,13 +91,22 @@ cases.
   or is not 3 times faster; and what `make.sh` installs over a stand-in for Docker, when
   the check passes and when anything fails. The real build and check need a Lean with
   Mathlib, and run only where one is present;
+* the [worker sandbox](worker-sandbox.md), on the test machine's own kernel, outside Docker:
+  each wall twice, the act allowed without the sandbox and refused under it (another worker's
+  pipes and environment through `/proc`, and its parent's; a file outside `/tmp`), TCP and
+  signals refused where the kernel's Landlock version has them and allowed where it does not;
+  the key taken out of the environment and the mark put in; that a worker that cannot be
+  sandboxed is not started; and that the launcher starts the compiled search step's launcher
+  where it can, and the image's REPL otherwise;
 * the [installers](../deploy/install/README.md) (`tests/install/`), on a fake machine: copies
   whose host paths point into a fake root directory, and stand-ins for Docker, systemd, the
   firewall's tools and the package managers, whose Docker refuses a file read that a
   container's user could not make. A host with two Lean servers, the pool put in front of one,
   the control commands,
   joins over real HTTPS with the real join service, refreshes, the compose plugin's install,
-  the firewall rules, uninstalls; every refusal before root is asked for; an instance whose
+  the firewall rules, uninstalls; the worker sandbox's probe with each of its outcomes, and a
+  server whose check fails with one protection taken away at a time; every refusal before root
+  is asked for; an instance whose
   image is pulled by name instead of built; and a box set up by the installers of an older
   version, made by those installers themselves, moved to the compose files of `deploy/` with
   every setting and the cache's results kept, put back as it was when a server does not come
@@ -328,6 +344,13 @@ address. Its single and its batched requests were answered, and repeats came fro
   check compares three proofs: it does not show that the compiled search and the
   interpreted one agree on every input
   ([why that cannot let a wrong proof pass](compiled-search.md#what-it-cannot-change-and-what-it-does)).
+* **The worker sandbox has not run inside a Lean server yet.** Its tests run on the test
+  machine's kernel, outside Docker, and its `make.sh` has run only on the fake machine. On each
+  box the installers ask a container of that box's own image first, and send the server a
+  real check after.
+* **The screen is a list of words**, not proof that a check runs no code
+  ([what it is not](cache.md#the-screened-key)). Of 575 real proofs, 489 published ones and 86
+  attempts by the deployment's model, it refused none.
 * **What TLS costs** in CPU or throughput has not been measured, beyond the timers above.
 * **What a check costs the work beside it** was measured on three machines of one deployment
   and differed on each. Nothing here says what it is on yours: measure the box

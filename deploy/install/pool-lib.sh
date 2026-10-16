@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # pool-lib.sh - shared by install.sh (the site's values, the server's control group, the compiled search
-# step, the read-only root, the compose plugin, and the usage agent and TLS front beside a Lean server),
+# step, the read-only root, the worker sandbox, the compose plugin, and the usage agent and TLS front beside a
+# Lean server),
 # install-pool.sh (the pool's front door) and a join script (a new box). Sourced, never run.
 #
 # Expects the caller to have defined: SRC (this directory), say, warn, die.
@@ -74,8 +75,9 @@ lean_pool_source() {
 # A Lean server instance and a pool each run as ONE compose project, from the lean-pool project's own compose
 # files, copied unchanged into the instance's or the pool's directory:
 #   deploy/lean-server/  compose.yaml (the server) and its overlays: compose.agent.yaml (the usage agent),
-#                        compose.tls.yaml (the TLS front; the server and the agent then publish nothing) and
-#                        compose.compiled-search.yaml (linarith's search step, compiled)
+#                        compose.tls.yaml (the TLS front; the server and the agent then publish nothing),
+#                        compose.compiled-search.yaml (linarith's search step, compiled) and
+#                        compose.worker-sandbox.yaml (every worker in a sandbox of its own)
 #   deploy/pool/         compose.yaml (the proxy and the cache), compose.tls.yaml and compose.dns.yaml
 # The env file beside them (kimina.env, pool.env) names the files the box runs, in order (COMPOSE_FILE), and the
 # project (COMPOSE_PROJECT_NAME), and every program passes both to `docker compose` itself. Containers, networks
@@ -83,7 +85,8 @@ lean_pool_source() {
 # lean-pool-NAME_cache-data.
 LEAN_SERVER_COMPOSE_DIR=deploy/lean-server     # in the lean-pool project
 LEAN_POOL_COMPOSE_DIR=deploy/pool
-LEAN_SERVER_COMPOSE_FILES=(compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml)
+LEAN_SERVER_COMPOSE_FILES=(compose.yaml compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml
+  compose.worker-sandbox.yaml)
 LEAN_POOL_COMPOSE_FILES=(compose.yaml compose.tls.yaml compose.dns.yaml)
 
 # lean_server_project INSTANCE : the compose project of a Lean server instance (lean-server for instance 1).
@@ -128,7 +131,7 @@ compose_in() {
 }
 
 # set_overlay ENV_FILE FILE on|off : COMPOSE_FILE with the Lean server's overlay FILE in it, or without it. The
-# files keep one order (LEAN_SERVER_COMPOSE_FILES): the server's own first, the compiled search step last.
+# files keep one order (LEAN_SERVER_COMPOSE_FILES): the server's own first, the worker sandbox last.
 set_overlay() {
   local env=$1 overlay=$2 state=$3 now file list=compose.yaml
   now=":$(setting_in "$env" COMPOSE_FILE):"
@@ -512,32 +515,134 @@ install_read_only_root() {
   echo "$READ_ONLY_SAID"
 }
 
-# confirm_read_only_root INSTANCE_DIR INSTANCE : after the Lean server was (re)made, a real check against it
-# ALONE (not through a pool, which may answer from another server). A read-only server that fails it is made
-# writable again and checked once more; the caller's verdict is the last check's status.
-confirm_read_only_root() {
-  local dir=$1 instance=$2 env=$1/kimina.env container state healthy=0
+# ------------------------------------------- each worker in a sandbox of its own
+# A check runs code inside the worker that answers it, and Kimina runs every worker in one container as one
+# user. Started through the lean-pool project's worker-sandbox/ (docs/worker-sandbox.md), each worker puts
+# itself in a Landlock domain of its own first: the code a check runs can then reach no other worker, nor
+# Kimina, nor the server's key. A worker that cannot be sandboxed does not start, so the overlay is added only
+# where a container of the box's own image made the sandbox (make.sh), and kept only where a real check then
+# passes. Elsewhere the workers start as before, and the box says why.
+#   LEAN_SERVER_WORKER_SANDBOX=off    in kimina.env: turned off by hand (kimina-ctl sandbox off); every run keeps it
+#   <instance dir>/sandbox/           mounted read-only at /opt/lean-sandbox by compose.worker-sandbox.yaml
+#     lean-worker, sandbox.py         the launcher (the program a worker is started as) and the sandbox
+#     repl-path                       the image's REPL, which lean-worker starts where no compiled step is on
+#     state                           one line: `on ...` with what the probe found, or `off REASON`
+#   <instance dir>/sandbox.log        the last probe, in full
+LEAN_SANDBOX_MAKE=deploy/lean-server/worker-sandbox/make.sh     # in the lean-pool project
+LEAN_SANDBOX_OVERLAY=compose.worker-sandbox.yaml
+WORKER_SANDBOX_INSTALLED=""     # set once install_worker_sandbox has run in this process
+WORKER_SANDBOX_SAID=""          # its one line, for the installer's last lines
+
+# worker_sandbox_off INSTANCE_DIR REASON : the workers start as they did before the sandbox, and the box says why.
+worker_sandbox_off() {
+  printf 'off %s\n' "$2" > "$1/sandbox/state"
+  chmod 0644 "$1/sandbox/state"
+  set_overlay "$1/kimina.env" "$LEAN_SANDBOX_OVERLAY" off
+}
+
+# install_worker_sandbox INSTANCE_DIR INSTANCE IMAGE : ask a container of IMAGE whether this box can sandbox
+# each worker, put the sandbox in the instance's directory, and write into its settings whether its workers
+# start in it (whether COMPOSE_FILE holds compose.worker-sandbox.yaml), BEFORE its container is (re)made.
+# Nothing here stops an install.
+install_worker_sandbox() {
+  local dir=$1 instance=$2 image=$3 env=$1/kimina.env project said state reason hint
+  WORKER_SANDBOX_INSTALLED=1
+  hint="sudo kimina-ctl ${instance:+@$instance }sandbox"
+  project=$(lean_pool_source) && [ -f "$project/$LEAN_SANDBOX_MAKE" ] \
+    || die "missing $LEAN_SANDBOX_MAKE: $LEAN_POOL_SOURCE_MISSING"
+  if [ "$(setting_in "$env" LEAN_SERVER_WORKER_SANDBOX)" = off ]; then
+    set_overlay "$env" "$LEAN_SANDBOX_OVERLAY" off
+    WORKER_SANDBOX_SAID="WORKER SANDBOX: off by this box's own setting (LEAN_SERVER_WORKER_SANDBOX=off in $env); '$hint on' turns it on"
+    echo "$WORKER_SANDBOX_SAID"
+    return 0
+  fi
+  # make.sh's last line is the answer: on, or off and why. One that stopped before it could say leaves the
+  # workers as they were before the sandbox too.
+  said=$(mktemp)
+  if bash "$project/$LEAN_SANDBOX_MAKE" --image "$image" --box "$dir" --name "$(lean_server_project "$instance")-sandbox" \
+       </dev/null | tee "$said"; then
+    WORKER_SANDBOX_SAID="$(tail -n 1 "$said"); a real check is sent to the server once it is made"
+    set_overlay "$env" "$LEAN_SANDBOX_OVERLAY" on
+  else
+    state=$(head -n 1 "$dir/sandbox/state" 2>/dev/null || true)
+    case $state in
+      "off "*) reason=${state#off } ;;
+      *) reason="make.sh stopped: $(last_line_of "$said")" ;;
+    esac
+    mkdir -p "$dir/sandbox"
+    worker_sandbox_off "$dir" "$reason"
+    WORKER_SANDBOX_SAID="WORKER SANDBOX: OFF - $reason. The Lean server starts its workers as it did before, without it: every answer is the same, and a check can still reach the other checks of its server. The installer's next run tries again. Full log: $dir/sandbox.log"
+    warn "$WORKER_SANDBOX_SAID"
+  fi
+  rm -f "$said"
+}
+
+# remake_and_check INSTANCE_DIR INSTANCE : make the Lean server again with its settings as they now are, wait
+# until it is healthy, and send it a real check by itself.
+remake_and_check() {
+  local env=$1/kimina.env instance=$2 container state
   # shellcheck disable=SC2086  # no prefix for instance 1
-  /usr/local/bin/kimina-ctl ${instance:+@$instance} check && return 0
-  [ "$(setting_in "$env" LEAN_SERVER_ROOT_READ_ONLY)" = true ] || return 1
-  read_only_off "$dir" "a real check failed against the server with its root read-only"
-  READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check failed against the server with its root read-only, so it was made writable again (as it was: every answer is the same, and a check can still change this server for the checks after it). The installer's next run tries again."
-  warn "$READ_ONLY_SAID"
-  # shellcheck disable=SC2086
   /usr/local/bin/kimina-ctl ${instance:+@$instance} restart
   container=$(lean_container "$env")
   for _ in $(seq 1 60); do
     state=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container" 2>/dev/null || true)
-    [ "$state" = healthy ] && { healthy=1; break; }
+    # shellcheck disable=SC2086
+    [ "$state" != healthy ] || { /usr/local/bin/kimina-ctl ${instance:+@$instance} check; return; }
     sleep 5
   done
-  # shellcheck disable=SC2086
-  [ "$healthy" -eq 1 ] && /usr/local/bin/kimina-ctl ${instance:+@$instance} check && return 0
-  # Writable, it fails as well: the read-only root was not the cause. It stays writable until the next run.
-  read_only_off "$dir" "a real check failed against the server read-only and again writable, so the cause is not the read-only root"
-  READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check failed against the server with its root read-only AND again writable, so the cause is not the read-only root: see the check's failure above. The server stays writable until the installer's next run, which tries again."
-  warn "$READ_ONLY_SAID"
   return 1
+}
+
+# confirm_lean_server INSTANCE_DIR INSTANCE : after the Lean server was (re)made, a real check against it ALONE
+# (not through a pool, which may answer from another server). A server that fails it loses one protection at
+# a time, each time made again and checked once more: first the worker sandbox; if the check fails without it
+# too, the sandbox was not the cause and comes back while the read-only root is tried. Where neither alone was
+# the cause, the server is made as it was before both and checked once more. The caller's verdict is the last
+# check's status.
+confirm_lean_server() {
+  local dir=$1 instance=$2 env=$1/kimina.env probe="" read_only_tried=""
+  # shellcheck disable=SC2086  # no prefix for instance 1
+  /usr/local/bin/kimina-ctl ${instance:+@$instance} check && return 0
+  if has_overlay "$env" "$LEAN_SANDBOX_OVERLAY"; then
+    probe=$(head -n 1 "$dir/sandbox/state" 2>/dev/null || true)     # what the probe found: to put back
+    worker_sandbox_off "$dir" "a real check failed against the server with each worker in its sandbox"
+    WORKER_SANDBOX_SAID="WORKER SANDBOX: OFF - a real check failed against the server with each worker in its sandbox, so it was made again without it (as before: every answer is the same, and a check can still reach the other checks of its server). The installer's next run tries again."
+    warn "$WORKER_SANDBOX_SAID"
+    remake_and_check "$dir" "$instance" && return 0
+  fi
+  if [ "$(setting_in "$env" LEAN_SERVER_ROOT_READ_ONLY)" = true ]; then
+    read_only_tried=1
+    if [ -n "$probe" ]; then
+      # It failed without the sandbox as well, so the sandbox was not the cause: it comes back.
+      printf '%s\n' "$probe" > "$dir/sandbox/state"
+      set_overlay "$env" "$LEAN_SANDBOX_OVERLAY" on
+      WORKER_SANDBOX_SAID="WORKER SANDBOX: on - ${probe#on }; a real check failed with it AND without it, so it was not the cause"
+      echo "$WORKER_SANDBOX_SAID"
+    fi
+    read_only_off "$dir" "a real check failed against the server with its root read-only"
+    READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check failed against the server with its root read-only, so it was made writable again (as it was: every answer is the same, and a check can still change this server for the checks after it). The installer's next run tries again."
+    warn "$READ_ONLY_SAID"
+    remake_and_check "$dir" "$instance" && return 0
+    # Writable, it fails as well: the read-only root was not the cause. It stays writable until the next run.
+    read_only_off "$dir" "a real check failed against the server read-only and again writable, so the cause is not the read-only root"
+    READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check failed against the server with its root read-only AND again writable, so the cause is not the read-only root: see the check's failure above. The server stays writable until the installer's next run, which tries again."
+    warn "$READ_ONLY_SAID"
+  fi
+  [ -n "$probe" ] || return 1
+  # Neither protection alone was the cause. The workers start without the sandbox until the next run.
+  worker_sandbox_off "$dir" "a real check failed against the server with each worker in its sandbox and again without it, so the cause is not the sandbox"
+  WORKER_SANDBOX_SAID="WORKER SANDBOX: OFF - a real check failed against the server with each worker in its sandbox AND again without it, so the cause is not the sandbox: see the check's failure above. The workers start without it until the installer's next run, which tries again."
+  warn "$WORKER_SANDBOX_SAID"
+  [ -n "$read_only_tried" ] || return 1
+  # The last check ran with the sandbox back: once more with neither protection, as the server was before both.
+  remake_and_check "$dir" "$instance" || return 1
+  worker_sandbox_off "$dir" "a real check passed only with the sandbox and the read-only root both off"
+  read_only_off "$dir" "a real check passed only with the sandbox and the read-only root both off"
+  WORKER_SANDBOX_SAID="WORKER SANDBOX: OFF - a real check passed only with the sandbox and the read-only root both off. The installer's next run tries again."
+  READ_ONLY_SAID="READ-ONLY ROOT: OFF - a real check passed only with the sandbox and the read-only root both off. The installer's next run tries again."
+  warn "$WORKER_SANDBOX_SAID"
+  warn "$READ_ONLY_SAID"
+  return 0
 }
 
 # Docker from the snap package cannot do what these installers need: a snap-confined daemon sees its own
@@ -953,6 +1058,9 @@ install_tls_front() {
     || install_compiled_search "$dir" "$instance" "$(setting_in "$env" LEAN_SERVER_IMAGE)"
   # Whether its root filesystem is read-only, decided here for the pool's own host likewise.
   [ -n "$READ_ONLY_INSTALLED" ] || install_read_only_root "$dir" "$instance"
+  # And whether each worker starts in a sandbox of its own.
+  [ -n "$WORKER_SANDBOX_INSTALLED" ] \
+    || install_worker_sandbox "$dir" "$instance" "$(setting_in "$env" LEAN_SERVER_IMAGE)"
   # The egress rule names the whole network; the front's fixed address is its one exception. In place
   # BEFORE the front starts, so its first connections to the server are let through.
   if [ -f "$dir/firewall.conf" ]; then
@@ -1035,13 +1143,13 @@ pack_join_bundle() {
 }
 
 # bundled_project_paths : the lean-pool project's paths a join bundle carries, one a line: only what the image
-# build reads (see the project's .dockerignore), the Lean server's compose files, the compiled search step and
-# the read-only check. No tests, no environment, no caches.
+# build reads (see the project's .dockerignore), the Lean server's compose files, the compiled search step,
+# the read-only check and the worker sandbox. No tests, no environment, no caches.
 bundled_project_paths() {
   local file
   printf '%s\n' pyproject.toml README.md LICENSE leanpool deploy/Dockerfile
   for file in "${LEAN_SERVER_COMPOSE_FILES[@]}"; do printf '%s\n' "$LEAN_SERVER_COMPOSE_DIR/$file"; done
-  printf '%s\n' deploy/lean-server/compiled-search "$LEAN_READ_ONLY_CHECK"
+  printf '%s\n' deploy/lean-server/compiled-search "$LEAN_READ_ONLY_CHECK" deploy/lean-server/worker-sandbox
 }
 
 # installer_version INSTANCE : the version of this installer, one md5 of everything a join bundle of INSTANCE

@@ -529,6 +529,11 @@ if [ -n "$INSTANCE" ] && declare -F install_compiled_search >/dev/null; then
   project=$(lean_pool_source) && [ -f "$project/$LEAN_NATIVE_MAKE" ] \
     || die "missing $LEAN_NATIVE_MAKE: $LEAN_POOL_SOURCE_MISSING"
 fi
+# Every instance asks its own image whether each worker can have a sandbox of its own, with its make.sh.
+if declare -F install_worker_sandbox >/dev/null; then
+  project=$(lean_pool_source) && [ -f "$project/$LEAN_SANDBOX_MAKE" ] \
+    || die "missing $LEAN_SANDBOX_MAKE: $LEAN_POOL_SOURCE_MISSING"
+fi
 # The server's container has an init process. Where the image is already on
 # this host (a re-run, a refresh), a Docker that cannot start such a container is found out HERE, before
 # anything is written: otherwise the running server would be replaced by one that does not start.
@@ -719,6 +724,10 @@ fi
 if declare -F install_read_only_root >/dev/null; then
   install_read_only_root "$DIR" "$INSTANCE"
 fi
+# And whether each worker starts in a sandbox of its own: only where a container of this image made one.
+if declare -F install_worker_sandbox >/dev/null; then
+  install_worker_sandbox "$DIR" "$INSTANCE" "$IMAGE"
+fi
 # The usage agent and the TLS front are services of the instance's own project: their settings and overlays
 # come first, and the project starts once.
 agent_subnet=""
@@ -807,9 +816,10 @@ became_healthy "$CONTAINER" || { compose logs --tail 40 >&2 || true; die "the se
 
 say "Verifying: one valid and one invalid proof through the live server (the first check imports Mathlib)"
 verdict="INSTALLED AND VERIFIED"
-# A read-only server that fails this check is made writable again and checked once more.
-if declare -F confirm_read_only_root >/dev/null; then
-  confirm_read_only_root "$DIR" "$INSTANCE" \
+# A server that fails this check loses one protection at a time, the worker sandbox first and then the
+# read-only root, each time made again and checked once more.
+if declare -F confirm_lean_server >/dev/null; then
+  confirm_lean_server "$DIR" "$INSTANCE" \
     || verdict="INSTALLED, BUT THE CHECK FAILED - see the output above and: sudo kimina-ctl ${CTL_PREFIX}logs 200"
 else
   # shellcheck disable=SC2086
@@ -824,10 +834,11 @@ $verdict
   service     $CONTAINER, image $IMAGE
   url         $shown_url   (API key: sudo kimina-ctl ${CTL_PREFIX}show-key)
   settings    $DIR/kimina.env
-  operate     sudo kimina-ctl ${CTL_PREFIX}status | check | logs [N|build] | up | down | restart | set-repls N | set-cpus N | set-mem SIZE${INSTANCE:+ | compiled-search on|off} | read-only on|off
+  operate     sudo kimina-ctl ${CTL_PREFIX}status | check | logs [N|build] | up | down | restart | set-repls N | set-cpus N | set-mem SIZE${INSTANCE:+ | compiled-search on|off} | read-only on|off | sandbox on|off
 EOF
 [ -z "${COMPILED_SEARCH_SAID:-}" ] || echo "  search      $COMPILED_SEARCH_SAID"
 [ -z "${READ_ONLY_SAID:-}" ] || echo "  read-only   $READ_ONLY_SAID"
+[ -z "${WORKER_SANDBOX_SAID:-}" ] || echo "  sandbox     $WORKER_SANDBOX_SAID"
 # The site's operating guide, where the site has one (a box that joined a pool has only the installer).
 [ ! -f "$SITE/README.md" ] || echo "  guide       $SITE/README.md"
 [ "$verdict" = "INSTALLED AND VERIFIED" ]

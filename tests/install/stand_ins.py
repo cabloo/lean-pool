@@ -45,6 +45,17 @@ run the REAL scripts against a fake machine:
     plays `docker diff` of a Lean server that has served checks (unnamed files in /tmp, Python's byte-code cache,
     git's index of a Lake package, the mount points it was made with; STUB_DIFF_EXTRA adds lines, STUB_DIFF_FAILS fails it). `kimina-ctl check` fails against the
     container STUB_READ_ONLY_CHECK_FAILS names while that container is read-only;
+  - plays the worker sandbox's probe as make.sh runs it (`run --rm --pull never --name N ... --read-only --tmpfs
+    /tmp:... -v DIR:/opt/lean-sandbox:ro --entrypoint sh IMAGE -c '... sandbox.py --probe'`): it refuses a
+    container not made as the server is, and one whose source mount lacks sandbox.py or lean-worker, then says
+    the image's REPL and what the real probe says: Landlock 6, or what a test says (STUB_SANDBOX: `no-landlock`,
+    a kernel without it; `no-python`, an image without python3; `relative-repl`, an image that names its REPL by
+    a relative path). `kimina-ctl check` fails against the container STUB_SANDBOX_CHECK_FAILS names while its
+    workers are started through the sandbox. `top CONTAINER -o pid,args eww` lists a running Lean server's
+    processes with their environment, as the daemon's ps does: Kimina's (the API key in it), and for each
+    worker (STUB_WORKERS_RUNNING, 4) its `lake env` and the REPL itself, which carries the sandbox's mark where
+    the container starts its workers through the sandbox (but the first STUB_WORKERS_UNMARKED of them) and the
+    key where it does not;
   - plays the build and the check as the installers ran them before make.sh too (`run ... --entrypoint bash
     IMAGE -c "bash /lean-native-src/lean-native-build.sh ..."`, writing straight into the directory mounted at
     /opt/lean-native), so the upgrade tests can install a box with an older installer;
@@ -431,6 +442,8 @@ def run(args):
         return compiled_search(image, command[1:], name, given, mount_of)
     if entrypoint == "bash" and command[:1] == ["-c"] and "lean-native-build.sh" in command[1]:
         return compiled_search_in_place(image, name, mount_of)
+    if entrypoint == "sh" and command[:1] == ["-c"] and "sandbox.py --probe" in command[1]:
+        return sandbox_probe(image, name, given, bare, mount_of)
     if entrypoint == "cp":                                   # cp -a FROM/. TO/: one volume's files into another
         if len(command) != 3 or command[0] != "-a" or not command[1].endswith("/.") \
                 or not mount_of(command[1][:-2]) or not mount_of(command[2].rstrip("/")):
@@ -650,6 +663,43 @@ def compiled_search(image, arguments, name, given, mount_of):
     return 0
 
 
+IMAGE_REPL = "/repl/.lake/build/bin/repl"                   # the REPL of every Lean image here
+SANDBOX_LAUNCHER = "/opt/lean-sandbox/lean-worker"           # what compose.worker-sandbox.yaml starts workers as
+
+
+def sandbox_probe(image, name, given, bare, mount_of):
+    """The worker sandbox's probe, as make.sh has a container of the Lean server's image run it: the image's
+    REPL, then what `sandbox.py --probe` says. What the real probe does is tests/test_worker_sandbox.py's; here it
+    is what make.sh must give it, and what the installer does with each outcome (STUB_SANDBOX)."""
+    for option, wanted in (("--pull", "never"), ("--network", "none"), ("--cap-drop", "ALL"),
+                           ("--security-opt", "no-new-privileges:true")):
+        if given.get(option) != [wanted]:
+            fail(f"docker run: the stand-in probes the worker sandbox only in a container made as the server is ({option} {wanted})")
+    if not {"--rm", "--read-only"} <= bare or not any(value.startswith("/tmp:") for value in given.get("--tmpfs", [])):
+        fail("docker run: the stand-in probes the worker sandbox only in a container removed after it, with a "
+             "read-only root and a /tmp in memory")
+    source = mount_of("/opt/lean-sandbox")
+    if source is None or len(given["-v"]) != 1 or not given["-v"][0].endswith(":/opt/lean-sandbox:ro"):
+        fail("docker run: the worker sandbox is probed with its source mounted read-only, and nothing else")
+    for needed in ("sandbox.py", "lean-worker"):
+        if not Path(source[0], needed).is_file():
+            fail(f"python3: can't open file '/opt/lean-sandbox/{needed}': [Errno 2] No such file or directory", 2)
+    if not name:
+        fail("docker run: the stand-in probes the worker sandbox in a named container")
+    if (STATE / f"id.{name}").exists():
+        fail(f'docker: Error response from daemon: Conflict. The container name "/{name}" is already in use.', 125)
+    note("sandbox-probes", image)
+    outcome = os.environ.get("STUB_SANDBOX", "ok")
+    print("LEAN_SERVER_REPL_PATH=" + ("repl" if outcome == "relative-repl" else IMAGE_REPL))
+    if outcome == "no-python":
+        fail("sh: 1: exec: python3: not found", 127)
+    if outcome == "no-landlock":
+        print("WORKER SANDBOX PROBE: FAILED - this kernel has no Landlock (Linux 5.13 or later)")
+        return 1
+    print("WORKER SANDBOX PROBE: ok - Landlock 6: /proc, files, TCP, signals")
+    return 0
+
+
 def image_state(tag):
     """Where the stand-in keeps "this image exists", and what it was made from."""
     return STATE / ("built." + tag.replace("/", "_").replace(":", "_"))
@@ -727,6 +777,9 @@ def main():
         if argv[1:2] == ["inspect"]:
             if not holder.exists():
                 fail(f"Error response from daemon: No such image: {argv[-1]}")
+            if "-f" not in argv:                             # the whole record: is the image there?
+                print(json.dumps([{"Id": "sha256:" + holder.read_text()}]))
+                return 0
             digest, template = holder.read_text(), argv[argv.index("-f") + 1]
             if template == "{{.Id}}":
                 # The image's ID is the digest of its config under one image store and of its manifest under
@@ -787,7 +840,36 @@ def main():
             # `kimina-ctl check` against a Lean server that does not work with its root read-only.
             print('{"check": "FAILED", "reason": "OSError(30, \'Read-only file system\')"}')
             return 1
+        made_as = STATE / f"repl-path.{argv[-3]}"
+        if "kimina_ctl_valid" in program and os.environ.get("STUB_SANDBOX_CHECK_FAILS") == argv[-3] \
+                and made_as.exists() and made_as.read_text() == SANDBOX_LAUNCHER:
+            # `kimina-ctl check` against a Lean server whose workers do not start in their sandbox.
+            print('{"check": "FAILED", "reason": "the server answered 500: the REPL did not start"}')
+            return 1
         return inside_pool(program)
+    if verb == "top":                                        # top CONTAINER -o pid,args eww
+        name = argv[1]
+        if argv[2:] != ["-o", "pid,args", "eww"]:
+            fail("docker top: the stand-in lists a container's processes only as `-o pid,args eww`")
+        if not is_running(name):
+            fail(f"Error response from daemon: container {name} is not running")
+        note("tops", name)
+        made_as = STATE / f"repl-path.{name}"
+        program = made_as.read_text() if made_as.exists() else IMAGE_REPL
+        key = "LEAN_SERVER_API_KEY=the-key-a-status-line-must-never-show"
+        lines = ["PID                 COMMAND",
+                 f"4242                /usr/bin/python3 -m server HOME=/root {key} LEAN_SERVER_REPL_PATH={program}"]
+        unmarked = int(os.environ.get("STUB_WORKERS_UNMARKED", "0"))
+        for number in range(int(os.environ.get("STUB_WORKERS_RUNNING", "4"))):
+            pid = 5000 + 2 * number
+            lines.append(f"{pid}                /root/.elan/bin/lake env {program} HOME=/root {key}")
+            if program == SANDBOX_LAUNCHER and number >= unmarked:
+                environment = "HOME=/root LEANPOOL_WORKER_SANDBOX=landlock-6"
+            else:
+                environment = f"HOME=/root {key}"
+            lines.append(f"{pid + 1}                {IMAGE_REPL} {environment}")
+        sys.stdout.write("".join(line + "\n" for line in lines))
+        return 0
     if verb == "ps":
         names = [path.name for path in sorted((STATE / "running").iterdir()) if is_running(path.name)]
         names += [path.name[4:] for path in STATE.glob("pid.*") if is_running(path.name[4:])]
@@ -1161,10 +1243,12 @@ PROJECT_FILES = (
     "deploy/Dockerfile",
     "deploy/lean-server/compiled-search",
     "deploy/lean-server/read-only-check.sh",
+    "deploy/lean-server/worker-sandbox",
     "deploy/lean-server/compose.yaml",
     "deploy/lean-server/compose.agent.yaml",
     "deploy/lean-server/compose.tls.yaml",
     "deploy/lean-server/compose.compiled-search.yaml",
+    "deploy/lean-server/compose.worker-sandbox.yaml",
     "deploy/pool/compose.yaml",
     "deploy/pool/compose.tls.yaml",
     "deploy/pool/compose.dns.yaml",
@@ -1389,6 +1473,21 @@ class Machine:
         holder = self.stub / "state" / f"repl-path.{name}"
         return holder.read_text() if holder.exists() else ""
 
+    def worker_runs(self, name: str) -> str:
+        """The program a Lean server's workers run, as its container was last made. Started through the worker
+        sandbox's launcher, a worker runs what lean-worker starts: the compiled search step's launcher where
+        that is mounted, else the image's REPL."""
+        program = self.worker_program(name)
+        if program != "/opt/lean-sandbox/lean-worker":
+            return program
+        holder = self.stub / "state" / f"mounts.{name}"
+        mounted = holder.read_text().split() if holder.exists() else []
+        return (
+            "/opt/lean-native/repl-native"
+            if "/opt/lean-native" in mounted
+            else "/repl/.lake/build/bin/repl"
+        )
+
     def read_only(self, name: str) -> bool:
         """Whether a container's root filesystem was read-only when it was last made."""
         holder = self.stub / "state" / f"read-only.{name}"
@@ -1402,6 +1501,11 @@ class Machine:
     def native_builds(self) -> list[str]:
         """The images the compiled search step was built and checked in, in order."""
         holder = self.stub / "native-builds"
+        return holder.read_text().splitlines() if holder.exists() else []
+
+    def sandbox_probes(self) -> list[str]:
+        """The images the worker sandbox's probe ran in, in order."""
+        holder = self.stub / "sandbox-probes"
         return holder.read_text().splitlines() if holder.exists() else []
 
     def reloads(self) -> list[str]:

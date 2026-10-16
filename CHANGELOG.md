@@ -49,6 +49,9 @@ A week of running the pool on boxes that also do other work.
   write anywhere but `/tmp`; open TCP (Landlock 4); or signal another worker (Landlock 6). Each
   worker starts without the server's key. `make.sh` asks a container of the box's own image
   whether the sandbox can be made there, and a worker that cannot be sandboxed does not start.
+  The installers turn it on where that probe passes and keep it where a real check then passes
+  (else one protection is taken away at a time, the sandbox first); `kimina-ctl [@NAME] sandbox
+  on|off` switches it, and `status` counts the running workers that carry its mark.
 - **A second, screened key for the cache** (`--screened-api-key-file`): for senders trusted less
   than the pool's own. Their checks must first pass [the screen](docs/cache.md#the-screened-key)
   (`leanpool/screen.py`: no `#eval`, `run_tac`, `elab`, `IO`, most attributes or imports beyond

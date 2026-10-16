@@ -294,6 +294,7 @@ def test_every_container_runs_under_its_new_name_and_no_older_project_is_left(
     # Each instance and the pool is one project, of the files its env file names.
     assert settings(machine, f"{INSTANCE}/kimina.env")["COMPOSE_FILE"] == (
         "compose.yaml:compose.agent.yaml:compose.tls.yaml:compose.compiled-search.yaml"
+        ":compose.worker-sandbox.yaml"
     )
     assert settings(machine, f"{INSTANCE_ONE}/kimina.env")["COMPOSE_FILE"] == "compose.yaml"
     for name in ("kimina", "agent", "front"):
@@ -343,8 +344,11 @@ def test_each_lean_server_is_made_again_once_and_the_front_keeps_its_address(
 ) -> None:
     machine = moved.machine
     made = machine.recreated()[moved.before.recreated :]
-    for name in ("lean-server-kimina-1", "lean-server-demo-kimina-1"):
-        assert made.count(name) == 1, made
+    # Instance 1 once, by the move. The pool's own server twice: by the move, as it was (a move that fails its
+    # check is taken back, so it adds nothing), then to start its workers in the sandbox, which the older
+    # installers did not have.
+    assert made.count("lean-server-kimina-1") == 1, made
+    assert made.count("lean-server-demo-kimina-1") == 2, made
     demo = settings(machine, f"{INSTANCE}/kimina.env")
     assert (
         demo["LEAN_SERVER_FRONT_ADDRESS"]

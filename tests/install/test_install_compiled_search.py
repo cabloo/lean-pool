@@ -154,8 +154,8 @@ def test_an_install_builds_the_step_checks_it_and_only_then_starts_the_workers_w
         in compose
     )
     assert f"      LEAN_SERVER_REPL_PATH: {LAUNCHER}\n" in compose
-    assert settings(fresh)["COMPOSE_FILE"].endswith(f":{OVERLAY}")
-    assert overlaid(fresh) and fresh.worker_program(LEAN) == LAUNCHER
+    assert settings(fresh)["COMPOSE_FILE"].endswith(f":{OVERLAY}:compose.worker-sandbox.yaml")
+    assert overlaid(fresh) and fresh.worker_runs(LEAN) == LAUNCHER
     assert "LEAN_SERVER_COMPILED_SEARCH" not in settings(fresh)
     # Said where it was made and again in the installer's last lines.
     assert result.stdout.count(f"COMPILED SEARCH STEP: on - {MEASURED}") == 2
@@ -179,7 +179,7 @@ def test_a_second_run_makes_nothing_again(machine):
         machine.native_builds(),
         machine.path(f"{NATIVE}/linarith-search.so").stat().st_mtime_ns,
     ) == had
-    assert machine.worker_program(LEAN) == LAUNCHER
+    assert machine.worker_runs(LEAN) == LAUNCHER
 
 
 @pytest.mark.parametrize("changed", MADE_FROM)
@@ -243,13 +243,13 @@ def test_an_image_without_the_c_files_installs_with_the_plain_repl_and_says_so(f
     # Nothing a worker could load, and the server runs the program it always ran.
     assert held(fresh) == LAUNCHER_ONLY and not fresh.path(f"{INSTANCE}/native.built").exists()
     assert fresh.path(f"{NATIVE}/state").read_text().startswith("off nothing was built: ")
-    assert not overlaid(fresh) and fresh.worker_program(LEAN) == PLAIN and fresh.running(LEAN)
+    assert not overlaid(fresh) and fresh.worker_runs(LEAN) == PLAIN and fresh.running(LEAN)
     assert status_line(fresh).startswith(f"{START} OFF (nothing was built: ")
     assert status_line(fresh).endswith("; the workers run the plain REPL, with the same answers)")
     # The next run tries again, and a build that passes turns the step on: the server is made again, once.
     had = fresh.recreated()
     installed(fresh)
-    assert fresh.worker_program(LEAN) == LAUNCHER and fresh.recreated() == [*had, LEAN]
+    assert fresh.worker_runs(LEAN) == LAUNCHER and fresh.recreated() == [*had, LEAN]
     assert status_line(fresh) == f"{START} on ({MEASURED})"
 
 
@@ -259,7 +259,7 @@ def test_a_library_that_does_not_pass_its_check_is_never_given_to_the_server(fre
     assert f"WARNING: COMPILED SEARCH STEP: OFF - {reason}." in result.stderr
     assert held(fresh) == LAUNCHER_ONLY  # the library the build wrote stayed in its container
     assert fresh.path(f"{NATIVE}/state").read_text() == f"off {reason}\n"
-    assert not overlaid(fresh) and fresh.worker_program(LEAN) == PLAIN
+    assert not overlaid(fresh) and fresh.worker_runs(LEAN) == PLAIN
     assert (
         status_line(fresh)
         == f"{START} OFF ({reason}; the workers run the plain REPL, with the same answers)"
@@ -276,7 +276,7 @@ def test_a_box_that_had_the_step_loses_it_when_a_newer_build_does_not_pass(tmp_p
     assert "COMPILED SEARCH STEP: OFF" in result.stderr
     assert held(machine) == LAUNCHER_ONLY and not machine.path(f"{INSTANCE}/native.built").exists()
     assert not overlaid(machine)
-    assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [*had, LEAN, AGENT]
+    assert machine.worker_runs(LEAN) == PLAIN and machine.recreated() == [*had, LEAN, AGENT]
 
 
 # --- the switch ---------------------------------------------------------------------------------------------------
@@ -288,7 +288,7 @@ def test_off_starts_the_plain_repl_and_on_goes_back_with_the_library_the_box_kep
     assert result.returncode == 0, result.stderr
     assert "compiled search step off: the workers run the plain REPL" in result.stdout
     assert not overlaid(machine) and settings(machine)["LEAN_SERVER_COMPILED_SEARCH"] == "off"
-    assert machine.worker_program(LEAN) == PLAIN and machine.recreated() == [
+    assert machine.worker_runs(LEAN) == PLAIN and machine.recreated() == [
         *had,
         LEAN,
     ]  # not its usage agent
@@ -306,7 +306,7 @@ def test_off_starts_the_plain_repl_and_on_goes_back_with_the_library_the_box_kep
     assert result.returncode == 0, result.stderr
     assert f"compiled search step on: {MEASURED}" in result.stdout
     assert overlaid(machine) and "LEAN_SERVER_COMPILED_SEARCH" not in settings(machine)
-    assert machine.worker_program(LEAN) == LAUNCHER and machine.recreated() == [*had, LEAN, LEAN]
+    assert machine.worker_runs(LEAN) == LAUNCHER and machine.recreated() == [*had, LEAN, LEAN]
     assert status_line(machine) == f"{START} on ({MEASURED})"
 
 
@@ -320,7 +320,7 @@ def test_a_later_run_of_the_installer_keeps_an_off_and_builds_nothing(machine):
     )
     assert "'sudo kimina-ctl @demo compiled-search on' turns it on" in result.stdout
     assert (machine.recreated(), machine.native_builds()) == had
-    assert not overlaid(machine) and machine.worker_program(LEAN) == PLAIN
+    assert not overlaid(machine) and machine.worker_runs(LEAN) == PLAIN
 
 
 def test_on_refuses_where_the_box_has_no_library_that_passed_and_clears_the_setting(fresh):
@@ -334,19 +334,19 @@ def test_on_refuses_where_the_box_has_no_library_that_passed_and_clears_the_sett
     )
     assert "the join command with --refresh" in result.stderr
     assert not overlaid(fresh) and "LEAN_SERVER_COMPILED_SEARCH" not in settings(fresh)
-    assert fresh.worker_program(LEAN) == PLAIN and fresh.recreated() == had
+    assert fresh.worker_runs(LEAN) == PLAIN and fresh.recreated() == had
     # The installer's next run makes one, now that nothing says off.
     installed(fresh)
-    assert fresh.worker_program(LEAN) == LAUNCHER
+    assert fresh.worker_runs(LEAN) == LAUNCHER
 
 
 def test_the_switch_goes_through_the_door(machine):
     result = machine.bash(machine.path(CTL), SSH_ORIGINAL_COMMAND="@demo compiled-search off")
     assert result.returncode == 0, result.stderr
-    assert machine.worker_program(LEAN) == PLAIN
+    assert machine.worker_runs(LEAN) == PLAIN
     result = machine.bash(machine.path(CTL), SSH_ORIGINAL_COMMAND="@demo compiled-search on")
     assert result.returncode == 0, result.stderr
-    assert machine.worker_program(LEAN) == LAUNCHER
+    assert machine.worker_runs(LEAN) == LAUNCHER
 
 
 @pytest.mark.parametrize(
@@ -397,10 +397,10 @@ def test_status_says_when_the_launcher_has_nothing_to_load(machine):
 
 def test_status_of_a_server_from_before_the_step(machine):
     env = machine.path(f"{INSTANCE}/kimina.env")
-    env.write_text(env.read_text().replace(f":{OVERLAY}\n", "\n"))
+    env.write_text(env.read_text().replace(f":{OVERLAY}", ""))
     machine.path(f"{NATIVE}/state").unlink()
     assert control(machine, "restart").returncode == 0
-    assert machine.worker_program(LEAN) == PLAIN  # the image's own
+    assert machine.worker_runs(LEAN) == PLAIN  # the image's own
     assert (
         status_line(machine)
         == f"{START} OFF (this server was installed before it had one: the installer, or a refresh, makes and checks it)"
@@ -417,8 +417,10 @@ def test_instance_one_gets_no_step_and_the_program_it_always_ran(fresh):
         "COMPILED SEARCH STEP" not in result.stdout + result.stderr and fresh.native_builds() == []
     )
     assert not fresh.path("/srv/kimina/native").exists()
-    assert settings(fresh, "/srv/kimina")["COMPOSE_FILE"] == "compose.yaml"
-    assert fresh.worker_program("lean-server-kimina-1") == PLAIN
+    assert (
+        settings(fresh, "/srv/kimina")["COMPOSE_FILE"] == "compose.yaml:compose.worker-sandbox.yaml"
+    )
+    assert fresh.worker_runs("lean-server-kimina-1") == PLAIN
     status = fresh.bash(fresh.path(CTL), "status")
     assert status.returncode == 0 and START not in status.stdout
 
@@ -432,8 +434,8 @@ def test_the_pools_own_host_keeps_what_its_instance_made_and_says_so_last(machin
         "  search      COMPILED SEARCH STEP: on - already made from this image and checked"
         in result.stdout
     )
-    assert machine.native_builds() == had and machine.worker_program(LEAN) == LAUNCHER
-    # Behind its TLS front now, with the step's overlay last.
+    assert machine.native_builds() == had and machine.worker_runs(LEAN) == LAUNCHER
+    # Behind its TLS front now, with the step's overlay and then the worker sandbox's last.
     assert settings(machine)["COMPOSE_FILE"] == (
-        f"compose.yaml:compose.agent.yaml:compose.tls.yaml:{OVERLAY}"
+        f"compose.yaml:compose.agent.yaml:compose.tls.yaml:{OVERLAY}:compose.worker-sandbox.yaml"
     )

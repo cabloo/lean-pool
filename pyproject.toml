@@ -130,6 +130,7 @@ module = [
     "test_install_reaping",
     "test_install_run",
     "test_install_tls_front",
+    "test_install_worker_sandbox",
 ]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false

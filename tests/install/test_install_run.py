@@ -85,7 +85,9 @@ def pin_of(machine: Machine) -> str:
 
 
 def changing(calls: list[str]) -> list[str]:
-    """The calls that change something that runs: a container made, removed or signalled, a firewall re-applied."""
+    """The calls that change something that runs: a container made, removed or signalled, a firewall re-applied.
+    Not the removal of the container the compiled search step is built in, or the worker sandbox's probe runs
+    in: neither ever serves anything."""
     return [
         call
         for call in calls
@@ -93,6 +95,7 @@ def changing(calls: list[str]) -> list[str]:
             r"^docker (rm|kill|stop|start) | up -d| down$|^systemctl restart |^docker exec \S+ sh -c kill -HUP 1$",
             call,
         )
+        and not re.fullmatch(r"docker rm -f lean-server(-[a-z0-9-]+)?-(native|sandbox)", call)
     ]
 
 
@@ -256,8 +259,11 @@ def test_the_upgrade_gives_the_pools_own_lean_server_the_compiled_search_step(up
         upgraded.result.stdout[-3000:] + upgraded.result.stderr[-3000:]
     )
     assert "  search      COMPILED SEARCH STEP: on - " in upgraded.result.stdout
-    assert machine.worker_program("lean-server-demo-kimina-1") == "/opt/lean-native/repl-native"
-    assert compose_files_of(machine)[-1] == "compose.compiled-search.yaml"
+    assert machine.worker_runs("lean-server-demo-kimina-1") == "/opt/lean-native/repl-native"
+    assert compose_files_of(machine)[-2:] == [
+        "compose.compiled-search.yaml",
+        "compose.worker-sandbox.yaml",
+    ]
     assert {path.name for path in machine.path(f"{INSTANCE}/native").iterdir()} == {
         "repl-native",
         "repl-path",
@@ -399,12 +405,14 @@ def test_this_boxs_server_went_behind_a_front_that_lets_in_the_proxy_alone(upgra
         "compose.yaml",
         "compose.agent.yaml",
         "compose.compiled-search.yaml",
+        "compose.worker-sandbox.yaml",
     ]
     assert compose_files_of(machine) == [
         "compose.yaml",
         "compose.agent.yaml",
         "compose.tls.yaml",
         "compose.compiled-search.yaml",
+        "compose.worker-sandbox.yaml",
     ]
     settings = machine.path(f"{INSTANCE}/kimina.env").read_text()
     assert (
@@ -620,8 +628,8 @@ def test_re_running_either_instance_installer_after_the_upgrade_recreates_only_a
     assert pool.bash("install.sh", "--no-door").returncode == 0
     assert pool.container_id("lean-server-kimina-1") == one and pool.recreated() == recreated
     assert snapshot(pool.path("/srv/kimina")) == before
-    # Instance 1 stays published, plain.
-    assert compose_files_of(pool, "/srv/kimina") == ["compose.yaml"]
+    # Instance 1 stays published, plain, its workers in the sandbox.
+    assert compose_files_of(pool, "/srv/kimina") == ["compose.yaml", "compose.worker-sandbox.yaml"]
     # The pool member stays behind its front, with the certificate and the settings it has.
     box = pool.path(f"{INSTANCE}/tls/box.pem").read_bytes()
     result = pool.bash("install.sh", "--instance", "demo", "--no-door")
@@ -1453,13 +1461,13 @@ def test_status_counts_the_containers_zombies_at_the_end_of_its_usage_line(pool)
     calls = pool.calls_since(mark)
     assert f"docker inspect -f {{{{.State.Pid}}}} {{{{.Id}}}} {LEAN}" in calls
     # Asked of the host. Nothing is started in the Lean server's container (it could not be, at its process
-    # limit), and `docker top` is not used (it shows no zombie: tests/install/test_install_reaping.py).
+    # limit), and `docker top` is not what counts them (it shows no zombie: tests/install/test_install_reaping.py):
+    # it is asked once, for the live workers that carry the worker sandbox's mark.
     # The one `docker exec` of a status is in the usage agent's own container, to hear what it says.
-    assert not any(
-        call.startswith("docker top")
-        or (call.startswith("docker exec") and f" {LEAN} " in f"{call} ")
-        for call in calls
-    )
+    assert not any(call.startswith("docker exec") and f" {LEAN} " in f"{call} " for call in calls)
+    assert [call for call in calls if call.startswith("docker top")] == [
+        f"docker top {LEAN} -o pid,args eww"
+    ]
     assert [call for call in calls if call.startswith("docker exec")] == [
         "docker exec -i lean-server-demo-agent-1 python -"
     ]
@@ -2903,8 +2911,9 @@ def test_a_lean_server_that_never_answers_is_reported_after_thirty_tries(tmp_pat
         result.returncode == 1
         and "POOL INSTALLED, BUT THE CHECK THROUGH IT FAILED" in result.stdout
     )
-    # Thirty through the pool; then this box's own server by itself, read-only and again writable.
-    assert result.stdout.count('"check": "FAILED"') == 30 + 2
+    # Thirty through the pool; then this box's own server by itself, with both protections, without the
+    # worker sandbox, with it and writable, and with neither.
+    assert result.stdout.count('"check": "FAILED"') == 30 + 4
 
 
 # --- F. nothing a box sends reaches the operator's terminal unprintable ---------------------------------------------------

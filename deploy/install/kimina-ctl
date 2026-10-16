@@ -34,6 +34,9 @@
 #   [@NAME] read-only on|off            whether the Lean server's root filesystem is read-only;
 #                                       `on` only where the installer's own reading of this server passed.
 #                                       The Lean server is made again, nothing else
+#   [@NAME] sandbox on|off              whether each worker starts in a sandbox of its own; `on` only where
+#                                       the installer's probe of this box passed. The Lean server is made
+#                                       again, nothing else
 #   [@NAME] show-key                    print the API key (clients need it)
 #
 #   @proxy-NAME status | servers | check | logs [N] | restart | cache-stop | cache-start
@@ -66,7 +69,7 @@ cmd=${SSH_ORIGINAL_COMMAND:-${*:-status}}
 stamp() { date -u +%FT%TZ; }
 log()   { { printf '%s kimina-ctl[%s]: %s\n' "$(stamp)" "${SSH_CLIENT:-local}" "$*" >> "$LOG"; } 2>/dev/null; }
 refuse() {
-  echo "kimina-ctl: refused '$cmd' - allowed: [@NAME] status | check | logs [N|build] | up | down | restart | set-repls N | set-cpus N | set-mem SIZE | set-beside N|none | read-only on|off | show-key ; @NAME compiled-search on|off ; @proxy-NAME status | servers | check | ca | logs [N] | restart | cache-stop | cache-start | admit HOST:PORT WORKERS [SERVER] | add-backend SERVER HOST:PORT WORKERS [AGENT_PORT] | remove-backend SERVER | pause SERVER | resume SERVER | set-workers SERVER N | join-open [MINUTES]" >&2
+  echo "kimina-ctl: refused '$cmd' - allowed: [@NAME] status | check | logs [N|build] | up | down | restart | set-repls N | set-cpus N | set-mem SIZE | set-beside N|none | read-only on|off | sandbox on|off | show-key ; @NAME compiled-search on|off ; @proxy-NAME status | servers | check | ca | logs [N] | restart | cache-stop | cache-start | admit HOST:PORT WORKERS [SERVER] | add-backend SERVER HOST:PORT WORKERS [AGENT_PORT] | remove-backend SERVER | pause SERVER | resume SERVER | set-workers SERVER N | join-open [MINUTES]" >&2
   log "REFUSED: ${cmd}"
   exit 2
 }
@@ -153,7 +156,7 @@ case "$verb" in
     # What the installer's --mem-limit takes: a whole number from 1, then g or m.
     [ -z "$arg2" ] || refuse
     [[ "$arg" =~ ^[1-9][0-9]{0,3}[gGmM]$ ]] || refuse ;;
-  compiled-search|read-only)
+  compiled-search|read-only|sandbox)
     [ -z "$arg2" ] || refuse
     [ "$arg" = on ] || [ "$arg" = off ] || refuse ;;
   *)
@@ -202,9 +205,9 @@ set_setting() {   # set_setting KEY VALUE : replace or append one line of kimina
   grep -q "^$1=$2\$" "$ENV_FILE" || echo "$1=$2" >> "$ENV_FILE"
 }
 
-# The overlays, in the order the installer lists them after compose.yaml: the usage agent, the TLS front and
-# the compiled search step.
-OVERLAYS=(compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml)
+# The overlays, in the order the installer lists them after compose.yaml: the usage agent, the TLS front, the
+# compiled search step and the worker sandbox.
+OVERLAYS=(compose.agent.yaml compose.tls.yaml compose.compiled-search.yaml compose.worker-sandbox.yaml)
 has_overlay() { [[ ":$(setting COMPOSE_FILE):" == *":$1:"* ]]; }
 set_overlay() {   # set_overlay FILE on|off : COMPOSE_FILE with FILE in or out, the others as they were
   local now list=compose.yaml file
@@ -294,6 +297,27 @@ memory_ceiling_line() {
 # in the container at this path by its overlay (compose.compiled-search.yaml), which starts every worker with it.
 NATIVE_LAUNCHER=/opt/lean-native/repl-native
 NATIVE_OVERLAY=compose.compiled-search.yaml
+# The worker sandbox: the launcher the installer puts in the instance's `sandbox/` directory, mounted in the
+# container at this path by its overlay (compose.worker-sandbox.yaml), which starts every worker in it. Inside
+# the sandbox it starts the compiled step's launcher where that is mounted too.
+SANDBOX_LAUNCHER=/opt/lean-sandbox/lean-worker
+SANDBOX_OVERLAY=compose.worker-sandbox.yaml
+
+# running_program : the program the RUNNING container starts its workers as: Docker's record of its
+# environment, of which only this one variable is read (the API key is in the same list).
+running_program() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null | sed -n 's/^LEAN_SERVER_REPL_PATH=//p' | head -n 1
+}
+
+# runs_native_launcher : whether the running container's workers start through the compiled step's
+# launcher: directly, or from inside the sandbox while the launcher is mounted beside it.
+runs_native_launcher() {
+  local running
+  running=$(running_program)
+  [ "$running" = "$NATIVE_LAUNCHER" ] && return 0
+  [ "$running" = "$SANDBOX_LAUNCHER" ] \
+    && [[ " $(docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$CONTAINER" 2>/dev/null) " == *" ${NATIVE_LAUNCHER%/*} "* ]]
+}
 
 # compiled_search_here : this box holds a library its installer made AND saw work (the launcher loads it only
 # while it still matches the image's C files, which it checks itself each time a worker starts).
@@ -307,12 +331,11 @@ compiled_search_here() {
 # only this one variable is read: the API key is in the same list) and from the installer's record of what
 # this box's own check measured. Named instances only: instance 1 has no compiled step.
 compiled_search_line() {
-  local running state hint
+  local state hint
   [ -n "$INSTANCE" ] || return 0
-  running=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null | sed -n 's/^LEAN_SERVER_REPL_PATH=//p' | head -n 1)
   state=$(head -n 1 "$DIR/native/state" 2>/dev/null)
   hint="sudo kimina-ctl @$INSTANCE"
-  if [ "$running" = "$NATIVE_LAUNCHER" ]; then
+  if runs_native_launcher; then
     if compiled_search_here; then
       echo "--- compiled search step: on (${state#on })"
     else
@@ -352,6 +375,43 @@ read_only_line() {
     fi
   else
     echo "--- read-only root: OFF (this server was installed before it had one: the installer, or a refresh, reads it and turns it on)"
+  fi
+}
+
+# sandboxed_workers : how many of the workers Kimina has started carry the sandbox's mark, as `K of N`,
+# read from the running processes themselves. `docker top` lists the container's processes with their
+# environment (the daemon runs ps, which may read it), and a worker is a process started as the image's REPL
+# (the path in sandbox/repl-path), with the compiled step or without it. The listing is only counted, never
+# shown: Kimina's own line holds the API key.
+sandboxed_workers() {
+  local repl listing total marked
+  repl=$(head -n 1 "$DIR/sandbox/repl-path" 2>/dev/null)
+  [ -n "$repl" ] || { echo '?'; return 0; }
+  listing=$(docker top "$CONTAINER" -o pid,args eww 2>/dev/null) || { echo '?'; return 0; }
+  total=$(awk -v repl="$repl" '$2 == repl { count++ } END { print count + 0 }' <<<"$listing")
+  marked=$(awk -v repl="$repl" '$2 == repl && / LEANPOOL_WORKER_SANDBOX=landlock-[0-9]+( |$)/ { count++ } END { print count + 0 }' <<<"$listing")
+  if [ "$total" -eq 0 ]; then echo "no worker running"; else echo "$marked of $total"; fi
+}
+
+# sandbox_line : whether this server's workers each start in a sandbox of their own: from what the RUNNING
+# container starts them as, from the installer's record of its probe of this box, and from the workers.
+sandbox_line() {
+  local state hint="sudo kimina-ctl ${INSTANCE:+@$INSTANCE }"
+  state=$(head -n 1 "$DIR/sandbox/state" 2>/dev/null)
+  if [ "$(running_program)" = "$SANDBOX_LAUNCHER" ]; then
+    if [ "${state%% *}" = on ]; then
+      echo "--- worker sandbox: on (${state#on }); workers sandboxed: $(sandboxed_workers)"
+    else
+      echo "--- worker sandbox: on in the running container, but this box's probe did not pass ('${state:-no record}'): a worker that cannot be sandboxed does not start (re-run the installer, or ${hint}sandbox off); workers sandboxed: $(sandboxed_workers)"
+    fi
+  elif has_overlay "$SANDBOX_OVERLAY"; then
+    echo "--- worker sandbox: on in the settings, NOT in effect (the running container was made before it: ${hint}restart)"
+  elif [ "$(setting LEAN_SERVER_WORKER_SANDBOX)" = off ]; then
+    echo "--- worker sandbox: OFF (turned off on this box: ${hint}sandbox on)"
+  elif [ "${state%% *}" = off ]; then
+    echo "--- worker sandbox: OFF (${state#off }; the workers start without it, with the same answers)"
+  else
+    echo "--- worker sandbox: OFF (this server was installed before it had one: the installer, or a refresh, asks its image and turns it on)"
   fi
 }
 
@@ -480,6 +540,7 @@ case "$verb" in
     memory_ceiling_line
     compiled_search_line
     read_only_line
+    sandbox_line
     if systemctl is-enabled --quiet "$FW_UNIT" 2>/dev/null; then
       echo "--- firewall: $FW_UNIT enabled; inbound rule $(iptables -S DOCKER-USER 2>/dev/null | grep -c -- "-j KIMINA-LAN$CHAIN_SUFFIX\$") jump(s) in DOCKER-USER; egress block $(iptables -S DOCKER-USER 2>/dev/null | grep -c -- "-j KIMINA-EGRESS$CHAIN_SUFFIX\$") in DOCKER-USER, $(iptables -S INPUT 2>/dev/null | grep -c -- "-j KIMINA-EGRESS$CHAIN_SUFFIX\$") in INPUT"
     else
@@ -614,6 +675,31 @@ case "$verb" in
       server_again
       log "read-only on"
       echo "read-only root on: the Lean server was made again with it (to check it: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }check)"
+    fi
+    ;;
+
+  sandbox)
+    # Only the program a worker is started as changes (the overlay comes in or goes), so only the Lean server
+    # is made again. `off` is a setting every later installer run keeps. `on` puts the overlay back only where
+    # the installer's probe of this box passed (`on` in sandbox/state): a worker that cannot be sandboxed
+    # does not start. Elsewhere the installer's next run asks the image again.
+    if [ "$arg" = off ]; then
+      set_setting LEAN_SERVER_WORKER_SANDBOX off
+      set_overlay "$SANDBOX_OVERLAY" off
+      server_again
+      log "sandbox off"
+      echo "worker sandbox off: the workers start without it (the same answers; a check can reach the other checks of this server)"
+    else
+      sed -i '/^LEAN_SERVER_WORKER_SANDBOX=/d' "$ENV_FILE"
+      if [ "$(head -n 1 "$DIR/sandbox/state" 2>/dev/null | cut -d ' ' -f 1)" != on ] || [ ! -x "$DIR/sandbox/lean-worker" ]; then
+        log "sandbox on -> no probe of this box passed"
+        echo "kimina-ctl: the installer has not seen this box make the sandbox, so the workers stay without it. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) asks its image again" >&2
+        exit 1
+      fi
+      set_overlay "$SANDBOX_OVERLAY" on
+      server_again
+      log "sandbox on"
+      echo "worker sandbox on: $(head -n 1 "$DIR/sandbox/state" | cut -d ' ' -f 2-) (to check it: sudo kimina-ctl ${INSTANCE:+@$INSTANCE }check)"
     fi
     ;;
 

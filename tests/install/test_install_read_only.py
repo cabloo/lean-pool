@@ -159,11 +159,12 @@ def test_an_install_over_a_server_that_wrote_only_tmp_and_byte_code_switches_it(
         "A /tmp/tmpq8x1v2c4" in listing
         and "__pycache__" in listing
         and "A /opt/lean-native" in listing
+        and "A /opt/lean-sandbox" in listing
     )
     assert "/lean-project/.lake/packages/mathlib/.git/index" in listing  # git's own cache, allowed
     assert "A /usr/sbin/docker-init" in listing  # Docker's own init, allowed
     assert (
-        "docker diff: 18 lines, 0 outside /tmp, the mount points (Docker's own too), Python's byte-code cache and "
+        "docker diff: 20 lines, 0 outside /tmp, the mount points (Docker's own too), Python's byte-code cache and "
         "git's index of each Lake package"
     ) in result.stdout
     line = "READ-ONLY ROOT: on - the running server wrote nothing outside /tmp; a real check is sent to it once it is made again"
@@ -180,7 +181,7 @@ def test_a_server_that_wrote_elsewhere_stays_writable_and_the_next_run_reads_it_
         said(result, f"READ-ONLY ROOT: OFF - {reason}. The Lean server stays writable, as it was")
         == 2
     )
-    assert "docker diff: 21 lines, 1 outside /tmp" in result.stdout
+    assert "docker diff: 23 lines, 1 outside /tmp" in result.stdout
     assert (
         state(writable) == f"off {reason}\n"
         and settings(writable)["LEAN_SERVER_ROOT_READ_ONLY"] == "false"
@@ -396,9 +397,7 @@ def test_the_pools_own_host_switches_its_server_and_checks_it_by_itself(writable
     result = writable.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES)
     assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
     assert "POOL INSTALLED AND VERIFIED" in result.stdout and writable.read_only(LEAN)
-    assert (
-        "Verifying this box's own Lean server by itself, with its root read-only" in result.stdout
-    )
+    assert "Verifying this box's own Lean server by itself, with its protections" in result.stdout
     assert (
         "  read-only   READ-ONLY ROOT: on - the running server wrote nothing outside /tmp"
         in result.stdout
@@ -436,9 +435,7 @@ def test_the_pools_own_host_keeps_a_failed_check_through_the_pool_as_its_verdict
         and "POOL INSTALLED, BUT THE CHECK THROUGH IT FAILED" in result.stdout
     )
     assert "OWN LEAN SERVER FAILED" not in result.stdout
-    assert (
-        "Verifying this box's own Lean server by itself, with its root read-only" in result.stdout
-    )
+    assert "Verifying this box's own Lean server by itself, with its protections" in result.stdout
     assert not writable.read_only(LEAN) and "so the cause is not the read-only root" in state(
         writable
     )
