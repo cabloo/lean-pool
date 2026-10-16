@@ -121,6 +121,12 @@ item follows from a rule described on another page.
   checks share the pool's workers with everyone's, at whatever priority it asks for, so at most as
   many as the pool has workers can be its at once. The cache's count of those workers is the one of
   the pool's last install run.
+* A screened sender's checks share the store with the pool's: many unique checks with long
+  answers push the pool's own stored answers out sooner, and an answer's `cached: true` tells a
+  sender whether that exact text, with that timeout, was checked before.
+* The firewall of the screened door tells Docker's bridges from others named `br-*` as the host has
+  them when its rule is applied: a bridge of that name made later is let in until the rule is
+  applied again.
 * The screened door hands its key to no one: a program on the pool's host must pass the door and
   the key on, and whoever holds the key can send checks through the door until a new key is made.
   Closing the door does not retire it; `screened-key new` does.

@@ -17,8 +17,11 @@ only to clients you would let run code there.
 **One key for the whole pool.** Clients send it, the cache checks it in constant time before it
 answers anything from its store, and every Lean server checks it again. No command takes a key
 or a token as an argument, and none logs one. The installer writes it into a directory of your
-choosing only when asked (`--pool-key-copy`), for a program that hands it on: whoever can read
-that directory holds the key.
+choosing only when asked (`--pool-key-copy`), for a program that hands it on: the directory's
+owner holds the key, and so does whoever can read the files there. It is written only where
+nobody but root and that owner could have put a directory of their own on the way (no directory
+of the path writable by anyone else), never beside the screened key's copy, and never in a
+pool's or a Lean server's own directory.
 
 **A second key, screened, for senders trusted less.** The cache can hold one more key. A check
 sent with it must first pass [the screen](docs/cache.md#the-screened-key), a list of what a proof
@@ -30,7 +33,8 @@ plain fields, a bounded number of snippets and a bounded timeout, and its checks
 number of places at the servers. It is taken at one door alone: [the screened
 door](docs/cache.md#the-screened-door), a second HTTPS port that leads to the cache and nowhere
 else, which the installer publishes on the Docker bridge's address and firewalls to the Docker
-bridges.
+bridges. The door speaks HTTP/1.1 alone and takes a body of a stated length no longer than one
+of the proxy's buffers, so what its senders hold of the proxy is bounded by its connections.
 
 **Three things are answered without the key.** `GET /health`, and for a Prometheus scraper
 `GET /metrics`, `/metrics/cache` and `/metrics/pool`: the names of the pool's servers and

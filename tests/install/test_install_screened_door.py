@@ -288,6 +288,48 @@ def test_the_door_is_firewalled_to_the_docker_bridges_with_no_lan_subnet(opened)
     )
 
 
+COMPOSE_NETWORK = "0123456789ab" + "c" * 52
+NAMED_NETWORK = "fedcba987654" + "3" * 52
+
+
+def door_rules(
+    machine: Machine, **environment: str
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    mark = machine.mark()
+    applied = machine.bash(
+        machine.path("/usr/local/sbin/lean-pool-firewall"), "apply", "door-demo", **environment
+    )
+    rules = [
+        call.removeprefix("iptables -A LEANPOOL-DOOR-DEMO ")
+        for call in machine.calls_since(mark)
+        if call.startswith("iptables -A LEANPOOL-DOOR-DEMO")
+    ]
+    return applied, rules
+
+
+def test_a_bridge_named_br_that_is_not_dockers_is_turned_away_by_name(pool):
+    # Docker's: a Compose network's br-<id>, and a network that names its own bridge. Not Docker's: a LAN's br-lan.
+    for interface in ("eth0", "docker0", "br-0123456789ab", "br-named", "br-lan"):
+        pool.path(f"/sys/class/net/{interface}").mkdir()
+    applied, rules = door_rules(pool, STUB_NETWORKS=f"{COMPOSE_NETWORK}= {NAMED_NETWORK}=br-named")
+    assert applied.returncode == 0, failed(applied)
+    assert rules == [
+        "-i docker0 -j RETURN",
+        "-i br-lan -j DROP",
+        "-i br-+ -j RETURN",
+        "-s 127.0.0.0/8 -j RETURN",
+        "-j DROP",
+    ]
+
+
+def test_without_dockers_networks_no_bridge_named_br_is_let_in(pool):
+    pool.path("/sys/class/net/br-0123456789ab").mkdir()
+    applied, rules = door_rules(pool, STUB_NETWORKS_FAIL="1")
+    assert applied.returncode == 0, failed(applied)
+    assert "docker0 alone is let in" in applied.stderr
+    assert rules == ["-i docker0 -j RETURN", "-s 127.0.0.0/8 -j RETURN", "-j DROP"]
+
+
 # --- kept, closed, renewed ---------------------------------------------------------------------------------------------
 
 
@@ -299,6 +341,37 @@ def test_a_re_run_without_the_options_keeps_the_door_its_key_and_its_copy(pool):
     assert key_of(pool) == key and settings(pool)["LEANPOOL_SCREENED_DOOR"] == "on"
     assert (pool.path(COPY) / "api-key").read_text().strip() == key
     assert pool.recreated() == recreated and containers(pool) == before
+
+
+def test_no_screened_key_copy_stops_the_copy_and_leaves_its_files(pool):
+    key, copy = key_of(pool), pool.path(COPY)
+    result = pool.bash(
+        "install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES, "--no-screened-key-copy"
+    )
+    assert result.returncode == 0, failed(result)
+    assert settings(pool)["LEANPOOL_SCREENED_KEY_COPY"] == ""
+    assert (
+        f"the copy in {copy} is no longer written, and its files are left there: remove them by hand"
+        in result.stdout
+    )
+    assert (copy / "api-key").read_text().strip() == key
+    # A later run writes nothing there, and the door stays open.
+    (copy / "api-key").unlink()
+    again = pool.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES)
+    assert again.returncode == 0, failed(again)
+    assert not (copy / "api-key").exists()
+    assert settings(pool)["LEANPOOL_SCREENED_DOOR"] == "on"
+    assert "key copy not written (no directory named)" in control(pool, "status").stdout
+
+
+def test_the_copy_is_refused_in_a_directory_that_holds_the_pools_own_key(pool):
+    copy = pool.path(COPY)
+    pools_key = pool.path(f"{POOL}/api-key").read_text()
+    (copy / "api-key").write_text(pools_key)
+    result = control(pool, "screened-key", "copy")
+    assert result.returncode != 0 and "holds the other key's copy" in result.stderr
+    assert (copy / "api-key").read_text() == pools_key
+    assert pools_key.strip() not in result.stdout + result.stderr
 
 
 def test_closing_the_door_takes_its_port_and_its_rule_away_and_keeps_its_key(pool):

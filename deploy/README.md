@@ -64,7 +64,8 @@ the box they belong to.
 | `LEANPOOL_CACHE_UPSTREAM_TIMEOUT_SECONDS` | `pool.env` | `1800` | The cache's own setting. |
 | `LEANPOOL_CACHE_MAX_REQUEST_BYTES` | `pool.env` | `16777216` | The cache's own setting. |
 | `LEANPOOL_CACHE_SCREENED_IN_FLIGHT` | `pool.env` | required by `compose.screened-door.yaml` | The cache's own setting: how many checks the screened door's senders may have at the servers at once. |
-| `LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` | `pool.env` | `300` | The cache's own setting: the longest Lean timeout those senders may ask for. |
+| `LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` | `pool.env` | `300` | The cache's own setting: the longest Lean timeout those senders may ask for, and the one given to a check of theirs that names none. |
+| `LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES` | `pool.env` | `262144` | The cache's own setting: the longest body those senders may send. |
 | `LEANPOOL_SUBNET` | `pool.env` | `172.29.55.0/24` | The pool's network. |
 | `LEANPOOL_DNS` | `pool.env` | required by `compose.dns.yaml` | The proxy's DNS server. |
 | `LEANPOOL_SCREENED_DOOR_ADDRESS` | `pool.env` | required by `compose.screened-door.yaml` | The one host address the [screened door](../docs/cache.md#the-screened-door) is published on. |
@@ -102,5 +103,5 @@ open, every run writes `LEANPOOL_SCREENED_DOOR_ADDRESS` (the docker0 bridge's), 
 | `LEANPOOL_JOIN_PUBLIC_PORT` | `pool.env` | The port the join service is published on while a window is open. |
 | `LEANPOOL_HAPROXY_INSTALLER_VERSION` | `pool.env` | The renderer's own setting: the installer's version, which the pool's `GET /health` carries. |
 | `LEANPOOL_SCREENED_DOOR` | `pool.env` | `on` while the [screened door](../docs/cache.md#the-screened-door) is open (`--screened-door`), `off` once closed. |
-| `LEANPOOL_SCREENED_KEY_COPY` | `pool.env` | The directory the screened key's copy is written to (`--screened-key-copy`). |
-| `LEANPOOL_POOL_KEY_COPY` | `pool.env` | The directory the pool's own key's copy is written to (`--pool-key-copy`). |
+| `LEANPOOL_SCREENED_KEY_COPY` | `pool.env` | The directory the screened key's copy is written to (`--screened-key-copy`; empty after `--no-screened-key-copy`). |
+| `LEANPOOL_POOL_KEY_COPY` | `pool.env` | The directory the pool's own key's copy is written to (`--pool-key-copy`; empty after `--no-pool-key-copy`). |

@@ -107,10 +107,15 @@ than its own: machines whose owner it does not know. Checking Lean code runs it
   `--screened-in-flight` snippets, and a timeout of at most `--screened-max-timeout` seconds.
   Anything else is answered 422 and reaches nothing. So it cannot skip the store, ask for a
   costlier answer (`infotree`, `reuse` false), or change what an answer stored for the pool's own
-  checks holds.
+  checks holds. A request that names no timeout is given `--screened-max-timeout`: the Lean
+  servers' own default never decides how long a screened check runs.
+- **Its body is short.** At most `--screened-max-request-bytes` (256 KiB unless set, and never more
+  than `--max-request-bytes`); a longer one is answered 413 as soon as its `Content-Length`, or
+  its bytes, say so, and the rest of it is not read.
 - **Every snippet is read first.** Every snippet of the request must pass, or the whole
   request is answered 422, `{"detail": "refused by the pool's screen: snippet 'ID' holds ..."}`,
-  and nothing of it is looked up, forwarded or stored.
+  and nothing of it is looked up, forwarded or stored. The screen runs off the cache's event
+  loop, so a long file holds up no other request (the proxy's health checks among them).
 - **One that passes is served like any other**, from the store or the servers, and shares stored
   answers with checks sent with the pool's key. A screened check joins a flight the pool's key
   started; a check sent with the pool's key never waits on one a screened sender started, which
@@ -164,15 +169,22 @@ The second key's one way in: a second HTTPS port of the pool's proxy (`--screene
 - **Its limits.** Let W be the workers of the listed servers that are not paused, when the proxy's
   config was rendered. At most W requests from the door are in the cache at once, and W more wait;
   past that, 503 `{"detail":"the screened door is full"}`, and a request still waiting at the proxy's
-  queue timeout gets HAProxy's own 503. The door keeps at most 2W + 8 connections open, so its
-  senders cannot use up the proxy's own. A request may carry several snippets, so the bound on the
+  queue timeout gets HAProxy's own 503. The door keeps at most 2W + 8 connections open, speaks
+  HTTP/1.1 alone (over HTTP/2 one connection would carry a hundred requests), gives a sender 5
+  seconds to send a whole request, and takes a body only of a stated length (else 411) no longer
+  than one of the proxy's buffers (else 413, before any of it is taken in). Those together bound
+  what its senders can hold of the proxy's connections and memory. A request may carry several
+  snippets, so the bound on the
   checks themselves is the cache's (above), which the installer sets to W as of its run: a server
   that joins later raises the door's W at once, and the cache's at the next install run.
 - **Where it is published.** `install.sh --proxy NAME --screened-door` publishes it on the docker0
   bridge's address alone (172.17.0.1 on most hosts), which the containers and the programs of the
   pool's host reach and the LAN does not. A firewall rule (`lean-pool-firewall@door-NAME`) lets in
   what arrives from a docker bridge's interface (`docker0`, `br-*`) and from loopback alone, so a LAN
-  host that routes to that address is turned away, whatever its address. The door's certificate is
+  host that routes to that address is turned away, whatever its address. A bridge named `br-*` that
+  is not Docker's (a LAN's `br-lan`, say) is turned away by name, as the host has it when the rule is
+  applied: one made later is let in until the rule is applied again, at the next install run or
+  restart of Docker or of the host. The door's certificate is
   the front door's, which already names that address. A program on the pool's host passes the door
   on to the machines that use it: one that opens an SSH tunnel to each, say.
 - **The key** is made by the installer once (`screened-api-key` beside the pool's key, readable by
@@ -184,16 +196,23 @@ The second key's one way in: a second HTTPS port of the pool's proxy (`--screene
   key: opened again, it takes the same one. `screened-key new` retires it.
 - **Its copy.** With `--screened-key-copy DIR`, the installer and `screened-key new` also write the
   key (`api-key`, 0600) and the pool authority's certificate (`ca.crt`, 0644) into DIR, for the
-  program that hands them on, owned by DIR's owner. DIR is kept once given, and goes with the door:
-  it is refused while the door is closed. Its path is walked from `/` one directory at a time, and
-  none of them may be a link, so nobody who owns a directory on the way can send the copy
-  elsewhere. Its parent must exist. A DIR that does not is made, 0700, with its parent's owner, so
-  that parent should belong to the program's user. Each file is made new beside the old one and
-  moved over it, never written by name, so a link planted in DIR changes nothing outside it, and a
-  file that cannot be moved into place is removed. A copy that cannot be written does not fail the
-  install: its summary says so (`ITS KEY'S COPY WAS NOT WRITTEN`), and
-  `sudo lean-pool-ctl NAME screened-key copy` writes it again. A new DIR leaves the old one's files
-  where they are: remove them, or run `screened-key new`.
+  program that hands them on, owned by DIR's owner. DIR is kept once given, until
+  `--no-screened-key-copy`, and goes with the door: it is refused while the door is closed. Its
+  parent must exist. A DIR that does not is made, 0700, with its parent's owner, so that parent
+  should belong to the program's user: the copy goes to that owner. Its path is walked from `/` one
+  directory at a time, and none of them may be a link. Each directory on the way must be root's or
+  that owner's and writable by nobody else, as sshd asks of a key's path, so nobody else can put a
+  directory of their own in its place and have the copy written there; one writable by all but
+  sticky, as `/tmp` is, passes only above DIR's parent, and only when the directory below it is
+  root's or the owner's, which nobody else can then move. DIR itself may be written by its owner
+  alone. It is never a pool's or a Lean server's own directory (`/srv/lean-pool-*`, `/srv/kimina*`,
+  `/etc/lean-pool`), nor inside one. Each file is made new beside the old one and moved over it,
+  never written by name, so a link planted in DIR changes nothing outside it, and a file that
+  cannot be moved into place is removed. A copy that cannot be written does not fail the install:
+  its summary says so (`ITS KEY'S COPY WAS NOT WRITTEN`), and
+  `sudo lean-pool-ctl NAME screened-key copy` writes it again. A new DIR, or
+  `--no-screened-key-copy`, leaves the old one's files where they are: remove them, or run
+  `screened-key new`.
 - **Closed** (the default, and `--no-screened-door`): the port, its firewall rule and the cache's
   second key are taken away. The key's file and its copy are kept for when the door opens again.
 - **What a sender at the door can do:** send checks that pass the screen, within the limits above.

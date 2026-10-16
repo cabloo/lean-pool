@@ -157,9 +157,17 @@ has_overlay() { [[ ":$(setting_in "$1" COMPOSE_FILE):" == *":$2:"* ]]; }
 # valid_copy_directory PATH : a directory for the screened key's copy, named by its whole path: parts of letters,
 # digits, '.', '_' and '-', none of them '.' or '..' (the same line as lean-pool-ctl's).
 valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
-# copies_apart A B : true unless directories A and B (either may be empty) are one, or one lies inside the other.
-# The screened key's copy and the pool's own key's copy hold files of the same names (lean-pool-ctl has the same).
-copies_apart() { [ -z "$1" ] || [ -z "$2" ] || { [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]; }; }
+# copies_apart A B : true unless directories A and B (either may be empty) are one, or one lies inside the other, or
+# either is not a usable path. The program that hands the screened key out must never read the pool's own key
+# (lean-pool-ctl has the same, and its writer also compares the directories themselves).
+copies_apart() {
+  [ -z "$1" ] || [ -z "$2" ] || {
+    valid_copy_directory "$1" && valid_copy_directory "$2" && [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]
+  }
+}
+# copy_outside_pools PATH : true unless PATH is a pool's or a Lean server's own directory, or inside one, where a key's
+# copy could replace a file one of their containers reads.
+copy_outside_pools() { [[ "$1/" != /srv/lean-pool-* ]] && [[ "$1/" != /srv/kimina* ]] && [[ "$1/" != /etc/lean-pool/* ]]; }
 
 # lean_container ENV_FILE : the Lean server's container of the instance whose settings ENV_FILE holds.
 lean_container() { echo "$(setting_in "$1" COMPOSE_PROJECT_NAME)-kimina-1"; }
@@ -889,7 +897,9 @@ require_firewall_tools() {
 # A LAN-only inbound rule for one published container port, re-applied at boot. Separate from
 # kimina-firewall on purpose: it never touches a Lean server's own rules. With no LAN_SUBNET (an empty
 # argument) the port is the docker bridges' alone, told by the interface a packet comes in on (docker0 and
-# Compose's br-*), so no host of a LAN is let in, whatever its addresses.
+# Compose's br-*), so no host of a LAN is let in, whatever its addresses. A bridge named br-* that is not
+# Docker's (a LAN's br-lan, say) is turned away by name, as it is when the rule is applied: one made later is
+# let in until the rule is applied again (a re-run of the installer, or a restart of Docker or of the host).
 #   install_lan_firewall NAME PORT LAN_SUBNET
 install_lan_firewall() {
   local name=$1 port=$2 subnet=$3
@@ -908,6 +918,25 @@ name=${2:-}
 chain=LEANPOOL-$(echo "$name" | tr '[:lower:]' '[:upper:]')
 . "/srv/lean-pool-firewall/$name.conf"
 match=(-p tcp -m conntrack --ctorigdstport "$LEANPOOL_FW_PORT" --ctdir ORIGINAL)
+# The interfaces named br-* that are not Docker's, one a line. Docker names a bridge network's interface br- and the
+# first 12 characters of its id, or as the network says (com.docker.network.bridge.name). Fails when Docker's
+# networks cannot be read, or an interface's name cannot be written in a rule.
+foreign_bridges() {
+  local ids id name ours=" " path
+  ids=$(docker network ls -q --no-trunc --filter driver=bridge) || return 1
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9a-f]{12,64}$ ]] || continue
+    ours+="br-${id:0:12} "
+    name=$(docker network inspect "$id" -f '{{index .Options "com.docker.network.bridge.name"}}' 2>/dev/null) || continue
+    [ -z "$name" ] || ours+="$name "
+  done
+  for path in /sys/class/net/br-*; do
+    [ -e "$path" ] || continue
+    name=${path##*/}
+    [[ "$name" =~ ^br-[A-Za-z0-9_.-]{1,12}$ ]] || return 1
+    [[ "$ours" == *" $name "* ]] || echo "$name"
+  done
+}
 remove() {
   while iptables -C DOCKER-USER "${match[@]}" -j "$chain" 2>/dev/null; do
     iptables -D DOCKER-USER "${match[@]}" -j "$chain"
@@ -925,7 +954,12 @@ case "${1:-}" in
       iptables -A "$chain" -s 172.16.0.0/12 -j RETURN    # docker bridge networks
     else
       iptables -A "$chain" -i docker0 -j RETURN          # docker bridge networks, by their interfaces
-      iptables -A "$chain" -i br-+ -j RETURN
+      if foreign=$(foreign_bridges); then
+        for bridge in $foreign; do iptables -A "$chain" -i "$bridge" -j DROP; done   # named br-*, not Docker's
+        iptables -A "$chain" -i br-+ -j RETURN
+      else
+        echo "lean-pool-firewall: Docker's bridges could not be told from others named br-*: of the bridges, docker0 alone is let in" >&2
+      fi
     fi
     iptables -A "$chain" -s 127.0.0.0/8 -j RETURN
     iptables -A "$chain" -j DROP

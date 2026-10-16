@@ -58,12 +58,17 @@ A week of running the pool on boxes that also do other work.
   Mathlib and Aesop), or the whole request is answered 422 and reaches nothing; those that pass
   are served like any other and forwarded with the pool's key, so no Lean server holds the
   second one. Such a request carries Kimina's plain fields alone, at most `--screened-in-flight`
-  snippets and a timeout of at most `--screened-max-timeout` seconds, and the checks its senders
-  start hold at most `--screened-in-flight` places at the servers, with as many waiting.
+  snippets, a timeout of at most `--screened-max-timeout` seconds (and that one when it names
+  none) and a body of at most `--screened-max-request-bytes`, and the checks its senders start
+  hold at most `--screened-in-flight` places at the servers, with as many waiting. The screen runs
+  off the cache's event loop.
 - **The screened door** ([docs](docs/cache.md#the-screened-door)): the second key's one way in, a
   second HTTPS port of the proxy (`--screened-door-port`) that leads to the cache alone, with no
-  backup, and marks what it passes (`X-Lean-Pool-Door`). `install.sh --proxy NAME --screened-door`
-  opens it on port 18120 of the docker0 bridge's address, firewalled to the docker bridges, makes
+  backup, and marks what it passes (`X-Lean-Pool-Door`). It speaks HTTP/1.1 alone, and refuses on
+  its headers a body of no stated length (411) or longer than one buffer (413), so its senders
+  cannot use up the proxy's memory. `install.sh --proxy NAME --screened-door`
+  opens it on port 18120 of the docker0 bridge's address, firewalled to the docker bridges (a
+  bridge named `br-*` that is not Docker's is turned away by name), makes
   the second key once and keeps it, and with `--screened-key-copy DIR` writes it, with the pool
   authority's certificate, into DIR for the program that hands it on. `lean-pool-ctl NAME
   screened-key new|copy` makes a new key or writes the copy again.
@@ -71,7 +76,10 @@ A week of running the pool on boxes that also do other work.
   `install.sh --proxy NAME --pool-key-copy DIR` writes the pool's key and the authority's
   certificate into DIR at every run, as the screened key's copy is written, for a program on the
   host that hands it to boxes of its own; never into the screened key's copy's directory, nor
-  one inside or around it. `lean-pool-ctl NAME pool-key copy` writes it again.
+  one inside or around it, nor one that holds the screened key, nor a pool's own directory.
+  `lean-pool-ctl NAME pool-key copy` writes it again; `--no-pool-key-copy` and
+  `--no-screened-key-copy` stop a copy. Either copy is written only where no directory of its
+  path can be written by anyone but root and the copy's owner.
 - **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
   its pool and its joining boxes with, now in this repository, with their tests
   (`tests/install/`, on a fake machine). A deployment's own values live in a site directory

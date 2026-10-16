@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import hmac
+import json
 from collections.abc import AsyncIterator, Sequence
 
 from aiohttp import web
@@ -17,6 +18,7 @@ from leanpool.cache.request import (
     Snippet,
     parse_check_request,
     screened_refusal,
+    with_timeout,
 )
 from leanpool.cache.service import CheckService
 from leanpool.cache.settings import CacheSettings
@@ -32,6 +34,7 @@ _SERVICE = web.AppKey("service", CheckService)
 
 _BEARER_PREFIX = "Bearer "
 _UNAUTHORIZED = 401
+_TOO_LARGE = 413
 _UNPROCESSABLE = 422
 _LOOP_DETECTED = 508
 
@@ -74,7 +77,10 @@ async def _handle_check(request: web.Request) -> web.Response:
     client's retry costs the Lean servers only what was missing.
 
     A request sent with the screened key must keep to the screened door's fields and limits
-    (``screened_refusal``) and pass the screen; it is then served like any other, from the store
+    (``screened_refusal``, and a body of at most ``screened_max_request_bytes``, refused before
+    more of it is read) and pass the screen, which runs off the event loop, so a long file holds
+    up no other request; one that names no timeout is given the door's longest. It is then
+    served like any other, from the store
     or the servers, and shares stored answers with the pool's own checks (an answer is the
     servers' work, whoever asked). The checks it starts at the servers take places of their own
     (``CheckService``). Each key is taken at its own door alone (``leanpool.doors``): the
@@ -86,13 +92,20 @@ async def _handle_check(request: web.Request) -> web.Response:
         return sender
     if settings.hop_header in request.headers:
         return _error(_LOOP_DETECTED, "this request has already passed through the cache")
+    screened = sender is _Sender.SCREENED
+    limit = (
+        min(settings.screened_max_request_bytes, settings.maximum_request_bytes)
+        if screened
+        else None
+    )
     try:
-        body = await _read_json(request)
+        body = await _read_json(request, limit)
         check_request = parse_check_request(body)
+    except _RequestTooLargeError as error:
+        return _error(_TOO_LARGE, f"a check at the screened door is at most {error.limit} bytes")
     except InvalidRequestError as error:
         return _error(_UNPROCESSABLE, str(error))
     authorization = request.headers.get("Authorization")
-    screened = sender is _Sender.SCREENED
     if screened:
         # parse_check_request took only an object, and settings with a screened key have a limit.
         assert isinstance(body, dict)
@@ -105,9 +118,12 @@ async def _handle_check(request: web.Request) -> web.Response:
         )
         if reason is not None:
             return _error(_UNPROCESSABLE, reason)
-        refusal = _refuse_unscreened(check_request.snippets)
-        if refusal is not None:
-            return refusal
+        # Off the event loop: the screen is plain Python, and a long file takes it a while.
+        finding = await asyncio.to_thread(_unscreened, check_request.snippets)
+        if finding is not None:
+            return _error(_UNPROCESSABLE, finding)
+        if check_request.timeout is None:
+            check_request = with_timeout(check_request, settings.screened_max_timeout_seconds)
         # Forwarded with the pool's own key: no Lean server ever holds the screened one.
         authorization = f"{_BEARER_PREFIX}{settings.api_key}"
     service = request.app[_SERVICE]
@@ -204,18 +220,16 @@ def _authenticate(request: web.Request, settings: CacheSettings) -> _Sender | we
     return _error(_UNAUTHORIZED, "Invalid API key")
 
 
-def _refuse_unscreened(snippets: Sequence[Snippet]) -> web.Response | None:
-    """Return a 422 naming the first snippet the screen refuses, or None if every one passes.
+def _unscreened(snippets: Sequence[Snippet]) -> str | None:
+    """Return why the screen refuses the first snippet it refuses, or None if every one passes.
 
     One refused snippet refuses the whole request, before any of it is looked up or forwarded.
+    Run in a thread: it touches nothing but its argument.
     """
     for snippet in snippets:
         finding = screen(snippet.code)
         if finding is not None:
-            return _error(
-                _UNPROCESSABLE,
-                f"refused by the pool's screen: snippet {snippet.identifier!r} holds {finding}",
-            )
+            return f"refused by the pool's screen: snippet {snippet.identifier!r} holds {finding}"
     return None
 
 
@@ -236,12 +250,37 @@ def _refuse_unauthenticated(request: web.Request, api_key: str | None) -> web.Re
     return None
 
 
-async def _read_json(request: web.Request) -> object:
+class _RequestTooLargeError(Exception):
+    """A body longer than its sender may send; nothing more of it is read."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(limit)
+        self.limit = limit
+
+
+async def _read_json(request: web.Request, limit: int | None = None) -> object:
+    """The body, as JSON. With ``limit``, a body longer than that many bytes is refused as soon
+    as it says so (its ``Content-Length``) or its bytes do."""
     try:
-        body: object = await request.json()
+        if limit is None:
+            body: object = await request.json()
+        else:
+            body = json.loads(await _read_at_most(request, limit))
     except ValueError:
         raise InvalidRequestError("the body is not valid JSON") from None
     return body
+
+
+async def _read_at_most(request: web.Request, limit: int) -> bytes:
+    if request.content_length is not None and request.content_length > limit:
+        raise _RequestTooLargeError(limit)
+    chunks, size = [], 0
+    async for chunk in request.content.iter_any():
+        size += len(chunk)
+        if size > limit:
+            raise _RequestTooLargeError(limit)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _error(status: int, detail: str) -> web.Response:

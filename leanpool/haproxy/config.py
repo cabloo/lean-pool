@@ -771,19 +771,32 @@ def _screened_door(
     as many requests in the cache at once as the listed servers that are not paused have
     workers, W (the cache server's limit in ``backend screened_cache``), and as many again
     waiting; one past that is answered 503 at once. A request may carry several snippets: the
-    cache bounds the checks themselves (``leanpool.cache.service``). The door keeps at most
-    2W + 8 connections open at once, so its senders cannot use up the proxy's own. Every
-    request it forwards says, in one header, that it came in by this door, and a sender's own
-    copy of that header, or of the loop guard, never reaches the cache.
+    cache bounds the checks themselves (``leanpool.cache.service``). Every request it forwards
+    says, in one header, that it came in by this door, and a sender's own copy of that header,
+    or of the loop guard, never reaches the cache.
+
+    What its senders can hold of the proxy is bounded three ways together: at most 2W + 8
+    connections, each speaking HTTP/1.1 alone (over HTTP/2 one connection carries a hundred
+    requests, and ``maxconn`` counts connections), each request with a ``Content-Length`` of
+    at most one buffer (``tune.bufsize``) and sent whole within 5 seconds. The door's rules
+    are read on a request's headers alone, so a body too large is refused before any of it is
+    taken in; the cache's backend then waits for the whole body, as every backend here does.
+    So its senders cannot use up the proxy's connections or its memory.
     """
     workers = total_workers(servers)
     refusal = "http-request return status {status} content-type application/json string"
     return section(
         f"frontend {SCREENED_DOOR_FRONTEND}",
         [
-            f"bind :{port} {bind_options(tls.front_door_pem)}",
+            "# HTTP/1.1 alone: over HTTP/2 one connection would carry a hundred requests.",
+            f"bind :{port} {bind_options(tls.front_door_pem)} alpn http/1.1",
             "# Its own share of the proxy's connections: the requests below, and a few more.",
             f"maxconn {2 * workers + 8}",
+            "# A request, its body included, is sent whole within 5s here (10s at the front door).",
+            "timeout http-request 5s",
+            "# The rules below are read on the headers alone, before any of the body is taken in;",
+            "# backend screened_cache waits for the whole body, as every backend here does.",
+            "no option http-buffer-request",
             "acl is_health path /health",
             "acl is_check path /api/check /api/check/",
             "acl checkers_up nbsrv(checkers) gt 0",
@@ -792,6 +805,14 @@ def _screened_door(
             "# offers are the front door's.",
             refusal.format(status=404)
             + """ '{"detail":"this door takes checks alone"}' unless METH_POST is_check""",
+            "# A body of a stated length, no longer than one buffer, so the proxy holds all of it",
+            "# and no more for each request (the cache has its own, smaller, limit).",
+            refusal.format(status=411)
+            + """ '{"detail":"a check at the screened door states its Content-Length"}'"""
+            + " unless { req.hdr_cnt(content-length) eq 1 }",
+            refusal.format(status=413)
+            + """ '{"detail":"a check at the screened door is too large"}'"""
+            + f" if {{ req.hdr_val(content-length) gt {settings.maximum_request_bytes} }}",
             f"# At most {workers} requests in the cache at once from here (the listed workers of",
             "# servers not paused) and as many waiting; past that, an answer at once, which a",
             "# client retries. The cache bounds the checks the requests carry.",

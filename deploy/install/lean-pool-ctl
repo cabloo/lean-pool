@@ -77,9 +77,17 @@ valid_minutes()     { [[ "$1" =~ ^[0-9]{1,4}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le
 # The screened key's copy: an absolute path of letters, digits, '.', '_' and '-' parts, none '.' or '..'
 # (the same line as pool-lib.sh's).
 valid_copy_directory() { [ "${#1}" -le 200 ] && [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] && [[ "$1/" != */./* ]] && [[ "$1/" != */../* ]]; }
-# The two copies hold files of the same names: neither directory may be the other or lie inside it, or the pool's
-# own key would be handed out with the screened one (pool-lib.sh has the same).
-copies_apart() { [ -z "$1" ] || [ -z "$2" ] || { [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]; }; }
+# A copy's directory is never a pool's or a Lean server's own, nor inside one: a key's copy there could replace a
+# file one of their containers reads (its own api-key, say). pool-lib.sh has the same.
+copy_outside_pools() { [[ "$1/" != /srv/lean-pool-* ]] && [[ "$1/" != /srv/kimina* ]] && [[ "$1/" != /etc/lean-pool/* ]]; }
+# The program that hands the screened key to machines nobody vouches for must never read the pool's own key: neither
+# copy's directory may be the other or lie inside it, and both must be usable paths, or they are not told apart
+# (pool-lib.sh has the same). The writer below also compares the directories themselves, and what they hold.
+copies_apart() {
+  [ -z "$1" ] || [ -z "$2" ] || {
+    valid_copy_directory "$1" && valid_copy_directory "$2" && [[ "$1/" != "$2/"* ]] && [[ "$2/" != "$1/"* ]]
+  }
+}
 
 # Validate the whole request before touching anything.
 case "$verb" in
@@ -373,28 +381,125 @@ PY
 }
 
 # A key's copy: the key and the pool authority's certificate, written into the directory the pool names, for the
-# program there that hands them to its clients. Its path is walked from / one directory at a time, none of them a
-# link, so nobody who owns a directory on the way can send the copy elsewhere. A missing last directory is made,
-# 0700, with its parent's owner; its parent must exist. Each file is owned by the directory's owner and is made new
-# beside the old one, then moved over it, and is never written, chowned or chmodded by name, so a link the owner
-# planted in the directory changes nothing outside it.
+# program there that hands them to its clients: the directory's owner, or its parent's when it is missing (it is then
+# made, 0700, with that owner). Its path is walked from / one directory at a time, none of them a link, and each
+# directory on the way must be owned by root or by that owner and writable by nobody else (as sshd's StrictModes
+# asks of a key's path), so nobody else can put a directory of their own in its place. A directory writable by others
+# but sticky, /tmp say, passes only above the copy's parent, and only when its next directory is root's or the
+# owner's, which nobody else can then move. The copy's directory itself is writable by its owner alone. It is never
+# the other key's copy's directory, nor inside it or around it, compared as directories (a bind mount, say), and
+# never one whose api-key is the other key. Each file is owned by the directory's owner and is made new beside the
+# old one, then moved over it, and is never written, chowned or chmodded by name, so a link the owner planted in the
+# directory changes nothing outside it.
 copies_together() {
   echo "pool $POOL names one directory for the screened key's copy and its own key's copy, or one inside the other ($SCREENED_KEY_COPY, $POOL_KEY_COPY): the pool's key would be handed out with the screened one. Re-run install.sh --proxy $POOL with another --pool-key-copy DIR"
 }
 
-write_key_copy() {        # COPY KEY
+write_key_copy() {        # COPY KEY OTHER_COPY OTHER_KEY
   command -v python3 >/dev/null || die "python3 is needed to write a key's copy"
+  [ -z "$3" ] || valid_copy_directory "$3" \
+    || die "$ENV_FILE names an unusable directory for the other key's copy ($3) - re-run install.sh --proxy $POOL with that option"
   copies_apart "$SCREENED_KEY_COPY" "$POOL_KEY_COPY" || die "$(copies_together)"
+  copy_outside_pools "$1" || die "$1 is a pool's or a Lean server's own directory, or inside one: no key's copy is written there"
   # -I: the current directory, and every PYTHON variable, are kept out of a program run as root.
-  python3 -I - "$1" "$2" "$DIR/certs/ca.crt" <<'PY'
+  python3 -I - "$1" "$2" "$DIR/certs/ca.crt" "$3" "$4" <<'PY'
 import errno
+import hmac
 import os
 import secrets
+import stat
 import sys
 
-copy, key, authority = sys.argv[1:]
+copy, key, authority, other_copy, other_key = sys.argv[1:]
 *above, name = copy.strip("/").split("/")
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+WRITABLE_BY_OTHERS = stat.S_IWGRP | stat.S_IWOTH
+
+
+class Refused(Exception):
+    """Why no copy is written here; nothing has been."""
+
+
+def identity(status):
+    return (status.st_dev, status.st_ino)
+
+
+def directories_of(path):
+    """The (device, inode) of each directory from / down PATH, as far as it can be walked with no link."""
+    found = []
+    try:
+        fd = os.open("/", DIRECTORY)
+    except OSError:
+        return found
+    try:
+        found.append(identity(os.fstat(fd)))
+        for part in path.strip("/").split("/"):
+            following = os.open(part, DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = following
+            found.append(identity(os.fstat(fd)))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    return found
+
+
+def read_small(directory, target):
+    """TARGET in DIRECTORY, as bytes, when it is a regular file of at most 4 KiB; else None."""
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except OSError:
+        return None
+    try:
+        status = os.fstat(fd)
+        return os.read(fd, 4097) if stat.S_ISREG(status.st_mode) and status.st_size <= 4096 else None
+    finally:
+        os.close(fd)
+
+
+def trusted_path(parents, recipient):
+    """Refused unless each directory from / to the copy's parent is root's or RECIPIENT's and writable by no one
+    else; a sticky one above the parent, whose next directory is root's or RECIPIENT's, passes too."""
+    for index, status in enumerate(parents):
+        where = "/" + "/".join(above[:index])
+        if status.st_uid not in (0, recipient):
+            raise Refused(f"{where} is owned by someone else (uid {status.st_uid})")
+        if status.st_mode & WRITABLE_BY_OTHERS:
+            sticky = status.st_mode & stat.S_ISVTX
+            below = parents[index + 1] if index + 1 < len(parents) else None
+            if not (sticky and below is not None and below.st_uid in (0, recipient)):
+                raise Refused(f"{where} can be written by others, who could put a directory of their own in its place")
+
+
+def apart(parents, directory_status):
+    """Refused when this directory is the other copy's, or inside it or around it, as directories."""
+    if not other_copy:
+        return
+    theirs = directories_of(other_copy)
+    complete = len(theirs) == other_copy.strip("/").count("/") + 2
+    ours = [identity(status) for status in parents]
+    if directory_status is not None:
+        ours.append(identity(directory_status))
+    if complete and theirs[-1] in ours:
+        raise Refused(f"it is, or lies inside, the other key's copy's directory {other_copy}")
+    if directory_status is not None and identity(directory_status) in theirs:
+        raise Refused(f"the other key's copy's directory {other_copy} lies inside it")
+
+
+def not_the_other_key(directory):
+    """Refused when the directory already holds the other key's copy: it is the other copy's directory, whatever its
+    name now."""
+    if not other_key:
+        return
+    try:
+        with open(other_key, "rb") as given:
+            theirs = given.read().strip()
+    except OSError:
+        return
+    held = read_small(directory, "api-key")
+    if theirs and held is not None and hmac.compare_digest(held.strip(), theirs):
+        raise Refused("it holds the other key's copy")
 
 
 def write(directory, source, target, mode, owner):
@@ -423,23 +528,37 @@ def write(directory, source, target, mode, owner):
 
 try:
     parent = os.open("/", DIRECTORY)
+    parents = [os.fstat(parent)]
     for part in above:
         following = os.open(part, DIRECTORY, dir_fd=parent)
         os.close(parent)
         parent = following
+        parents.append(os.fstat(parent))
     try:
-        os.mkdir(name, 0o700, dir_fd=parent)
-        made = True
-    except FileExistsError:
-        made = False
-    directory = os.open(name, DIRECTORY, dir_fd=parent)
-    if made:
-        top = os.fstat(parent)
+        directory = os.open(name, DIRECTORY, dir_fd=parent)
+    except FileNotFoundError:
+        directory = None
+    status = None if directory is None else os.fstat(directory)
+    recipient = parents[-1].st_uid if status is None else status.st_uid
+    trusted_path(parents, recipient)
+    if status is not None and status.st_mode & WRITABLE_BY_OTHERS:
+        raise Refused("it can be written by others than its owner")
+    apart(parents, status)
+    if directory is None:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            raise Refused("it appeared while it was being made") from None
+        directory = os.open(name, DIRECTORY, dir_fd=parent)
+        top = parents[-1]
         os.fchown(directory, top.st_uid, top.st_gid)
         os.fchmod(directory, 0o700)
+    not_the_other_key(directory)
     owner = os.fstat(directory)
     for source, target, mode in ((key, "api-key", 0o600), (authority, "ca.crt", 0o644)):
         write(directory, source, target, mode, owner)
+except Refused as refusal:
+    sys.exit(f"lean-pool-ctl: {copy}: {refusal}; nothing was written")
 except OSError as error:
     why = "a link or a file is in its path" if error.errno in (errno.ELOOP, errno.ENOTDIR) else error.strerror
     sys.exit(f"lean-pool-ctl: {copy}: {why} ({error.filename or 'its path'})")
@@ -453,7 +572,7 @@ write_screened_copy() {
   valid_copy_directory "$SCREENED_KEY_COPY" \
     || die "$ENV_FILE names an unusable LEANPOOL_SCREENED_KEY_COPY - re-run install.sh --proxy $POOL --screened-key-copy DIR"
   [ -s "$SCREENED_KEY" ] || die "the screened door has no key ($SCREENED_KEY) - re-run install.sh --proxy $POOL"
-  write_key_copy "$SCREENED_KEY_COPY" "$SCREENED_KEY" \
+  write_key_copy "$SCREENED_KEY_COPY" "$SCREENED_KEY" "$POOL_KEY_COPY" "$DIR/api-key" \
     || die "the screened key's copy could not be written to $SCREENED_KEY_COPY"
   echo "the screened key and the pool's authority are copied to $SCREENED_KEY_COPY (api-key, ca.crt), owned by $(stat -c '%U:%G' "$SCREENED_KEY_COPY")"
 }
@@ -465,7 +584,7 @@ write_pool_key_copy() {
   valid_copy_directory "$POOL_KEY_COPY" \
     || die "$ENV_FILE names an unusable LEANPOOL_POOL_KEY_COPY - re-run install.sh --proxy $POOL --pool-key-copy DIR"
   [ -s "$DIR/api-key" ] || die "the pool has no key ($DIR/api-key) - re-run install.sh --proxy $POOL"
-  write_key_copy "$POOL_KEY_COPY" "$DIR/api-key" \
+  write_key_copy "$POOL_KEY_COPY" "$DIR/api-key" "$SCREENED_KEY_COPY" "$SCREENED_KEY" \
     || die "the pool's key's copy could not be written to $POOL_KEY_COPY"
   echo "the pool's key and its authority are copied to $POOL_KEY_COPY (api-key, ca.crt), owned by $(stat -c '%U:%G' "$POOL_KEY_COPY")"
 }

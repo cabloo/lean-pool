@@ -86,6 +86,7 @@ def parse_settings(
         screened_api_key=screened_api_key,
         screened_in_flight=options.screened_in_flight,
         screened_max_timeout_seconds=options.screened_max_timeout,
+        screened_max_request_bytes=options.screened_max_request_bytes,
         database_path=options.database,
         host=options.host,
         port=options.port,
@@ -145,7 +146,16 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
         "LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS",
         parse_positive_integer,
         defaults.screened_max_timeout_seconds,
-        "the longest Lean timeout, in seconds, a check sent with the screened key may ask for",
+        "the longest Lean timeout, in seconds, a check sent with the screened key may ask for, "
+        "and the one it is given when it names none",
+    )
+    settings.add(
+        "--screened-max-request-bytes",
+        "LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES",
+        parse_positive_integer,
+        defaults.screened_max_request_bytes,
+        "the largest request body accepted with the screened key (never more than "
+        "--max-request-bytes)",
     )
     settings.add_switch(
         "--allow-unauthenticated",

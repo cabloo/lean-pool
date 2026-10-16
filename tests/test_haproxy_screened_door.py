@@ -68,7 +68,9 @@ def test_without_the_door_the_configuration_is_the_one_before_it_existed() -> No
 def test_the_door_serves_https_with_the_front_doors_certificate_on_its_port_alone() -> None:
     door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
     binds = [line for line in door if line.startswith("bind ")]
-    assert binds == [f"bind :{DOOR_PORT} ssl crt /etc/leanpool/tls/front.pem ssl-min-ver TLSv1.3"]
+    assert binds == [
+        f"bind :{DOOR_PORT} ssl crt /etc/leanpool/tls/front.pem ssl-min-ver TLSv1.3 alpn http/1.1"
+    ]
 
 
 def test_the_doors_only_backend_is_the_cache_server_alone_with_no_backup() -> None:
@@ -100,6 +102,30 @@ def test_the_door_takes_checks_alone_and_holds_as_many_waiting_as_the_pool_has_w
 def test_the_door_keeps_a_share_of_the_proxys_connections_of_its_own() -> None:
     door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
     assert [line for line in door if line.startswith("maxconn ")] == [f"maxconn {2 * WORKERS + 8}"]
+
+
+def test_the_door_bounds_what_each_connection_holds_of_the_proxy() -> None:
+    """HTTP/1.1 alone (one request at a time on a connection), a request sent whole within 5s, and
+    a body of a stated length no longer than one buffer: what 2W + 8 connections can hold."""
+    door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
+    assert next(line for line in door if line.startswith("bind ")).endswith(" alpn http/1.1")
+    assert [line for line in door if line.startswith("timeout ")] == ["timeout http-request 5s"]
+    # Refused on its headers: the body is not waited for here, and is in the backend.
+    assert "no option http-buffer-request" in door
+    buffer = WITH.maximum_request_bytes
+    assert (
+        "http-request return status 411 content-type application/json string "
+        """'{"detail":"a check at the screened door states its Content-Length"}' """
+        "unless { req.hdr_cnt(content-length) eq 1 }"
+    ) in door
+    assert (
+        "http-request return status 413 content-type application/json string "
+        """'{"detail":"a check at the screened door is too large"}' """
+        f"if {{ req.hdr_val(content-length) gt {buffer} }}"
+    ) in door
+    # Both after the rule that takes checks alone, so /health is answered as before.
+    refusals = [line for line in door if line.startswith("http-request return status 4")]
+    assert [line.split()[3] for line in refusals] == ["404", "411", "413"]
 
 
 def test_the_door_says_so_to_the_cache_and_takes_a_senders_loop_guard_away() -> None:

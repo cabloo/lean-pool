@@ -188,6 +188,14 @@ def test_the_screened_doors_limits_are_read_from_flags_or_the_environment() -> N
         ["--screened-in-flight", "3", "--screened-max-timeout", "120"], environment
     )
     assert (from_flags.screened_in_flight, from_flags.screened_max_timeout_seconds) == (3, 120)
+    assert from_flags.screened_max_request_bytes == 256 * 1024
+    limited = {**environment, "LEANPOOL_CACHE_SCREENED_IN_FLIGHT": "3"}
+    assert (
+        parse_settings(["--screened-max-request-bytes", "4096"], limited)
+    ).screened_max_request_bytes == 4096
+    assert (
+        parse_settings([], {**limited, "LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES": "8192"})
+    ).screened_max_request_bytes == 8192
     from_variables = parse_settings(
         [],
         {

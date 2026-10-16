@@ -5,7 +5,10 @@ screened door forwards (it says so in one header), the pool's key from everythin
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import threading
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -181,6 +184,18 @@ def test_settings_refuse_a_screened_key_equal_to_the_pools_or_without_one_or_wit
         )
 
 
+def test_settings_refuse_a_screened_request_limit_below_one_byte(tmp_path: Any) -> None:
+    with pytest.raises(ValueError, match="at least 1 byte"):
+        CacheSettings(
+            pin="p",
+            api_key=API_KEY,
+            database_path=tmp_path / "c.sqlite3",
+            screened_api_key=SCREENED_KEY,
+            screened_in_flight=PLACES,
+            screened_max_request_bytes=0,
+        )
+
+
 # --- what a screened request may carry, and what its checks may cost ----------------------------
 
 
@@ -221,6 +236,80 @@ async def test_a_screened_request_with_kiminas_own_fields_is_taken(
     # The pool's own checks keep every field: what a newer Kimina adds still reaches it.
     await check(cache, "theorem other : True := trivial", infotree="original")
     assert lean.requests[-1].body["infotree"] == "original"
+
+
+async def test_a_screened_request_that_names_no_timeout_is_given_the_doors_longest(
+    start_lean_server: StartLeanServer, start_cache: StartCache
+) -> None:
+    """Never the servers' own default, which may be longer than the pool lets its senders ask
+    for: the timeout is in what is forwarded, and in the answer's key."""
+    lean = await start_lean_server(api_key=API_KEY)
+    cache = await start_cache(lean.url, **SCREENED_SETTINGS, screened_max_timeout_seconds=120)
+    body = check_body(PROOF, timeout=None)
+    async with cache.post("/api/check", json=body, headers=SCREENED) as response:
+        assert response.status == 200, await response.text()
+    (request,) = lean.requests
+    assert request.body["timeout"] == 120
+    # Stored under that timeout: the same check naming it is answered from the store.
+    status, reply = await screened_check(cache, PROOF, timeout=120)
+    assert status == 200
+    assert reply["results"][0]["cached"] is True
+    assert len(lean.requests) == 1
+
+
+async def test_a_screened_body_longer_than_its_limit_is_refused_before_it_is_read(
+    start_lean_server: StartLeanServer, start_cache: StartCache
+) -> None:
+    lean = await start_lean_server(api_key=API_KEY)
+    limit = 1024
+    cache = await start_cache(lean.url, **SCREENED_SETTINGS, screened_max_request_bytes=limit)
+    long_proof = "theorem long : True := trivial -- " + "x" * limit
+    refused = (413, {"detail": f"a check at the screened door is at most {limit} bytes"})
+    # As its Content-Length says, and as its bytes say when it states no length (chunked).
+    status, reply = await screened_check(cache, long_proof)
+    assert (status, reply) == refused
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield json.dumps(check_body(long_proof)).encode()
+
+    async with cache.post("/api/check", data=chunks(), headers=SCREENED) as response:
+        assert (response.status, await response.json()) == refused
+    assert lean.requests == []
+    # The pool's own key keeps the pool's limit.
+    await check(cache, long_proof)
+    assert len(lean.requests) == 1
+    # And a screened body within it is served.
+    status, _reply = await screened_check(cache, PROOF)
+    assert status == 200
+
+
+async def test_the_screen_runs_off_the_event_loop(
+    start_lean_server: StartLeanServer,
+    start_cache: StartCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A screen that takes a while holds up no other request: here /health, answered while it
+    runs."""
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_screen(_code: str) -> str | None:
+        entered.set()
+        release.wait(10)
+        return None
+
+    monkeypatch.setattr("leanpool.cache.app.screen", slow_screen)
+    lean = await start_lean_server(api_key=API_KEY)
+    cache = await start_cache(lean.url, **SCREENED_SETTINGS)
+    sent = asyncio.create_task(screened_check(cache, PROOF))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        async with cache.get("/health") as response:
+            assert response.status == 200
+        assert not sent.done()
+    finally:
+        release.set()
+    status, _reply = await sent
+    assert status == 200
 
 
 async def test_a_screened_request_carries_at_most_as_many_snippets_as_its_places(

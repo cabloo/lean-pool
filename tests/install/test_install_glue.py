@@ -396,9 +396,14 @@ def test_text_from_a_join_request_is_made_printable_before_it_is_shown_or_sent()
 
 def test_the_installer_for_instance_one_takes_no_tls_option_and_install_pool_never_names_it():
     """Text check, beside the fake-machine run that shows instance 1 untouched: install-pool.sh and
-    lean-pool-ctl never name /srv/kimina (instance 1) at all, only /srv/kimina-NAME and /srv/lean-pool-NAME."""
+    lean-pool-ctl never name /srv/kimina (instance 1) at all, only /srv/kimina-NAME and /srv/lean-pool-NAME.
+    The one line allowed to is copy_outside_pools, which refuses a key's copy there and touches nothing."""
     for name in ("install-pool.sh", "lean-pool-ctl"):
-        code = commands_of(INSTALLERS / name)
+        code = "\n".join(
+            line
+            for line in commands_of(INSTALLERS / name).splitlines()
+            if not line.startswith("copy_outside_pools() {")
+        )
         assert not re.search(r"/srv/kimina(?![-\w])", code), name
         assert "kimina-firewall.service" not in (INSTALLERS / name).read_text(), name
     assert "INSTANCE_DIR=/srv/kimina-$POOL" in (INSTALLERS / "install-pool.sh").read_text()

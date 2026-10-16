@@ -3,8 +3,10 @@
 The machine is the tests' site with `demo`'s pool. It is installed again with `--pool-key-copy DIR`, DIR where a
 program on the host hands the pool's key to boxes of its own (a directory under one that program's user owns). What
 is shown: no copy unless asked for; asked, the key and the authority are written at every run as the screened key's
-copy is, by the same writer, and `lean-pool-ctl NAME pool-key copy` writes them again; the key is never printed; and
-the copy is never let into the screened key's copy's directory, nor one inside or around it, whichever names it.
+copy is, by the same writer, and `lean-pool-ctl NAME pool-key copy` writes them again, until `--no-pool-key-copy`;
+the key is never printed; the copy is never let into the screened key's copy's directory, nor one inside or around
+it, whichever names it, nor one that holds the screened key, nor a pool's own directory; and it is never written
+where anyone but root and its owner could have put a directory of their own on its path.
 """
 
 import os
@@ -179,6 +181,124 @@ def test_the_copy_is_never_written_through_a_link_planted_in_its_directory(pool,
     assert result.returncode == 0, failed(result)
     assert victim.read_text() == "left alone\n" and victim.stat().st_mode & 0o777 == 0o640
     assert not (copy / "api-key").is_symlink()
+
+
+def test_no_pool_key_copy_stops_the_copy_and_leaves_its_files(pool):
+    copy = pool.path(COPY)
+    result = install(pool, "--no-pool-key-copy")
+    assert result.returncode == 0, failed(result)
+    assert settings(pool)["LEANPOOL_POOL_KEY_COPY"] == ""
+    assert (
+        f"  pool key    no longer copied; the files in {copy} are left there: remove them by hand"
+        in result.stdout
+    )
+    assert (copy / "api-key").read_text().strip() == key_of(pool)
+    # A later run writes nothing there.
+    (copy / "api-key").unlink()
+    again = install(pool)
+    assert again.returncode == 0, failed(again)
+    assert not (copy / "api-key").exists()
+    assert "  pool key " not in again.stdout
+    assert "the pool's key: copied" not in control(pool, "status").stdout
+
+
+def test_a_copy_and_no_copy_in_one_run_are_refused(untouched):
+    result = install(
+        untouched.machine,
+        "--pool-key-copy",
+        str(untouched.machine.path(COPY)),
+        "--no-pool-key-copy",
+    )
+    assert result.returncode != 0 and "say opposite things" in result.stderr
+    assert untouched.machine.path(f"{POOL}/pool.env").read_bytes() == untouched.settings
+
+
+# --- never where someone else could have put a directory of their own ------------------------------------------------
+
+
+def test_a_parent_others_can_write_is_refused_and_nothing_is_written(pool):
+    hand_out, copy = pool.path(HAND_OUT), pool.path(COPY)
+    (copy / "api-key").write_text("before\n")
+    for mode in (
+        0o777,
+        0o1777,
+        0o770,
+    ):  # a sticky one too: whoever makes the copy's directory first owns it
+        hand_out.chmod(mode)
+        result = control(pool, "pool-key", "copy")
+        assert result.returncode != 0, oct(mode)
+        assert (
+            "can be written by others" in result.stderr and "nothing was written" in result.stderr
+        )
+        assert (copy / "api-key").read_text() == "before\n"
+    hand_out.chmod(0o755)
+    assert control(pool, "pool-key", "copy").returncode == 0
+
+
+def test_a_copy_directory_others_can_write_is_refused(pool):
+    copy = pool.path(COPY)
+    (copy / "api-key").write_text("before\n")
+    copy.chmod(0o770)
+    result = control(pool, "pool-key", "copy")
+    assert result.returncode != 0 and "can be written by others than its owner" in result.stderr
+    assert (copy / "api-key").read_text() == "before\n"
+
+
+def test_a_sticky_directory_higher_up_passes_when_its_next_is_the_owners(pool):
+    # /tmp's shape: writable by all, sticky, and the directory below it the copy's owner's, which nobody else can
+    # move. Here that is the hand-out directory, with the copy's own directory below a directory of the owner's.
+    hand_out = pool.path(HAND_OUT)
+    deeper = hand_out / "owner"
+    deeper.mkdir(mode=0o755)
+    env = pool.path(f"{POOL}/pool.env")
+    env.write_text(env.read_text().replace(str(pool.path(COPY)), str(deeper / "home")))
+    hand_out.chmod(0o1777)
+    try:
+        result = control(pool, "pool-key", "copy")
+        assert result.returncode == 0, failed(result)
+        assert (deeper / "home" / "api-key").read_text().strip() == key_of(pool)
+    finally:
+        hand_out.chmod(0o755)
+
+
+def test_a_directory_that_holds_the_screened_key_is_refused(pool):
+    # An old screened copy's directory, whatever it is called now: it holds the screened key.
+    copy = pool.path(COPY)
+    pool.path(f"{POOL}/screened-api-key").write_text("the-screened-key\n")
+    (copy / "api-key").write_text("the-screened-key\n")
+    result = control(pool, "pool-key", "copy")
+    assert result.returncode != 0 and "holds the other key's copy" in result.stderr
+    assert (copy / "api-key").read_text() == "the-screened-key\n"
+
+
+POOLS_OWN = [f"{POOL}/hand-out", "/srv/kimina-demo/hand-out", "/etc/lean-pool/x"]
+
+
+@pytest.mark.parametrize("inside", POOLS_OWN)
+def test_a_pools_own_directory_is_refused(untouched, inside):
+    machine = untouched.machine
+    result = install(machine, "--pool-key-copy", str(machine.path(inside)))
+    assert result.returncode != 0 and "a pool's or a Lean server's own directory" in result.stderr
+    assert machine.path(f"{POOL}/pool.env").read_bytes() == untouched.settings
+
+
+@pytest.mark.parametrize("inside", POOLS_OWN)
+def test_the_verb_refuses_a_pools_own_directory_whoever_wrote_it_in_the_settings(pool, inside):
+    env = pool.path(f"{POOL}/pool.env")
+    env.write_text(env.read_text().replace(str(pool.path(COPY)), str(pool.path(inside))))
+    refused = control(pool, "pool-key", "copy")
+    assert refused.returncode != 0 and "a pool's or a Lean server's own directory" in refused.stderr
+    assert not pool.path(inside).exists()
+
+
+def test_a_kept_directory_that_is_not_a_usable_path_is_refused_before_anything(untouched):
+    machine = untouched.machine
+    env = machine.path(f"{POOL}/pool.env")
+    env.write_text(env.read_text() + "LEANPOOL_POOL_KEY_COPY=/srv//x\n")
+    kept = env.read_bytes()
+    result = install(machine)
+    assert result.returncode != 0 and "keeps an unusable directory" in result.stderr
+    assert env.read_bytes() == kept
 
 
 def test_a_copy_that_cannot_be_written_is_a_warning_not_a_failed_install(pool, tmp_path):

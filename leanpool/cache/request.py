@@ -7,6 +7,7 @@ other field untouched, so an option a newer Kimina adds keeps working through th
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -85,6 +86,19 @@ def screened_refusal(
     if request.timeout is not None and request.timeout > max_timeout:
         return f"a check at the screened door has a timeout of at most {max_timeout} seconds"
     return None
+
+
+def with_timeout(request: CheckRequest, seconds: int) -> CheckRequest:
+    """The request with its Lean timeout set to ``seconds``: in its key and in what is forwarded.
+
+    The screened door gives one to a request that names none, so that the servers' own default,
+    whatever it is, never decides how long a screened check may run.
+    """
+    return dataclasses.replace(
+        request,
+        timeout=seconds,
+        forwarded_fields={**request.forwarded_fields, "timeout": seconds},
+    )
 
 
 def _read_snippets(raw_snippets: object) -> tuple[Snippet, ...]:

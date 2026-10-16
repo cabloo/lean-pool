@@ -132,6 +132,7 @@ HOST_PREFIXES = (
     "/run/systemd/",
     "/run/lean-pool/",
     "/sys/fs/cgroup/",
+    "/sys/class/net/",
 )
 # The scripts without a `.sh` that name host paths.
 PROGRAMS = ("kimina-ctl", "lean-pool-ctl", "kimina-firewall")
@@ -1056,9 +1057,19 @@ def main():
             print("[ALERT]    (1) : config : parsing [/usr/local/etc/haproxy/haproxy.cfg:34] : 'bind :18001' in section "
                   "'listen' : unable to stat SSL certificate from file '/etc/leanpool/tls/box.pem' : Permission denied.")
         return 0
+    # Docker's bridge networks, as STUB_NETWORKS names them: ID=BRIDGE_NAME ... (an empty name: Docker's br-ID).
+    networks = dict(entry.split("=", 1) for entry in os.environ.get("STUB_NETWORKS", "").split())
+    if verb == "network" and argv[1] == "ls":                # ls -q --no-trunc --filter driver=bridge
+        if os.environ.get("STUB_NETWORKS_FAIL"):
+            fail("Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+        print("\n".join(networks))
+        return 0
     if verb == "network" and argv[1] == "inspect":
         if argv[2] == "bridge":
             print(os.environ.get("STUB_BRIDGE", "172.17.0.1"))
+            return 0
+        if argv[2] in networks:                              # inspect ID -f '{{index .Options "...bridge.name"}}'
+            print(networks[argv[2]])
             return 0
         # A network exists while the compose project that makes it is up.
         if not (STATE / f"network.{argv[2]}").exists():
@@ -1394,6 +1405,7 @@ class Machine:
             "etc/sudoers.d",
             "run/systemd/system",
             "sys/fs/cgroup",
+            "sys/class/net",
         ):
             (self.root / path).mkdir(parents=True)
         (self.stub / "bin").mkdir(parents=True)

@@ -747,6 +747,73 @@ async def test_the_screened_door_answers_health_as_the_front_door_and_takes_chec
     assert lean.asked == []
 
 
+async def test_the_screened_door_speaks_http_1_1_alone_and_refuses_a_large_body_on_its_headers(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    certificates: PoolCertificates,
+    session: aiohttp.ClientSession,
+) -> None:
+    """What a connection at the door can hold of the proxy: one request at a time, and a body no
+    longer than one buffer, refused before it is sent (docs/haproxy.md#the-screened-door)."""
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+    assert pool.screened_door_port is not None
+    context = certificates.client_context()
+    context.set_alpn_protocols(["h2", "http/1.1"])
+    _reader, writer = await asyncio.open_connection(
+        "127.0.0.1", pool.screened_door_port, ssl=context, server_hostname=FRONT_DOOR_NAME
+    )
+    try:
+        assert writer.get_extra_info("ssl_object").selected_alpn_protocol() == "http/1.1"
+    finally:
+        writer.close()
+    # A body stated as one byte past a buffer: refused on the headers, with no byte of it sent.
+    too_large = pool.settings.maximum_request_bytes + 1
+    head = (
+        "POST /api/check HTTP/1.1\r\nHost: pool.test\r\n"
+        f"Authorization: Bearer {SCREENED_KEY}\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {too_large}\r\n\r\n"
+    )
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1",
+        pool.screened_door_port,
+        ssl=certificates.client_context(),
+        server_hostname=FRONT_DOOR_NAME,
+    )
+    received = b""
+    try:
+        writer.write(head.encode())
+        await writer.drain()
+        # The proxy answers and closes the connection, whose body it will never read: what
+        # arrived before the close is the answer.
+        while b"\r\n\r\n" not in received or not received.rstrip().endswith(b"}"):
+            chunk = await asyncio.wait_for(reader.read(65536), 10)
+            if not chunk:
+                break
+            received += chunk
+    except (ssl.SSLError, OSError):
+        pass
+    finally:
+        writer.close()
+    assert received.startswith(b"HTTP/1.1 413 "), received
+    assert b'{"detail":"a check at the screened door is too large"}' in received
+
+    # A body of no stated length (chunked) is refused too.
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b'{"snippets": [{"id": "a", "code": "-- proof a"}]}'
+
+    async with session.post(
+        f"{pool.door_url}/api/check", data=chunks(), headers=SCREENED_AUTHORIZED
+    ) as answer:
+        assert answer.status == 411
+        assert await answer.json() == {
+            "detail": "a check at the screened door states its Content-Length"
+        }
+    # And a check that keeps to both is served.
+    assert (await send(session, pool.door_url, proof("a"), SCREENED_AUTHORIZED))[0] == 200
+    assert lean.checked_codes == [proof("a")]
+
+
 async def test_while_the_cache_is_down_the_screened_door_answers_503_and_reaches_no_server(
     start_lean_server: StartLeanServer,
     start_box: StartBox,

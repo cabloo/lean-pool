@@ -314,7 +314,9 @@ from a docker bridge's interface: only the containers and the programs of the po
 and something there passes it on (an SSH tunnel to the machine, say). `--screened-key-copy DIR`
 names the directory that program reads the key and the pool authority's certificate from; the
 files are owned by that directory's owner. DIR's parent must exist, belong to that program's user,
-and be reached through no link. The install's summary has a `screened` line, with where the door is
+and be reached through no link and through no directory anyone but root and that user can write
+(the installer refuses the copy otherwise, and writes nothing). `--no-screened-key-copy` stops the
+copy and leaves its files. The install's summary has a `screened` line, with where the door is
 and where its key went; a copy that could not be written is a warning there, not a failed install.
 `lean-pool-ctl upstream status` says the same, and never prints the key. The door stays open
 through every re-run until `--no-screened-door`. Closing it does not retire the key: `screened-key
@@ -334,12 +336,18 @@ sudo lean-pool-ctl upstream pool-key copy        # the key and the authority wri
 
 Every install run writes the pool's key (`api-key`, 0600) and the pool authority's certificate
 (`ca.crt`, 0644) into DIR, as the [screened key's copy](cache.md#the-screened-door) is written:
-owned by DIR's owner, its path walked with no link followed, each file made beside the old one
-and moved over it. DIR is kept once given. It may not be the screened key's copy's directory,
-lie inside it or hold it, since both copies hold files of the same names: the installer refuses
-that before it changes anything. The summary has a `pool key` line; a copy that could not be
-written is a warning there, not a failed install. Whoever can read DIR holds the pool's key,
-which runs code on every Lean server of the pool ([SECURITY.md](../SECURITY.md)).
+owned by DIR's owner, its path walked with no link followed and through no directory anyone but
+root and that owner can write, each file made beside the old one and moved over it. DIR is kept
+once given, until `--no-pool-key-copy`, which stops the copy and leaves its files where they are
+(remove them by hand). It may not be the screened key's copy's directory, lie inside it or hold
+it, nor be a directory that holds the screened key, compared as directories and by what they hold
+as well as by name: the program that hands the screened key to machines nobody vouches for must
+never be able to read the pool's own key. The installer refuses that before it changes anything.
+One user may own both directories only when it is the one program trusted to hand each key to
+its own machines alone, as a coordinator that starts work on rented and owned boxes is. The
+summary has a `pool key` line; a copy that could not be written is a warning there, not a failed
+install. Whoever can read DIR holds the pool's key, which runs code on every Lean server of the
+pool ([SECURITY.md](../SECURITY.md)).
 
 ### Watching it
 
