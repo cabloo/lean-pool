@@ -11,6 +11,8 @@ reference.
 | `--pin` | `LEANPOOL_CACHE_PIN` | required | A string naming the pool's Lean and Mathlib versions. Part of every cache key: change it whenever the Lean servers' image changes. |
 | `--api-key-file` | `LEANPOOL_CACHE_API_KEY_FILE` | none | A file holding the pool's API key. |
 | (no flag) | `LEANPOOL_CACHE_API_KEY` | none | The key itself. There is deliberately no flag for it: command lines are visible to every user of the machine. Give the file or the variable, not both. |
+| `--screened-api-key-file` | `LEANPOOL_CACHE_SCREENED_API_KEY_FILE` | none | A file holding a second key, for senders trusted less than the pool's own. Their checks must pass [the screen](cache.md#the-screened-key) and are forwarded with the pool's key. Needs the pool's key, and must differ from it. |
+| (no flag) | `LEANPOOL_CACHE_SCREENED_API_KEY` | none | The second key itself. Give the file or the variable, not both. |
 | `--allow-unauthenticated` | `LEANPOOL_CACHE_ALLOW_UNAUTHENTICATED` | off | Serve without checking a key, for a pool whose Lean servers have none. Without a key and without this, the cache refuses to start. |
 | `--database` | `LEANPOOL_CACHE_DATABASE` | `leanpool-cache.sqlite3` (the image sets `/var/lib/leanpool/cache.sqlite3`) | The SQLite file holding the stored results. |
 | `--max-bytes` | `LEANPOOL_CACHE_MAX_BYTES` | `4294967296` (4 GiB) | The size cap. Above it the least recently used results are evicted. |

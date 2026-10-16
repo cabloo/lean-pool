@@ -5,18 +5,20 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import hmac
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 from aiohttp import web
 
 from leanpool.cache.metrics import render_cache_metrics
-from leanpool.cache.request import InvalidRequestError, parse_check_request
+from leanpool.cache.request import InvalidRequestError, Snippet, parse_check_request
 from leanpool.cache.service import CheckService
 from leanpool.cache.settings import CacheSettings
 from leanpool.cache.store import AsyncResultStore
 from leanpool.cache.upstream import UpstreamClient, UpstreamFailure, new_upstream_session
 from leanpool.metrics import CACHE_METRICS_PATH, CONTENT_TYPE
+from leanpool.screen import screen
 from leanpool.signals import PRIORITY_HEADER, is_background
 
 _SETTINGS = web.AppKey("settings", CacheSettings)
@@ -63,19 +65,29 @@ async def _handle_check(request: web.Request) -> web.Response:
     be answered, the first such failure (in request order) is the reply, with the upstream's own
     status and body. The snippets that did get a definitive answer are already stored, so the
     client's retry costs the Lean servers only what was missing.
+
+    A request sent with the screened key is read by the screen first; it is then served like any
+    other, from the store or the servers, and shares flights and stored answers with the pool's
+    own checks (an answer is the servers' work, whoever asked).
     """
     settings = request.app[_SETTINGS]
-    refusal = _refuse_unauthenticated(request, settings.api_key)
-    if refusal is not None:
-        return refusal
+    sender = _authenticate(request, settings)
+    if isinstance(sender, web.Response):
+        return sender
     if settings.hop_header in request.headers:
         return _error(_LOOP_DETECTED, "this request has already passed through the cache")
     try:
         check_request = parse_check_request(await _read_json(request))
     except InvalidRequestError as error:
         return _error(_UNPROCESSABLE, str(error))
-    service = request.app[_SERVICE]
     authorization = request.headers.get("Authorization")
+    if sender is _Sender.SCREENED:
+        refusal = _refuse_unscreened(check_request.snippets)
+        if refusal is not None:
+            return refusal
+        # Forwarded with the pool's own key: no Lean server ever holds the screened one.
+        authorization = f"{_BEARER_PREFIX}{settings.api_key}"
+    service = request.app[_SERVICE]
     background = is_background(request.headers.get(PRIORITY_HEADER))
     outcomes = await asyncio.gather(
         *(
@@ -118,6 +130,50 @@ async def _handle_metrics(request: web.Request) -> web.Response:
     status = await request.app[_SERVICE].status()
     text = render_cache_metrics(status, request.app[_SETTINGS].maximum_bytes)
     return web.Response(body=text.encode("ascii"), headers={"Content-Type": CONTENT_TYPE})
+
+
+class _Sender(enum.Enum):
+    """Which key a check came with: the pool's own, or the screened one."""
+
+    POOL = enum.auto()
+    SCREENED = enum.auto()
+
+
+def _authenticate(request: web.Request, settings: CacheSettings) -> _Sender | web.Response:
+    """Return which key the request carries, or a 401.
+
+    Both keys are compared, each in constant time, whichever matches, so the reply's timing says
+    nothing about either key or about which one a token came close to.
+    """
+    if settings.screened_api_key is None:
+        refusal = _refuse_unauthenticated(request, settings.api_key)
+        return _Sender.POOL if refusal is None else refusal
+    authorization = request.headers.get("Authorization")
+    if not authorization:
+        return _error(_UNAUTHORIZED, "Missing API key")
+    token = authorization.removeprefix(_BEARER_PREFIX).strip().encode("utf-8")
+    pool = hmac.compare_digest(token, (settings.api_key or "").encode("utf-8"))
+    screened = hmac.compare_digest(token, settings.screened_api_key.encode("utf-8"))
+    if pool:
+        return _Sender.POOL
+    if screened:
+        return _Sender.SCREENED
+    return _error(_UNAUTHORIZED, "Invalid API key")
+
+
+def _refuse_unscreened(snippets: Sequence[Snippet]) -> web.Response | None:
+    """Return a 422 naming the first snippet the screen refuses, or None if every one passes.
+
+    One refused snippet refuses the whole request, before any of it is looked up or forwarded.
+    """
+    for snippet in snippets:
+        finding = screen(snippet.code)
+        if finding is not None:
+            return _error(
+                _UNPROCESSABLE,
+                f"refused by the pool's screen: snippet {snippet.identifier!r} holds {finding}",
+            )
+    return None
 
 
 def _refuse_unauthenticated(request: web.Request, api_key: str | None) -> web.Response | None:

@@ -43,6 +43,12 @@ A week of running the pool on boxes that also do other work.
 
 ### Added
 
+- **A second, screened key for the cache** (`--screened-api-key-file`): for senders trusted less
+  than the pool's own. Their checks must first pass [the screen](docs/cache.md#the-screened-key)
+  (`leanpool/screen.py`: no `#eval`, `run_tac`, `elab`, `IO`, most attributes or imports beyond
+  Mathlib and Aesop), or the whole request is answered 422 and reaches nothing; those that pass
+  are served like any other and forwarded with the pool's key, so no Lean server holds the
+  second one.
 - **The installers** (`deploy/install/`): the scripts the deployment installs its Lean servers,
   its pool and its joining boxes with, now in this repository, with their tests
   (`tests/install/`, on a fake machine). A deployment's own values live in a site directory

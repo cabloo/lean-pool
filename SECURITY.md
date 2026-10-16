@@ -18,6 +18,13 @@ only to clients you would let run code there.
 answers anything from its store, and every Lean server checks it again. No command takes a key
 or a token as an argument, and none logs one.
 
+**A second key, screened, for senders trusted less.** The cache can hold one more key. A check
+sent with it must first pass [the screen](docs/cache.md#the-screened-key), a list of what a proof
+never needs (`#eval`, `run_tac`, `elab`, `IO`, most attributes, imports beyond Mathlib and
+Aesop), and is forwarded with the pool's key, so no Lean server holds the second one. The screen
+is a list of words, not proof that a check runs no code: give that key only where the Lean
+servers are also run so as to hold what passes.
+
 **Three things are answered without the key.** `GET /health`, and for a Prometheus scraper
 `GET /metrics`, `/metrics/cache` and `/metrics/pool`: the names of the pool's servers and
 certificates, their states, and counts. No key, no proof and no address is in them, and none

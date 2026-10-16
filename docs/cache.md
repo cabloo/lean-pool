@@ -63,8 +63,32 @@ open: neither holds a key, a proof or an address.
 
 **Other replies of the cache itself:** 401 without the key, 422 for a malformed request
 (not a JSON object, no snippets, duplicate ids, a `timeout` that is not a whole number of
-seconds, a `debug` or `no_cache` that is not a boolean), 508 for a request that already carries
-the loop-guard header.
+seconds, a `debug` or `no_cache` that is not a boolean) or one the screen refuses (below), 508
+for a request that already carries the loop-guard header.
+
+## The screened key
+
+A pool can give the cache a second key (`--screened-api-key-file`), for senders it trusts less
+than its own: machines whose owner it does not know. Checking Lean code runs it
+([security](../SECURITY.md)), and the screen takes the easy ways of doing that away from them.
+
+- **A check sent with it is read first.** Every snippet of the request must pass, or the whole
+  request is answered 422, `{"detail": "refused by the pool's screen: snippet 'ID' holds ..."}`,
+  and nothing of it is looked up, forwarded or stored.
+- **One that passes is served like any other**, from the store or the servers, and shares flights
+  and stored answers with checks sent with the pool's key. It is forwarded with the pool's key,
+  so no Lean server holds the second one. `/status` takes the pool's key alone.
+- **The rules** (`leanpool/screen.py`) hold what a proof and its statement never need: `import`
+  only `Mathlib`, `Aesop` and their modules; no `#` command but `#print`, `#check`, `#reduce` and
+  `#synth`; none of the words that run a program or define a way to (`run_tac`, `elab`, `macro`,
+  `syntax`, `initialize`, `simproc`, `unsafe`, `implemented_by`, `extern`, `native_decide`, `IO`
+  and others); and attributes from a short list (`simp`, `norm_cast`, `ext`, `instance`, ...)
+  only, since an attribute can register code. The whole text is read, comments and strings
+  included, each word as a whole word: a word in a comment costs one refused check.
+- **What it is not:** proof that a check runs no code. It is a list of words over a language
+  whose files can define syntax, and a determined sender may get round it. Run the Lean servers
+  so that what passes is held too: the installers put each worker in a
+  [sandbox of its own](worker-sandbox.md).
 
 **The store** is one SQLite file in write-ahead-log mode. All SQLite work runs on a dedicated
 thread, never on the event loop. The size cap counts the bytes of keys and payloads; when a

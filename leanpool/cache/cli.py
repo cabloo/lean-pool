@@ -29,6 +29,7 @@ from leanpool.environment import (
 logger = logging.getLogger(__name__)
 
 _API_KEY_VARIABLE = "LEANPOOL_CACHE_API_KEY"
+_SCREENED_API_KEY_VARIABLE = "LEANPOOL_CACHE_SCREENED_API_KEY"
 _PATTERNS_VARIABLE = "LEANPOOL_CACHE_EXHAUSTION_PATTERNS"
 _PATTERN_SEPARATOR = ","
 
@@ -40,13 +41,14 @@ def main(
     settings = parse_settings(arguments, os.environ if environment is None else environment)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logger.info(
-        "lean-pool cache for pin %r on %s:%d, forwarding misses to %s, store %s (cap %d bytes)",
+        "lean-pool cache for pin %r on %s:%d, forwarding misses to %s, store %s (cap %d bytes), %s",
         settings.pin,
         settings.host,
         settings.port,
         settings.upstream_url,
         settings.database_path,
         settings.maximum_bytes,
+        "with a screened key" if settings.screened_api_key else "no screened key",
     )
     # No access log: a pool serves thousands of checks a minute, and /status has the counts.
     web.run_app(
@@ -69,12 +71,14 @@ def parse_settings(
         parser.error("--pin (or LEANPOOL_CACHE_PIN) is required")
     try:
         api_key = _resolve_api_key(options, environment)
+        screened_api_key = _resolve_screened_api_key(options, environment, api_key)
         patterns = _resolve_patterns(options, environment)
     except ValueError as error:
         parser.error(str(error))
     return CacheSettings(
         pin=options.pin,
         api_key=api_key,
+        screened_api_key=screened_api_key,
         database_path=options.database,
         host=options.host,
         port=options.port,
@@ -111,6 +115,15 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
         None,
         f"a file holding the pool's API key (or put the key itself in {_API_KEY_VARIABLE}); "
         "required unless --allow-unauthenticated",
+    )
+    settings.add(
+        "--screened-api-key-file",
+        "LEANPOOL_CACHE_SCREENED_API_KEY_FILE",
+        Path,
+        None,
+        "a file holding a second key, for senders trusted less than the pool's own (or put the "
+        f"key itself in {_SCREENED_API_KEY_VARIABLE}): their checks must pass the screen and are "
+        "forwarded with the pool's key; none by default",
     )
     settings.add_switch(
         "--allow-unauthenticated",
@@ -195,6 +208,32 @@ def _resolve_api_key(options: argparse.Namespace, environment: Mapping[str, str]
         f"no API key: set --api-key-file or {_API_KEY_VARIABLE}, "
         "or pass --allow-unauthenticated for a pool without a key"
     )
+
+
+def _resolve_screened_api_key(
+    options: argparse.Namespace, environment: Mapping[str, str], api_key: str | None
+) -> str | None:
+    """Return the screened key, or None when there is none (the default).
+
+    It needs the pool's own key: without one every sender is let in unscreened, so a second key
+    would screen nobody. And it must differ from it, or the screen could never tell them apart.
+    """
+    key_from_environment = environment.get(_SCREENED_API_KEY_VARIABLE, "")
+    if options.screened_api_key_file is not None and key_from_environment:
+        raise ApiKeyError(
+            f"give either --screened-api-key-file or {_SCREENED_API_KEY_VARIABLE}, not both"
+        )
+    if options.screened_api_key_file is not None:
+        screened = read_api_key_file(options.screened_api_key_file)
+    elif key_from_environment:
+        screened = validate_api_key(key_from_environment)
+    else:
+        return None
+    if api_key is None:
+        raise ApiKeyError("a screened key needs the pool's own key: the cache has none")
+    if screened == api_key:
+        raise ApiKeyError("the screened key must differ from the pool's own key")
+    return screened
 
 
 def _resolve_patterns(
