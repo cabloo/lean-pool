@@ -137,6 +137,7 @@ SCREENED_DOOR_ADDRESS=$(setting LEANPOOL_SCREENED_DOOR_ADDRESS)
 SCREENED_DOOR_PORT=$(setting LEANPOOL_SCREENED_DOOR_PORT)
 SCREENED_KEY_COPY=$(setting LEANPOOL_SCREENED_KEY_COPY)
 SCREENED_KEY=$DIR/screened-api-key
+SCREENED_IMPORTS=$(setting LEANPOOL_CACHE_SCREENED_IMPORTS)
 # Where the pool's own key's copy is written (docs/deployment.md), for a program on this host that hands it on.
 POOL_KEY_COPY=$(setting LEANPOOL_POOL_KEY_COPY)
 if [ "$SCREENED_DOOR" = on ]; then
@@ -373,7 +374,7 @@ PY
   if container_runs "$JOIN_SERVICE"; then echo "--- a join window is open (port $JOIN_PORT)"; fi
   # The screened door: where it is open and where its key's copy goes. Never the key itself.
   if [ "$SCREENED_DOOR" = on ]; then
-    echo "--- screened door: on, https://$SCREENED_DOOR_ADDRESS:$SCREENED_DOOR_PORT; key copy ${SCREENED_KEY_COPY:-not written (no directory named)}"
+    echo "--- screened door: on, https://$SCREENED_DOOR_ADDRESS:$SCREENED_DOOR_PORT; key copy ${SCREENED_KEY_COPY:-not written (no directory named)}${SCREENED_IMPORTS:+; imports beyond Mathlib and Aesop: ${SCREENED_IMPORTS//,/, }}"
   else
     echo "--- screened door: off"
   fi

@@ -25,6 +25,7 @@ from leanpool.environment import (
     parse_positive_integer,
     parse_positive_number,
 )
+from leanpool.screen import IMPORT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ _API_KEY_VARIABLE = "LEANPOOL_CACHE_API_KEY"
 _SCREENED_API_KEY_VARIABLE = "LEANPOOL_CACHE_SCREENED_API_KEY"
 _PATTERNS_VARIABLE = "LEANPOOL_CACHE_EXHAUSTION_PATTERNS"
 _PATTERN_SEPARATOR = ","
+_IMPORTS_VARIABLE = "LEANPOOL_CACHE_SCREENED_IMPORTS"
 
 
 def main(
@@ -73,6 +75,7 @@ def parse_settings(
         api_key = _resolve_api_key(options, environment)
         screened_api_key = _resolve_screened_api_key(options, environment, api_key)
         patterns = _resolve_patterns(options, environment)
+        imports = _resolve_imports(options, environment)
     except ValueError as error:
         parser.error(str(error))
     if screened_api_key is not None and options.screened_in_flight is None:
@@ -87,6 +90,7 @@ def parse_settings(
         screened_in_flight=options.screened_in_flight,
         screened_max_timeout_seconds=options.screened_max_timeout,
         screened_max_request_bytes=options.screened_max_request_bytes,
+        screened_imports=imports,
         database_path=options.database,
         host=options.host,
         port=options.port,
@@ -211,6 +215,14 @@ def _build_parser(environment: Mapping[str, str]) -> argparse.ArgumentParser:
         "the loop-guard header; must match the proxy's",
     )
     parser.add_argument(
+        "--screened-import",
+        action="append",
+        metavar="ROOT",
+        help="with a screened key, a check may also import ROOT and its modules (a module name's "
+        "first part, such as FormalConjectures), beside Mathlib and Aesop; repeatable "
+        f"[env {_IMPORTS_VARIABLE}, comma-separated; default none]",
+    )
+    parser.add_argument(
         "--exhaustion-pattern",
         action="append",
         metavar="TEXT",
@@ -276,6 +288,28 @@ def _resolve_patterns(
     return environment_default(
         environment, _PATTERNS_VARIABLE, _parse_patterns, DEFAULT_EXHAUSTION_PATTERNS
     )
+
+
+def _resolve_imports(
+    options: argparse.Namespace, environment: Mapping[str, str]
+) -> tuple[str, ...]:
+    """The roots a screened check may import beside Mathlib and Aesop: the flags', else the
+    variable's (comma-separated), else none."""
+    if options.screened_import:
+        roots = tuple(options.screened_import)
+    else:
+        roots = tuple(
+            root.strip()
+            for root in environment.get(_IMPORTS_VARIABLE, "").split(_PATTERN_SEPARATOR)
+            if root.strip()
+        )
+    for root in roots:
+        if not IMPORT_ROOT.fullmatch(root):
+            raise ValueError(
+                f"--screened-import: {root!r} is not the first part of a Lean module's name "
+                "(such as FormalConjectures)"
+            )
+    return roots
 
 
 def _parse_patterns(text: str) -> tuple[str, ...]:

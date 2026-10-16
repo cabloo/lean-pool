@@ -66,6 +66,7 @@ the box they belong to.
 | `LEANPOOL_CACHE_SCREENED_IN_FLIGHT` | `pool.env` | required by `compose.screened-door.yaml` | The cache's own setting: how many checks the screened door's senders may have at the servers at once. |
 | `LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS` | `pool.env` | `300` | The cache's own setting: the longest Lean timeout those senders may ask for, and the one given to a check of theirs that names none. |
 | `LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES` | `pool.env` | `262144` | The cache's own setting: the longest body those senders may send. |
+| `LEANPOOL_CACHE_SCREENED_IMPORTS` | `pool.env` | empty | The cache's own setting: the roots, beside Mathlib and Aesop, whose modules those senders' checks may import, comma-separated (`--screened-import`). |
 | `LEANPOOL_SUBNET` | `pool.env` | `172.29.55.0/24` | The pool's network. |
 | `LEANPOOL_DNS` | `pool.env` | required by `compose.dns.yaml` | The proxy's DNS server. |
 | `LEANPOOL_SCREENED_DOOR_ADDRESS` | `pool.env` | required by `compose.screened-door.yaml` | The one host address the [screened door](../docs/cache.md#the-screened-door) is published on. |

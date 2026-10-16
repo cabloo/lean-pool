@@ -34,7 +34,9 @@
 # second HTTPS port, 18120, published on the docker0 bridge's address alone and reachable from the docker bridges
 # alone, that leads to the cache, which takes a second key there and screens what comes with it. The key is made
 # once (screened-api-key beside the pool's key); with --screened-key-copy DIR it is also written, with the pool
-# authority's certificate, into DIR for the program that hands it out (lean-pool-ctl NAME screened-key).
+# authority's certificate, into DIR for the program that hands it out (lean-pool-ctl NAME screened-key). With
+# --screened-import ROOT (repeatable; kept once given, replaced by a run that gives any, cleared by
+# --no-screened-import) a check at the door may also import ROOT's modules, beside Mathlib and Aesop.
 #
 # With --pool-key-copy DIR (kept once given) the pool's own key is written at every run, with the authority's
 # certificate, into DIR for a program on this host that hands it to boxes of its own (lean-pool-ctl NAME
@@ -74,6 +76,8 @@ SCREENED_KEY_COPY=""
 POOL_KEY_COPY=""
 NO_SCREENED_KEY_COPY=0
 NO_POOL_KEY_COPY=0
+SCREENED_IMPORTS=()
+NO_SCREENED_IMPORT=0
 # The screened door's port, as the proxy and the host both see it.
 SCREENED_DOOR_PORT=18120
 while [ $# -gt 0 ]; do
@@ -91,13 +95,15 @@ while [ $# -gt 0 ]; do
     --no-screened-key-copy) NO_SCREENED_KEY_COPY=1; shift ;;
     --pool-key-copy) POOL_KEY_COPY=$2; shift 2 ;;
     --no-pool-key-copy) NO_POOL_KEY_COPY=1; shift ;;
+    --screened-import) SCREENED_IMPORTS+=("$2"); shift 2 ;;
+    --no-screened-import) NO_SCREENED_IMPORT=1; shift ;;
     --no-firewall) FIREWALL=0; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
-[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--screened-door [--screened-key-copy DIR] | --no-screened-door] [--no-screened-key-copy] [--pool-key-copy DIR | --no-pool-key-copy] [--no-firewall] [--uninstall [--purge]]"
+[[ "$POOL" =~ ^[a-z0-9]{1,16}$ ]] || die "usage: install.sh [--site DIR] --proxy NAME --admit-cases DIR [--port N] [--subnet CIDR] [--dns IP] [--lean-timeout S] [--front-name NAME]... [--screened-door [--screened-key-copy DIR] | --no-screened-door] [--no-screened-key-copy] [--screened-import ROOT... | --no-screened-import] [--pool-key-copy DIR | --no-pool-key-copy] [--no-firewall] [--uninstall [--purge]]"
 # The site's values: --site DIR, else the site/ a join bundle carries beside this file.
 [ -n "$SITE" ] || [ ! -f "$SRC/site/site.env" ] || SITE=$SRC/site
 [ -n "$SITE" ] || die "--site DIR is needed: the directory of this site's values (site.env, instances/NAME.env)"
@@ -117,6 +123,13 @@ fi
   || die "--pool-key-copy must be an absolute directory path (parts of letters, digits, '.', '_' and '-', none '.' or '..')"
 [ -z "$POOL_KEY_COPY" ] || [ "$NO_POOL_KEY_COPY" -eq 0 ] \
   || die "--pool-key-copy and --no-pool-key-copy say opposite things"
+# The roots a screened check may import beside Mathlib and Aesop: a Lean module name's first part each.
+for root in ${SCREENED_IMPORTS[@]+"${SCREENED_IMPORTS[@]}"}; do
+  [[ "$root" =~ ^[A-Z][A-Za-z0-9_]{0,63}$ ]] \
+    || die "--screened-import takes the first part of a Lean module's name (FormalConjectures, say), not '$root'"
+done
+[ "${#SCREENED_IMPORTS[@]}" -eq 0 ] || [ "$NO_SCREENED_IMPORT" -eq 0 ] \
+  || die "--screened-import and --no-screened-import say opposite things"
 # Never a pool's or a Lean server's own directory: a key's copy there could replace a file their containers read.
 for copy in "$SCREENED_KEY_COPY" "$POOL_KEY_COPY"; do
   [ -z "$copy" ] || copy_outside_pools "$copy" \
@@ -300,6 +313,12 @@ fi
 # And the pool's own key's copy: kept once given too, until --no-pool-key-copy.
 [ -z "$POOL_KEY_COPY" ] || set_env_in "$DIR/pool.env" LEANPOOL_POOL_KEY_COPY "$POOL_KEY_COPY"
 [ "$NO_POOL_KEY_COPY" -eq 0 ] || set_env_in "$DIR/pool.env" LEANPOOL_POOL_KEY_COPY ""
+# The roots a screened check may import beside Mathlib and Aesop: kept once given, replaced by a run that gives any.
+if [ "${#SCREENED_IMPORTS[@]}" -gt 0 ]; then
+  set_env_in "$DIR/pool.env" LEANPOOL_CACHE_SCREENED_IMPORTS "$(IFS=,; echo "${SCREENED_IMPORTS[*]}")"
+elif [ "$NO_SCREENED_IMPORT" -eq 1 ]; then
+  set_env_in "$DIR/pool.env" LEANPOOL_CACHE_SCREENED_IMPORTS ""
+fi
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE "$LEAN_POOL_IMAGE"
 set_env_in "$DIR/pool.env" LEANPOOL_IMAGE_GID "$POOL_GID"
 set_env_in "$DIR/pool.env" LEANPOOL_HAPROXY_IMAGE "$HAPROXY_IMAGE"
@@ -480,6 +499,8 @@ SCREENED_SAID=""
 if [ "$SCREENED_DOOR" = on ]; then
   copy=$(pool_setting LEANPOOL_SCREENED_KEY_COPY)
   SCREENED_SAID="https://$BRIDGE:$SCREENED_DOOR_PORT (the docker bridges only)"
+  imports=$(pool_setting LEANPOOL_CACHE_SCREENED_IMPORTS)
+  [ -z "$imports" ] || SCREENED_SAID="$SCREENED_SAID; its checks may also import ${imports//,/, }"
   if [ -z "$copy" ]; then
     SCREENED_SAID="$SCREENED_SAID; its key is in $DIR/screened-api-key alone (no --screened-key-copy)"
     [ -z "$STOPPED_SCREENED_COPY" ] \

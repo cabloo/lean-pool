@@ -61,7 +61,8 @@ A week of running the pool on boxes that also do other work.
   snippets, a timeout of at most `--screened-max-timeout` seconds (and that one when it names
   none) and a body of at most `--screened-max-request-bytes`, and the checks its senders start
   hold at most `--screened-in-flight` places at the servers, with as many waiting. The screen runs
-  off the cache's event loop.
+  off the cache's event loop. `--screened-import ROOT` (the installer's too) lets those checks
+  import another library's modules beside Mathlib and Aesop: `FormalConjectures`, say.
 - **The screened door** ([docs](docs/cache.md#the-screened-door)): the second key's one way in, a
   second HTTPS port of the proxy (`--screened-door-port`) that leads to the cache alone, with no
   backup, and marks what it passes (`X-Lean-Pool-Door`). It speaks HTTP/1.1 alone, and refuses on

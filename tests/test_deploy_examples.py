@@ -193,6 +193,9 @@ def test_the_screened_door_is_published_on_one_address_and_its_key_is_the_caches
     # Its senders' limits: as many checks at the servers as it is told, and the pool's Lean timeout.
     assert environment["LEANPOOL_CACHE_SCREENED_IN_FLIGHT"] == "12"
     assert environment["LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS"] == "300"
+    # The longest body they may send; no imports but Mathlib and Aesop unless the pool names some.
+    assert environment["LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES"] == "262144"
+    assert environment["LEANPOOL_CACHE_SCREENED_IMPORTS"] == ""
     assert "secrets" not in pool["services"]["haproxy"]
 
 

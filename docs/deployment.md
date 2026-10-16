@@ -323,6 +323,14 @@ through every re-run until `--no-screened-door`. Closing it does not retire the 
 new` does, open or closed. The door takes as many checks as the pool's workers, counted at the
 install (a server that joins later counts at the next install run).
 
+A check at the door may import `Mathlib`, `Aesop` and their modules alone. For a pool whose Lean
+servers carry another library its senders' statements need, `--screened-import ROOT` (repeatable)
+admits ROOT's modules too: `--screened-import FormalConjectures` for statements written with
+`import FormalConjectures.Util.ProblemImports`. It is kept once given, replaced by a run that
+gives any, and cleared by `--no-screened-import`; the `screened` line of the summary names it.
+Admit only a library whose every module you would let a stranger load
+([more imports](cache.md#the-screened-key)).
+
 ### A copy of the pool's key
 
 A program on the pool's host that starts work on other boxes, and hands those it trusts the

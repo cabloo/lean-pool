@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import pytest
@@ -184,6 +184,48 @@ def test_settings_refuse_a_screened_key_equal_to_the_pools_or_without_one_or_wit
         )
 
 
+async def test_a_root_the_pool_adds_may_be_imported_and_nothing_else(
+    start_lean_server: StartLeanServer, start_cache: StartCache
+) -> None:
+    lean = await start_lean_server(api_key=API_KEY)
+    cache = await start_cache(
+        lean.url, **SCREENED_SETTINGS, screened_imports=("FormalConjectures",)
+    )
+    statement = "import FormalConjectures.Util.ProblemImports\ntheorem t : True := trivial"
+    status, reply = await screened_check(cache, statement)
+    assert status == 200, reply
+    assert lean.checked_codes == [statement]
+    status, reply = await screened_check(cache, "import Lean\ntheorem t : True := trivial")
+    assert status == 422
+    assert "only Mathlib, Aesop and FormalConjectures may be imported" in reply["detail"]
+
+
+async def test_without_an_added_root_another_librarys_import_is_refused(
+    start_lean_server: StartLeanServer, start_cache: StartCache
+) -> None:
+    lean = await start_lean_server(api_key=API_KEY)
+    cache = await start_cache(lean.url, **SCREENED_SETTINGS)
+    status, reply = await screened_check(
+        cache, "import FormalConjectures.Util.ProblemImports\ntheorem t : True := trivial"
+    )
+    assert status == 422
+    assert "only Mathlib and Aesop may be imported" in reply["detail"]
+    assert lean.requests == []
+
+
+@pytest.mark.parametrize("root", ["formal", "Formal.Conjectures", ""])
+def test_settings_refuse_an_import_root_that_is_not_one(tmp_path: Any, root: str) -> None:
+    with pytest.raises(ValueError, match="not the root of a Lean module's name"):
+        CacheSettings(
+            pin="p",
+            api_key=API_KEY,
+            database_path=tmp_path / "c.sqlite3",
+            screened_api_key=SCREENED_KEY,
+            screened_in_flight=PLACES,
+            screened_imports=(root,),
+        )
+
+
 def test_settings_refuse_a_screened_request_limit_below_one_byte(tmp_path: Any) -> None:
     with pytest.raises(ValueError, match="at least 1 byte"):
         CacheSettings(
@@ -292,7 +334,7 @@ async def test_the_screen_runs_off_the_event_loop(
     runs."""
     entered, release = threading.Event(), threading.Event()
 
-    def slow_screen(_code: str) -> str | None:
+    def slow_screen(_code: str, _imports: Sequence[str] = ()) -> str | None:
         entered.set()
         release.wait(10)
         return None

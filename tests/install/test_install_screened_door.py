@@ -374,6 +374,58 @@ def test_the_copy_is_refused_in_a_directory_that_holds_the_pools_own_key(pool):
     assert pools_key.strip() not in result.stdout + result.stderr
 
 
+def install(machine: Machine, *options: str) -> subprocess.CompletedProcess[str]:
+    return machine.bash("install.sh", "--proxy", "demo", "--admit-cases", ADMIT_CASES, *options)
+
+
+def test_screened_imports_are_kept_replaced_and_cleared_and_reach_the_cache(pool):
+    def cache_imports() -> str:
+        environment = resolved(pool)["services"]["cache"]["environment"]
+        return str(environment["LEANPOOL_CACHE_SCREENED_IMPORTS"])
+
+    assert cache_imports() == ""
+    given = install(
+        pool, "--screened-import", "FormalConjectures", "--screened-import", "Batteries"
+    )
+    assert given.returncode == 0, failed(given)
+    assert settings(pool)["LEANPOOL_CACHE_SCREENED_IMPORTS"] == "FormalConjectures,Batteries"
+    assert cache_imports() == "FormalConjectures,Batteries"
+    assert "its checks may also import FormalConjectures, Batteries" in given.stdout
+    assert (
+        "imports beyond Mathlib and Aesop: FormalConjectures, Batteries"
+        in control(pool, "status").stdout
+    )
+    # Kept by a run that gives none, replaced by one that gives any, cleared by --no-screened-import.
+    kept = install(pool)
+    assert kept.returncode == 0, failed(kept)
+    assert cache_imports() == "FormalConjectures,Batteries"
+    replaced = install(pool, "--screened-import", "FormalConjectures")
+    assert replaced.returncode == 0, failed(replaced)
+    assert cache_imports() == "FormalConjectures"
+    cleared = install(pool, "--no-screened-import")
+    assert cleared.returncode == 0, failed(cleared)
+    assert settings(pool)["LEANPOOL_CACHE_SCREENED_IMPORTS"] == ""
+    assert cache_imports() == ""
+    assert "may also import" not in cleared.stdout
+    assert "imports beyond" not in control(pool, "status").stdout
+
+
+def test_a_screened_import_that_is_not_a_root_or_says_both_is_refused(untouched):
+    machine = untouched.machine
+    before = machine.path(f"{POOL}/pool.env").read_bytes()
+    for options in (
+        ("--screened-import", "formal"),
+        ("--screened-import", "Formal.Conjectures"),
+        ("--screened-import", "A B"),
+        ("--screened-import", ""),
+        ("--screened-import", "FormalConjectures", "--no-screened-import"),
+    ):
+        result = install(machine, "--screened-door", *options)
+        assert result.returncode != 0, options
+        assert "--screened-import" in result.stderr, options
+    assert machine.path(f"{POOL}/pool.env").read_bytes() == before
+
+
 def test_closing_the_door_takes_its_port_and_its_rule_away_and_keeps_its_key(pool):
     key = key_of(pool)
     mark = pool.mark()

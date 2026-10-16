@@ -78,7 +78,8 @@ async def _handle_check(request: web.Request) -> web.Response:
 
     A request sent with the screened key must keep to the screened door's fields and limits
     (``screened_refusal``, and a body of at most ``screened_max_request_bytes``, refused before
-    more of it is read) and pass the screen, which runs off the event loop, so a long file holds
+    more of it is read) and pass the screen (with the pool's ``screened_imports`` beside Mathlib
+    and Aesop), which runs off the event loop, so a long file holds
     up no other request; one that names no timeout is given the door's longest. It is then
     served like any other, from the store
     or the servers, and shares stored answers with the pool's own checks (an answer is the
@@ -119,7 +120,9 @@ async def _handle_check(request: web.Request) -> web.Response:
         if reason is not None:
             return _error(_UNPROCESSABLE, reason)
         # Off the event loop: the screen is plain Python, and a long file takes it a while.
-        finding = await asyncio.to_thread(_unscreened, check_request.snippets)
+        finding = await asyncio.to_thread(
+            _unscreened, check_request.snippets, settings.screened_imports
+        )
         if finding is not None:
             return _error(_UNPROCESSABLE, finding)
         if check_request.timeout is None:
@@ -220,14 +223,15 @@ def _authenticate(request: web.Request, settings: CacheSettings) -> _Sender | we
     return _error(_UNAUTHORIZED, "Invalid API key")
 
 
-def _unscreened(snippets: Sequence[Snippet]) -> str | None:
+def _unscreened(snippets: Sequence[Snippet], imports: Sequence[str]) -> str | None:
     """Return why the screen refuses the first snippet it refuses, or None if every one passes.
 
     One refused snippet refuses the whole request, before any of it is looked up or forwarded.
-    Run in a thread: it touches nothing but its argument.
+    ``imports`` are the roots the pool lets a screened check import beside Mathlib and Aesop.
+    Run in a thread: it touches nothing but its arguments.
     """
     for snippet in snippets:
-        finding = screen(snippet.code)
+        finding = screen(snippet.code, imports)
         if finding is not None:
             return f"refused by the pool's screen: snippet {snippet.identifier!r} holds {finding}"
     return None

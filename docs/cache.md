@@ -132,13 +132,19 @@ than its own: machines whose owner it does not know. Checking Lean code runs it
   (`--screened-door-port`), which is when the front door takes the door's header away from what it
   receives; give the cache the second key only behind such a proxy.
 - **The rules** (`leanpool/screen.py`) hold what a proof and its statement never need: `import`
-  only `Mathlib`, `Aesop` and their modules; no `#` followed by a name but `#print`, `#check`,
+  only `Mathlib`, `Aesop` and their modules, and those of the roots the pool adds; no `#` followed by a name but `#print`, `#check`,
   `#reduce` and `#synth`, wherever it stands (so the notation `#s`, a finset's size, is refused
   too: `s.card` passes); none of the words that run a program or define a way to (`run_tac`,
   `elab`, `macro`, `syntax`, `initialize`, `simproc`, `unsafe`, `implemented_by`, `extern`,
   `native_decide`, `IO` and others); and attributes from a short list (`simp`, `norm_cast`, `ext`, `instance`, ...)
   only, since an attribute can register code. The whole text is read, comments and strings
   included, each word as a whole word: a word in a comment costs one refused check.
+- **More imports.** `--screened-import ROOT` (repeatable; `LEANPOOL_CACHE_SCREENED_IMPORTS`,
+  comma-separated) lets a screened check import ROOT and its modules too: a module name's first
+  part (`FormalConjectures`), so `Formal` admits nothing of `FormalConjectures`. A root admits
+  every module under it, and importing a module runs what its own code runs as it is loaded: name
+  only a library the Lean servers have installed and whose every module you would let a stranger
+  load. None by default.
 - **Where it is set:** by the installer, with the screened door (below), which also gives the cache
   its two limits: the pool's workers, and the pool's Lean timeout.
 - **While the cache is down** the screened door answers 503, and the front door sends checks

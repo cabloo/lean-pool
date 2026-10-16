@@ -210,6 +210,32 @@ def test_the_screened_doors_limits_are_read_from_flags_or_the_environment() -> N
     )
 
 
+def test_the_screened_imports_are_read_from_flags_or_the_environment() -> None:
+    environment = {
+        **KEY_ENVIRONMENT,
+        "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key",
+        "LEANPOOL_CACHE_SCREENED_IN_FLIGHT": "3",
+    }
+    assert parse_settings([], environment).screened_imports == ()
+    flags = ["--screened-import", "FormalConjectures", "--screened-import", "Batteries"]
+    assert parse_settings(flags, environment).screened_imports == ("FormalConjectures", "Batteries")
+    from_variable = parse_settings(
+        [], {**environment, "LEANPOOL_CACHE_SCREENED_IMPORTS": "FormalConjectures, Batteries"}
+    )
+    assert from_variable.screened_imports == ("FormalConjectures", "Batteries")
+    assert (
+        parse_settings([], {**environment, "LEANPOOL_CACHE_SCREENED_IMPORTS": ""}).screened_imports
+        == ()
+    )
+
+
+def test_a_screened_import_that_is_not_a_root_is_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = usage_error(["--screened-import", "Formal.Conjectures"], KEY_ENVIRONMENT, capsys)
+    assert "not the first part of a Lean module's name" in error
+
+
 def test_a_screened_key_without_a_limit_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
     environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
     error = usage_error([], environment, capsys)

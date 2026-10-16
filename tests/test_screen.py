@@ -82,6 +82,45 @@ def test_an_import_of_anything_but_mathlib_and_aesop_is_refused(module: str) -> 
     assert finding.startswith(f"`import {module}`")
 
 
+FORMAL_CONJECTURES = "import FormalConjectures.Util.ProblemImports\n\ntheorem t : True := trivial\n"
+
+
+def test_another_librarys_import_is_refused_unless_the_pool_adds_its_root() -> None:
+    assert screen(FORMAL_CONJECTURES) == (
+        "`import FormalConjectures.Util.ProblemImports` (only Mathlib and Aesop may be imported)"
+    )
+    assert screen(FORMAL_CONJECTURES, ("FormalConjectures",)) is None
+    assert (
+        screen("import FormalConjectures\ntheorem t : True := trivial", ("FormalConjectures",))
+        is None
+    )
+    assert screen(PROOF, ("FormalConjectures",)) is None
+
+
+@pytest.mark.parametrize("root", ["Formal", "FormalConjecturesX", "Conjectures"])
+def test_a_root_admits_its_own_modules_alone(root: str) -> None:
+    assert screen(FORMAL_CONJECTURES, (root,)) == (
+        "`import FormalConjectures.Util.ProblemImports` "
+        f"(only Mathlib, Aesop and {root} may be imported)"
+    )
+
+
+def test_an_added_root_changes_nothing_else() -> None:
+    roots = ("FormalConjectures",)
+    assert screen('import FormalConjectures\n#eval IO.println "x"', roots) == "the command `#eval`"
+    finding = screen("import Lean\ntheorem t : True := trivial", roots)
+    assert finding is not None
+    assert finding.startswith("`import Lean`")
+
+
+@pytest.mark.parametrize(
+    "root", ["", "formal", "Formal.Conjectures", "Formal Conjectures", "Lean*", "1Lean", "A" * 65]
+)
+def test_a_root_that_is_not_a_module_names_first_part_is_refused(root: str) -> None:
+    with pytest.raises(ValueError, match="not the root of a Lean module's name"):
+        screen("theorem t : True := trivial", (root,))
+
+
 @pytest.mark.parametrize(
     "code",
     [

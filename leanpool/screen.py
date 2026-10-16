@@ -6,7 +6,8 @@ file sent with its second key (the screened key) against the rules below before 
 refuses the whole request if one file breaks them. The rules hold what a proof and its statement
 never need:
 
-* ``import`` only ``Mathlib``, ``Aesop`` and their modules;
+* ``import`` only ``Mathlib``, ``Aesop`` and their modules, and those of the roots a pool adds
+  (``allowed_imports``; the cache's ``--screened-import``), each admitting every module under it;
 * no ``#`` followed by a name but ``#print``, ``#check``, ``#reduce`` and ``#synth``, wherever it
   stands: a command is not told apart from notation, so ``#s`` (a finset's size) is refused too,
   and ``s.card`` passes;
@@ -26,8 +27,12 @@ ways away; a sandbox around each Lean worker has to hold what passes.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 ALLOWED_IMPORTS = ("Mathlib", "Aesop")
+# A root a pool may add: the first part of a Lean module's name (``FormalConjectures``), never a
+# dotted name or a part of one, so a root admits that library's modules and no other's.
+IMPORT_ROOT = re.compile(r"[A-Z][A-Za-z0-9_]{0,63}")
 ALLOWED_HASH_COMMANDS = frozenset({"print", "check", "reduce", "synth"})
 
 REFUSED_WORDS = frozenset(
@@ -96,11 +101,18 @@ _ATTRIBUTE_TOKEN = re.compile(r"←|<-|↓|[\w'!?.]+|\S")
 _GUILLEMETS = str.maketrans("", "", "«»")
 
 
-def screen(code: str) -> str | None:
-    """Return what in ``code`` the screen refuses, in words, or ``None`` when it passes."""
+def screen(code: str, allowed_imports: Sequence[str] = ()) -> str | None:
+    """Return what in ``code`` the screen refuses, in words, or ``None`` when it passes.
+
+    ``allowed_imports`` names more roots whose modules a check may import, beside
+    ``ALLOWED_IMPORTS``; each must match ``IMPORT_ROOT``.
+    """
+    for root in allowed_imports:
+        if not IMPORT_ROOT.fullmatch(root):
+            raise ValueError(f"{root!r} is not the root of a Lean module's name")
     text = code.translate(_GUILLEMETS)
     for finding in (
-        _refused_import(text),
+        _refused_import(text, (*ALLOWED_IMPORTS, *allowed_imports)),
         _refused_hash_command(text),
         _refused_attribute(text),
         _refused_word(text),
@@ -110,11 +122,12 @@ def screen(code: str) -> str | None:
     return None
 
 
-def _refused_import(text: str) -> str | None:
+def _refused_import(text: str, roots: Sequence[str]) -> str | None:
     for match in _IMPORT.finditer(text):
         module = match.group(1)
-        if not any(module == root or module.startswith(f"{root}.") for root in ALLOWED_IMPORTS):
-            return f"`import {module}` (only {' and '.join(ALLOWED_IMPORTS)} may be imported)"
+        if not any(module == root or module.startswith(f"{root}.") for root in roots):
+            named = " and ".join([", ".join(roots[:-1]), roots[-1]])
+            return f"`import {module}` (only {named} may be imported)"
     return None
 
 

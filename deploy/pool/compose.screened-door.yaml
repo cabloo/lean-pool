@@ -8,8 +8,9 @@
 # file in ./screened-api-key, readable by the cache's group (10001) and nobody else: a check sent with it is
 # screened, and it is taken at this door alone. LEANPOOL_CACHE_SCREENED_IN_FLIGHT bounds the checks those senders
 # start (the installer gives it the pool's workers), LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS the longest Lean
-# timeout they may ask for (the installer gives it the pool's), and LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES the
-# longest body they may send.
+# timeout they may ask for (the installer gives it the pool's), LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES the
+# longest body they may send, and LEANPOOL_CACHE_SCREENED_IMPORTS the roots, beside Mathlib and Aesop, whose modules
+# their checks may import (comma-separated; none unless set).
 
 services:
   haproxy:
@@ -22,6 +23,7 @@ services:
       LEANPOOL_CACHE_SCREENED_IN_FLIGHT: "${LEANPOOL_CACHE_SCREENED_IN_FLIGHT:?set LEANPOOL_CACHE_SCREENED_IN_FLIGHT to how many checks the screened door's senders may have at the servers at once}"
       LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS: "${LEANPOOL_CACHE_SCREENED_MAX_TIMEOUT_SECONDS:-300}"
       LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES: "${LEANPOOL_CACHE_SCREENED_MAX_REQUEST_BYTES:-262144}"
+      LEANPOOL_CACHE_SCREENED_IMPORTS: "${LEANPOOL_CACHE_SCREENED_IMPORTS:-}"
     secrets:
       - screened_api_key
 

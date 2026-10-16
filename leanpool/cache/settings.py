@@ -7,6 +7,7 @@ from pathlib import Path
 
 from leanpool.cache.policy import DEFAULT_EXHAUSTION_PATTERNS
 from leanpool.loop_guard import DEFAULT_HOP_HEADER
+from leanpool.screen import IMPORT_ROOT
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,8 @@ class CacheSettings:
       ``screened_max_timeout_seconds`` is the longest Lean timeout they may ask for, and the one
       a request of theirs that names none is given. ``screened_max_request_bytes`` is the
       longest body they may send (never more than ``maximum_request_bytes``): a longer one is
-      refused before more of it is read.
+      refused before more of it is read. ``screened_imports`` names the roots, beside Mathlib and
+      Aesop, whose modules their checks may import (``leanpool.screen``); none by default.
     * ``upstream_timeout_seconds`` must cover the proxy's queue wait plus the slowest check; the
       generated ``haproxy.cfg`` states the minimum in its first lines.
     """
@@ -39,6 +41,7 @@ class CacheSettings:
     screened_in_flight: int | None = None
     screened_max_timeout_seconds: int = 300
     screened_max_request_bytes: int = 256 * 1024
+    screened_imports: tuple[str, ...] = ()
     host: str = "127.0.0.1"
     port: int = 18102
     upstream_url: str = "http://127.0.0.1:18101"
@@ -59,3 +62,8 @@ class CacheSettings:
             raise ValueError("the screened door's longest timeout must be at least 1 second")
         if self.screened_max_request_bytes < 1:
             raise ValueError("the screened door's longest request must be at least 1 byte")
+        for root in self.screened_imports:
+            if not IMPORT_ROOT.fullmatch(root):
+                raise ValueError(
+                    f"{root!r} is not the root of a Lean module's name (such as FormalConjectures)"
+                )
