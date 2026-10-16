@@ -226,7 +226,8 @@ runs the lint, the type check and
 the tests on Python 3.11, 3.12 and 3.13; runs the HAProxy tests with HAProxy 3.0 installed, where
 none may be skipped; builds the image; has Docker validate every compose file; and starts the
 demo in Docker and runs its walkthrough against it. The badge on the front page shows the last
-run.
+run. Each run's page notes the kernel the worker sandbox's tests ran on and its Landlock version,
+and lists each test that failed.
 
 ## The deployment's record
 

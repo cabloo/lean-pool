@@ -41,8 +41,22 @@ jobs:
         run: uv run ruff format --check .
       - name: Types
         run: uv run mypy
+      - name: The kernel the worker sandbox's tests run on
+        # tests/test_worker_sandbox.py shows the walls of this kernel's Landlock version, and skips
+        # without one: say which, where the run's page shows it.
+        run: |
+          probe=$(python3 -I -S -B deploy/lean-server/worker-sandbox/sandbox.py --probe 2>&1 || true)
+          echo "::notice title=Worker sandbox::Linux $(uname -r): ${probe}"
       - name: Tests
-        run: uv run pytest
+        # Each test that fails is also written as an annotation, which the run's page shows
+        # without a sign-in.
+        run: |
+          status=0
+          COLUMNS=1000 uv run pytest -rfE 2>&1 | tee pytest.log || status=$?
+          grep -E '^(FAILED|ERROR) ' pytest.log | cut -c1-900 | while IFS= read -r line; do
+            echo "::error title=pytest::${line//%/%25}"
+          done || true
+          exit "$status"
 
   live:
     name: The generated configuration on a running HAProxy 3.0
