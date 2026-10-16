@@ -69,7 +69,8 @@ def test_the_door_serves_https_with_the_front_doors_certificate_on_its_port_alon
     door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
     binds = [line for line in door if line.startswith("bind ")]
     assert binds == [
-        f"bind :{DOOR_PORT} ssl crt /etc/leanpool/tls/front.pem ssl-min-ver TLSv1.3 alpn http/1.1"
+        f"bind :{DOOR_PORT} ssl crt /etc/leanpool/tls/front.pem ssl-min-ver TLSv1.3 alpn http/1.1 "
+        "proto h1"
     ]
 
 
@@ -99,17 +100,24 @@ def test_the_door_takes_checks_alone_and_holds_as_many_waiting_as_the_pool_has_w
     ) in door
 
 
-def test_the_door_keeps_a_share_of_the_proxys_connections_of_its_own() -> None:
+def test_the_door_caps_its_own_connections() -> None:
     door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
     assert [line for line in door if line.startswith("maxconn ")] == [f"maxconn {2 * WORKERS + 8}"]
 
 
 def test_the_door_bounds_what_each_connection_holds_of_the_proxy() -> None:
-    """HTTP/1.1 alone (one request at a time on a connection), a request sent whole within 5s, and
-    a body of a stated length no longer than one buffer: what 2W + 8 connections can hold."""
-    door = sections(render_haproxy_config(SERVERS, WITH))["frontend screened_door"]
-    assert next(line for line in door if line.startswith("bind ")).endswith(" alpn http/1.1")
+    """HTTP/1.1 alone (one request at a time on a connection: no h2 by ALPN, no upgrade on HTTP/2's
+    preface), a request's headers within 5s and its body within 5s more, and a body of a stated
+    length no longer than one buffer: what 2W + 8 connections can hold."""
+    config = sections(render_haproxy_config(SERVERS, WITH))
+    door = config["frontend screened_door"]
+    assert next(line for line in door if line.startswith("bind ")).endswith(
+        " alpn http/1.1 proto h1"
+    )
     assert [line for line in door if line.startswith("timeout ")] == ["timeout http-request 5s"]
+    # The body is waited for in the backend, by its own timeout (the defaults give 10s).
+    backend = config["backend screened_cache"]
+    assert "timeout http-request 5s" in backend
     # Refused on its headers: the body is not waited for here, and is in the backend.
     assert "no option http-buffer-request" in door
     buffer = WITH.maximum_request_bytes

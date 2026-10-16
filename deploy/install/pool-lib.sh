@@ -916,6 +916,10 @@ set -euo pipefail
 name=${2:-}
 [[ "$name" =~ ^[a-z0-9-]{1,24}$ ]] || { echo "usage: lean-pool-firewall apply|remove NAME" >&2; exit 2; }
 chain=LEANPOOL-$(echo "$name" | tr '[:lower:]' '[:upper:]')
+# iptables takes a chain's name of at most 28 characters. A longer one (a long pool's name) is its first 12 and 6 of
+# its hash; a name that fits keeps the chain it always had.
+[ "${#chain}" -le 28 ] \
+  || chain=LEANPOOL-$(echo "${name:0:12}" | tr '[:lower:]' '[:upper:]')-$(printf '%s' "$name" | sha256sum | cut -c1-6 | tr '[:lower:]' '[:upper:]')
 . "/srv/lean-pool-firewall/$name.conf"
 match=(-p tcp -m conntrack --ctorigdstport "$LEANPOOL_FW_PORT" --ctdir ORIGINAL)
 # The interfaces named br-* that are not Docker's, one a line. Docker names a bridge network's interface br- and the

@@ -34,7 +34,7 @@ pytestmark = [
 
 POOL = "/srv/lean-pool-demo"
 INSTANCE = "/srv/kimina-demo"
-COPY = "/srv/hand-out/lean-pool"
+COPY = "/srv/hand-out/screened-key"
 OVERLAY = "compose.screened-door.yaml"
 CACHE = "lean-pool-demo-cache-1"
 PROXY = "lean-pool-demo-haproxy-1"
@@ -172,7 +172,7 @@ def test_opening_the_door_ends_verified_and_makes_again_the_proxy_and_the_cache_
     )
     assert re.search(
         r"^  screened    https://172\.17\.0\.1:18120 \(the docker bridges only\); its key and the authority's "
-        r"certificate are copied to \S+/srv/hand-out/lean-pool$",
+        r"certificate are copied to \S+/srv/hand-out/screened-key$",
         opened.result.stdout,
         re.MULTILINE,
     ), opened.result.stdout
@@ -305,6 +305,49 @@ def door_rules(
         if call.startswith("iptables -A LEANPOOL-DOOR-DEMO")
     ]
     return applied, rules
+
+
+def chains_of(machine: Machine, rule: str, verb: str = "apply") -> tuple[int, set[str]]:
+    """Apply (or remove) one firewall rule; its exit status and the chains its iptables calls name."""
+    mark = machine.mark()
+    result = machine.bash(machine.path("/usr/local/sbin/lean-pool-firewall"), verb, rule)
+    named = set()
+    for call in machine.calls_since(mark):
+        words = call.split()
+        if words[0] == "iptables" and words[1] in ("-N", "-A", "-F", "-X"):
+            named.add(words[2])
+        if "-j" in words and words[words.index("-j") + 1].startswith("LEANPOOL-"):
+            named.add(words[words.index("-j") + 1])
+    return result.returncode, named
+
+
+@pytest.mark.parametrize("kind", ["proxy", "join", "door", "agent"])
+def test_every_rule_of_a_sixteen_character_pool_has_a_chain_iptables_takes(pool, kind):
+    # iptables takes a chain's name of at most 28 characters (the stand-in refuses a longer one, as it does).
+    rule = f"{kind}-{'a' * 16}"
+    other = f"{kind}-{'a' * 15}b"
+    for name in (rule, other):
+        pool.path(f"/srv/lean-pool-firewall/{name}.conf").write_text(
+            "LEANPOOL_FW_PORT=18200\nLEANPOOL_FW_SUBNET=192.168.1.0/24\n"
+        )
+    status, chains = chains_of(pool, rule)
+    assert status == 0
+    (chain,) = chains
+    assert len(chain) == 28 and chain.startswith(f"LEANPOOL-{rule[:12].upper()}-"), chain
+    assert chains_of(pool, rule, "remove") == (0, {chain})
+    # Two pools alike in their first twelve characters keep apart.
+    other_status, other_chains = chains_of(pool, other)
+    assert other_status == 0 and other_chains.isdisjoint(chains)
+
+
+def test_a_rule_whose_chain_already_fits_keeps_its_chain(pool):
+    # A pool installed before this change keeps the chain it has: its rules are found and removed as they were.
+    rule = f"proxy-{'a' * 13}"
+    pool.path(f"/srv/lean-pool-firewall/{rule}.conf").write_text(
+        "LEANPOOL_FW_PORT=18200\nLEANPOOL_FW_SUBNET=192.168.1.0/24\n"
+    )
+    assert chains_of(pool, rule) == (0, {f"LEANPOOL-{rule.upper()}"})
+    assert chains_of(pool, "door-demo") == (0, {"LEANPOOL-DOOR-DEMO"})
 
 
 def test_a_bridge_named_br_that_is_not_dockers_is_turned_away_by_name(pool):

@@ -15,6 +15,7 @@ import dataclasses
 import shutil
 import ssl
 import subprocess
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -812,6 +813,85 @@ async def test_the_screened_door_speaks_http_1_1_alone_and_refuses_a_large_body_
     # And a check that keeps to both is served.
     assert (await send(session, pool.door_url, proof("a"), SCREENED_AUTHORIZED))[0] == 200
     assert lean.checked_codes == [proof("a")]
+
+
+async def screened_door_connection(
+    pool: TlsLivePool, certificates: PoolCertificates
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """A TLS connection to the screened door that offers no ALPN at all."""
+    assert pool.screened_door_port is not None
+    return await asyncio.open_connection(
+        "127.0.0.1",
+        pool.screened_door_port,
+        ssl=certificates.client_context(),
+        server_hostname=FRONT_DOOR_NAME,
+    )
+
+
+async def test_the_screened_door_never_upgrades_to_http_2_on_its_preface(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    certificates: PoolCertificates,
+) -> None:
+    """A sender who skips ALPN and opens with HTTP/2's preface gets no HTTP/2 frame back: the
+    door's ``proto h1`` takes away HAProxy's upgrade on the preface (docs/haproxy.md)."""
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+    reader, writer = await screened_door_connection(pool, certificates)
+    received = b""
+    try:
+        # The connection preface, then an empty SETTINGS frame: length 0, type 4, stream 0.
+        writer.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + bytes([0, 0, 0, 4, 0, 0, 0, 0, 0]))
+        await writer.drain()
+        # An HTTP/2 server answers with its own SETTINGS frame and waits; HTTP/1 answers and closes.
+        while len(received) < 9:
+            chunk = await asyncio.wait_for(reader.read(65536), 10)
+            if not chunk:
+                break
+            received += chunk
+    except (ssl.SSLError, OSError):
+        pass
+    finally:
+        writer.close()
+    assert not (len(received) >= 9 and received[3] == 4), received
+    assert received == b"" or received.startswith(b"HTTP/1."), received
+    assert lean.asked == []
+
+
+async def test_the_screened_door_gives_a_withheld_body_5_seconds_after_its_headers(
+    start_lean_server: StartLeanServer,
+    start_box: StartBox,
+    start_tls_pool: StartTlsPool,
+    certificates: PoolCertificates,
+) -> None:
+    """A body stated and withheld is waited for 5 seconds after the headers (backend
+    screened_cache's ``timeout http-request``), not the defaults' 10, then answered 408."""
+    lean, pool = await screened_pool(start_lean_server, start_box, start_tls_pool)
+    head = (
+        "POST /api/check HTTP/1.1\r\nHost: pool.test\r\n"
+        f"Authorization: Bearer {SCREENED_KEY}\r\nContent-Type: application/json\r\n"
+        "Content-Length: 100\r\n\r\n"
+    )
+    reader, writer = await screened_door_connection(pool, certificates)
+    received = b""
+    started = time.monotonic()
+    try:
+        writer.write(head.encode())
+        await writer.drain()
+        # Until the answer's status line and headers are in: when they came is what is measured.
+        while b"\r\n\r\n" not in received:
+            chunk = await asyncio.wait_for(reader.read(65536), 15)
+            if not chunk:
+                break
+            received += chunk
+    except (ssl.SSLError, OSError, TimeoutError):
+        pass
+    finally:
+        writer.close()
+    waited = time.monotonic() - started
+    assert received.startswith(b"HTTP/1.1 408 "), received
+    assert 4 < waited < 8, waited
+    assert lean.asked == []
 
 
 async def test_while_the_cache_is_down_the_screened_door_answers_503_and_reaches_no_server(

@@ -77,7 +77,8 @@ run the REAL scripts against a fake machine:
 * `free` gives the box's memory: 64 GiB, or what a test says (STUB_BOX_MEMORY, in bytes), or nothing at all
   (STUB_FREE_FAILS: a box whose memory cannot be read).
 * `id` says root; `systemctl`, `ip`, `hostname`, `df`, `sleep` answer or do nothing; `nproc` says 8.
-* `iptables` records each call and finds no rule it is asked to check (`-C`), so every rule is added.
+* `iptables` records each call and finds no rule it is asked to check (`-C`), so every rule is added; it refuses a
+  chain's name longer than 28 characters, as the real one does.
 * `ss` shows a listener only on the port a test names (STUB_BUSY_PORT). `uname`, `date` and `python3` are the
   real ones, unless a test makes the box another kind (STUB_MACHINE), its clock jump (STUB_CLOCK_STEP) or its
   resolver answer (STUB_HOST_LOOKUP).
@@ -1255,8 +1256,14 @@ case "${1:-}" in
 esac
 """,
     "df": "#!/usr/bin/env bash\nprintf 'Avail\\n%sG\\n' \"${STUB_DISK_FREE:-500}\"\n",
-    # A check (-C) answers "no such rule", so the firewall script's delete loops end; the rest succeeds.
-    "iptables": '#!/usr/bin/env bash\nprintf \'iptables %s\\n\' "$*" >> "$STUB/calls"\n[ "$1" != -C ]\n',
+    # A check (-C) answers "no such rule", so the firewall script's delete loops end; a chain's name longer than 28
+    # characters is refused, as the real one refuses it; the rest succeeds.
+    "iptables": (
+        '#!/usr/bin/env bash\nprintf \'iptables %s\\n\' "$*" >> "$STUB/calls"\nprevious=\n'
+        'for argument in "$@"; do\n  case "$previous" in\n    -N|-A|-I|-D|-C|-F|-X|-j)\n'
+        '      [ "${#argument}" -le 28 ] || { echo "iptables: chain name \'$argument\' too long (must be under 29 chars)" >&2; exit 2; } ;;\n'
+        '  esac\n  previous=$argument\ndone\n[ "$1" != -C ]\n'
+    ),
     # The machine's own resolver, when a test says what it knows (STUB_HOST_LOOKUP); else the real python3.
     "python3": (
         '#!/usr/bin/env bash\nif [ "${2:-}" = lookup ] && [ -n "${STUB_HOST_LOOKUP+set}" ]; then\n'
@@ -1454,6 +1461,8 @@ class Machine:
             "FAKE_ROOT": str(self.root),
             "STUB_LEAN_POOL": str(self.project),
             "SUDO_USER": "",
+            # A key's copy is walked from the machine's root, not from / (whose /tmp no copy may sit under).
+            "LEANPOOL_KEY_COPY_WALK_ROOT": str(self.root),
             **extra,
         }
 

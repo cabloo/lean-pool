@@ -5,8 +5,10 @@ program on the host hands the pool's key to boxes of its own (a directory under 
 is shown: no copy unless asked for; asked, the key and the authority are written at every run as the screened key's
 copy is, by the same writer, and `lean-pool-ctl NAME pool-key copy` writes them again, until `--no-pool-key-copy`;
 the key is never printed; the copy is never let into the screened key's copy's directory, nor one inside or around
-it, whichever names it, nor one that holds the screened key, nor a pool's own directory; and it is never written
-where anyone but root and its owner could have put a directory of their own on its path.
+it, whichever names it, nor one whose api-key is the screened key, nor a pool's own directory; and it is never
+written where anyone but root and its owner could have made a directory on its path: every directory from where the
+walk starts (the machine's root here, through LEANPOOL_KEY_COPY_WALK_ROOT; / on a host) must be theirs and writable
+by nobody else, sticky or not.
 """
 
 import os
@@ -32,8 +34,8 @@ pytestmark = [
 
 POOL = "/srv/lean-pool-demo"
 HAND_OUT = "/srv/hand-out"
-COPY = f"{HAND_OUT}/lean-pool-home"
-SCREENED_COPY = f"{HAND_OUT}/lean-pool"
+COPY = f"{HAND_OUT}/pool-key"
+SCREENED_COPY = f"{HAND_OUT}/screened-key"
 
 
 def failed(result: subprocess.CompletedProcess[str]) -> str:
@@ -244,21 +246,93 @@ def test_a_copy_directory_others_can_write_is_refused(pool):
     assert (copy / "api-key").read_text() == "before\n"
 
 
-def test_a_sticky_directory_higher_up_passes_when_its_next_is_the_owners(pool):
-    # /tmp's shape: writable by all, sticky, and the directory below it the copy's owner's, which nobody else can
-    # move. Here that is the hand-out directory, with the copy's own directory below a directory of the owner's.
+def name_the_copy(machine: Machine, copy: Path) -> None:
+    env = machine.path(f"{POOL}/pool.env")
+    env.write_text(env.read_text().replace(str(machine.path(COPY)), str(copy)))
+
+
+def test_a_directory_made_by_another_under_a_sticky_one_never_makes_them_the_copys_owner(pool):
+    # The attack: the copy is named .../fleet/keys, fleet is missing at some run, and the directory above it is
+    # sticky and writable by all, as /tmp is. Whoever makes fleet first would own the directory the copy is then
+    # made in, and be the one it is written for. The directory writable by all refuses it, sticky or not.
     hand_out = pool.path(HAND_OUT)
-    deeper = hand_out / "owner"
-    deeper.mkdir(mode=0o755)
-    env = pool.path(f"{POOL}/pool.env")
-    env.write_text(env.read_text().replace(str(pool.path(COPY)), str(deeper / "home")))
+    copy = hand_out / "fleet" / "keys"
+    name_the_copy(pool, copy)
     hand_out.chmod(0o1777)
     try:
+        (hand_out / "fleet").mkdir(mode=0o755)  # another user's, in the attack
         result = control(pool, "pool-key", "copy")
-        assert result.returncode == 0, failed(result)
-        assert (deeper / "home" / "api-key").read_text().strip() == key_of(pool)
+        assert result.returncode != 0
+        assert f"{hand_out} can be written by others (sticky or not)" in result.stderr
+        assert "nothing was written" in result.stderr
+        assert not copy.exists()
     finally:
         hand_out.chmod(0o755)
+
+
+@pytest.mark.parametrize("where", ["/", "/srv"])
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o1777])
+def test_a_directory_higher_up_others_can_write_is_refused_group_sticky_or_not(pool, where, mode):
+    # Every directory from where the walk starts (the machine's root here, / on a host) down to the copy's.
+    copy, above = pool.path(COPY), pool.path(where)
+    (copy / "api-key").write_text("before\n")
+    kept = above.stat().st_mode & 0o7777
+    above.chmod(mode)
+    try:
+        result = control(pool, "pool-key", "copy")
+    finally:
+        above.chmod(kept)
+    assert result.returncode != 0, oct(mode)
+    assert f"{str(above).rstrip('/')} can be written by others (sticky or not)" in result.stderr
+    assert (copy / "api-key").read_text() == "before\n"
+
+
+def test_walked_from_the_real_root_a_copy_on_a_path_others_can_write_is_refused(pool):
+    # The tests walk from the machine's root (LEANPOOL_KEY_COPY_WALK_ROOT): this machine sits in the tests' own
+    # temporary directory, whose path holds one anybody can write (/tmp), which a walk from / refuses.
+    copy = pool.path(COPY)
+    open_to_others = next(
+        (str(path) for path in reversed([copy, *copy.parents]) if path.stat().st_mode & 0o022),
+        None,
+    )
+    if open_to_others is None:
+        pytest.skip("no directory on the tests' own path can be written by others")
+    result = pool.bash_in(
+        None,
+        pool.path("/usr/local/sbin/lean-pool-ctl"),
+        "demo",
+        "pool-key",
+        "copy",
+        LEANPOOL_KEY_COPY_WALK_ROOT="/",
+    )
+    assert result.returncode != 0
+    assert f"{open_to_others} can be written by others (sticky or not)" in result.stderr
+
+
+def test_a_copy_outside_where_the_walk_starts_is_refused(pool):
+    result = pool.bash_in(
+        None,
+        pool.path("/usr/local/sbin/lean-pool-ctl"),
+        "demo",
+        "pool-key",
+        "copy",
+        LEANPOOL_KEY_COPY_WALK_ROOT=str(pool.path("/elsewhere")),
+    )
+    assert result.returncode != 0
+    assert "is not below" in result.stderr and "nothing was written" in result.stderr
+
+
+def test_a_walk_root_that_is_not_an_absolute_path_is_refused(pool):
+    result = pool.bash_in(
+        None,
+        pool.path("/usr/local/sbin/lean-pool-ctl"),
+        "demo",
+        "pool-key",
+        "copy",
+        LEANPOOL_KEY_COPY_WALK_ROOT="srv",
+    )
+    assert result.returncode != 0
+    assert "is not an absolute path" in result.stderr and "nothing was written" in result.stderr
 
 
 def test_a_directory_that_holds_the_screened_key_is_refused(pool):

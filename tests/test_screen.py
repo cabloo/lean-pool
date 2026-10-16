@@ -82,6 +82,36 @@ def test_an_import_of_anything_but_mathlib_and_aesop_is_refused(module: str) -> 
     assert finding.startswith(f"`import {module}`")
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import/-x-/Lean.Elab\ntheorem t : True := trivial",
+        "import--x\nLean\ntheorem t : True := trivial",
+        "import/-x-/Mathlib",
+        "import.Lean",
+        "import Mathlib/- x -/",
+    ],
+)
+def test_an_import_the_screen_cannot_read_is_refused(code: str) -> None:
+    finding = screen(code)
+    assert finding is not None
+    assert finding.endswith("(an import the screen cannot read: `import`, then a module's name)")
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "import Mathlib",
+        "import  Mathlib.Tactic\nimport\tAesop\n",
+        "import\nMathlib\ntheorem t : True := trivial",
+        "theorem important : True := trivial",
+        "def importX : Nat := 1",
+    ],
+)
+def test_an_ordinary_import_and_a_longer_word_pass(code: str) -> None:
+    assert screen(code) is None
+
+
 FORMAL_CONJECTURES = "import FormalConjectures.Util.ProblemImports\n\ntheorem t : True := trivial\n"
 
 

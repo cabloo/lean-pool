@@ -384,10 +384,11 @@ PY
 # A key's copy: the key and the pool authority's certificate, written into the directory the pool names, for the
 # program there that hands them to its clients: the directory's owner, or its parent's when it is missing (it is then
 # made, 0700, with that owner). Its path is walked from / one directory at a time, none of them a link, and each
-# directory on the way must be owned by root or by that owner and writable by nobody else (as sshd's StrictModes
-# asks of a key's path), so nobody else can put a directory of their own in its place. A directory writable by others
-# but sticky, /tmp say, passes only above the copy's parent, and only when its next directory is root's or the
-# owner's, which nobody else can then move. The copy's directory itself is writable by its owner alone. It is never
+# directory on the way, the copy's own included, must be owned by root or by that owner and writable by nobody else,
+# sticky or not (as sshd's StrictModes asks of a key's path): nobody else can then have made any directory on it, so
+# nobody else can make themselves the owner the copy is written for. /tmp, and anything under it, is refused. The
+# walk starts at LEANPOOL_KEY_COPY_WALK_ROOT instead of / when root's own environment names one: a seam for the
+# tests and for packaging into a staging root, read by this writer alone, which never loosens the rule. It is never
 # the other key's copy's directory, nor inside it or around it, compared as directories (a bind mount, say), and
 # never one whose api-key is the other key. Each file is owned by the directory's owner and is made new beside the
 # old one, then moved over it, and is never written, chowned or chmodded by name, so a link the owner planted in the
@@ -412,7 +413,12 @@ import stat
 import sys
 
 copy, key, authority, other_copy, other_key = sys.argv[1:]
-*above, name = copy.strip("/").split("/")
+# Where the walk starts: / on a host; the tests, or a package built into a staging root, name another in root's own
+# environment. Every directory from it down is held to the same rule.
+WALK_ROOT = os.environ.get("LEANPOOL_KEY_COPY_WALK_ROOT") or "/"
+start = [part for part in WALK_ROOT.split("/") if part]
+parts = copy.strip("/").split("/")
+*above, name = (parts[len(start) :] if parts[: len(start)] == start else []) or [""]
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 WRITABLE_BY_OTHERS = stat.S_IWGRP | stat.S_IWOTH
 
@@ -460,17 +466,15 @@ def read_small(directory, target):
 
 
 def trusted_path(parents, recipient):
-    """Refused unless each directory from / to the copy's parent is root's or RECIPIENT's and writable by no one
-    else; a sticky one above the parent, whose next directory is root's or RECIPIENT's, passes too."""
+    """Refused unless each directory from the walk's start to the copy's parent is root's or RECIPIENT's and writable
+    by no one else, sticky or not: anyone else who can write one could have made the directory below it, and so be
+    the owner the copy is written for."""
     for index, status in enumerate(parents):
-        where = "/" + "/".join(above[:index])
+        where = "/" + "/".join(start + above[:index])
         if status.st_uid not in (0, recipient):
             raise Refused(f"{where} is owned by someone else (uid {status.st_uid})")
         if status.st_mode & WRITABLE_BY_OTHERS:
-            sticky = status.st_mode & stat.S_ISVTX
-            below = parents[index + 1] if index + 1 < len(parents) else None
-            if not (sticky and below is not None and below.st_uid in (0, recipient)):
-                raise Refused(f"{where} can be written by others, who could put a directory of their own in its place")
+            raise Refused(f"{where} can be written by others (sticky or not), who could make a directory on its path")
 
 
 def apart(parents, directory_status):
@@ -528,7 +532,11 @@ def write(directory, source, target, mode, owner):
 
 
 try:
-    parent = os.open("/", DIRECTORY)
+    if not WALK_ROOT.startswith("/"):
+        raise Refused(f"LEANPOOL_KEY_COPY_WALK_ROOT ({WALK_ROOT}) is not an absolute path")
+    if not name:
+        raise Refused(f"it is not below {WALK_ROOT}, where its path is walked from (LEANPOOL_KEY_COPY_WALK_ROOT)")
+    parent = os.open(WALK_ROOT, DIRECTORY)
     parents = [os.fstat(parent)]
     for part in above:
         following = os.open(part, DIRECTORY, dir_fd=parent)

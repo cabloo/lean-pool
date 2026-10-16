@@ -776,12 +776,14 @@ def _screened_door(
     or of the loop guard, never reaches the cache.
 
     What its senders can hold of the proxy is bounded three ways together: at most 2W + 8
-    connections, each speaking HTTP/1.1 alone (over HTTP/2 one connection carries a hundred
+    connections, each speaking HTTP/1.1 alone, by ALPN and by ``proto h1``, which takes away
+    HAProxy's upgrade to HTTP/2 on its preface (over HTTP/2 one connection carries a hundred
     requests, and ``maxconn`` counts connections), each request with a ``Content-Length`` of
-    at most one buffer (``tune.bufsize``) and sent whole within 5 seconds. The door's rules
-    are read on a request's headers alone, so a body too large is refused before any of it is
-    taken in; the cache's backend then waits for the whole body, as every backend here does.
-    So its senders cannot use up the proxy's connections or its memory.
+    at most one buffer (``tune.bufsize``), its headers sent within 5 seconds and its body
+    within 5 seconds more. The door's rules are read on a request's headers alone, so a body
+    too large is refused before any of it is taken in; the cache's backend then waits for the
+    whole body, as every backend here does. So its senders cannot use up the proxy's
+    connections or its memory.
     """
     workers = total_workers(servers)
     refusal = "http-request return status {status} content-type application/json string"
@@ -789,10 +791,13 @@ def _screened_door(
         f"frontend {SCREENED_DOOR_FRONTEND}",
         [
             "# HTTP/1.1 alone: over HTTP/2 one connection would carry a hundred requests.",
-            f"bind :{port} {bind_options(tls.front_door_pem)} alpn http/1.1",
-            "# Its own share of the proxy's connections: the requests below, and a few more.",
+            "# ALPN offers no h2, and proto h1 takes away the upgrade to HTTP/2 on its preface.",
+            f"bind :{port} {bind_options(tls.front_door_pem)} alpn http/1.1 proto h1",
+            "# A cap on its connections: the requests below, and a few more (none are set aside",
+            "# for it out of the proxy's global maxconn).",
             f"maxconn {2 * workers + 8}",
-            "# A request, its body included, is sent whole within 5s here (10s at the front door).",
+            "# A request's headers within 5s here (10s at the front door); backend screened_cache",
+            "# gives its body 5s more.",
             "timeout http-request 5s",
             "# The rules below are read on the headers alone, before any of the body is taken in;",
             "# backend screened_cache waits for the whole body, as every backend here does.",
@@ -846,6 +851,8 @@ def _screened_cache_backend(
             "# where the front door would go round the cache, past the screen. It takes the state",
             "# of cache/cache. The cache holds a request for the queue wait and the check.",
             f"timeout server {timeouts.cache_seconds}s",
+            "# A screened check's body within 5s of its headers (the defaults give 10s).",
+            "timeout http-request 5s",
             default_server_line(),
             f"server cache {settings.cache_address} track cache/cache maxconn {workers}",
         ],

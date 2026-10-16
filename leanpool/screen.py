@@ -7,7 +7,9 @@ refuses the whole request if one file breaks them. The rules hold what a proof a
 never need:
 
 * ``import`` only ``Mathlib``, ``Aesop`` and their modules, and those of the roots a pool adds
-  (``allowed_imports``; the cache's ``--screened-import``), each admitting every module under it;
+  (``allowed_imports``; the cache's ``--screened-import``), each admitting every module under it,
+  and only as the word ``import``, whitespace, and a module's name ending at whitespace or at the
+  end of the file: any other ``import`` (``import/- c -/Lean.Elab``, ``import--c``) is refused;
 * no ``#`` followed by a name but ``#print``, ``#check``, ``#reduce`` and ``#synth``, wherever it
   stands: a command is not told apart from notation, so ``#s`` (a finset's size) is refused too,
   and ``s.card`` passes;
@@ -94,7 +96,10 @@ _SCOPES = frozenset({"local", "scoped"})
 # A word as Lean reads an identifier's part: letters (any script), digits, `_`, `'`, `!` and `?`.
 # A dot separates the parts of a name, so `IO.println` holds the word `IO`.
 _WORD = re.compile(r"[\w'!?]+")
-_IMPORT = re.compile(r"(?<![\w'!?.])import\s+([\w'!?.]*)")
+# Every word ``import`` is judged, and only one form of it is read: whitespace, then a module's
+# name ending at whitespace or at the end of the text. Any other is refused unread.
+_IMPORT_WORD = re.compile(r"(?<![\w'!?.])import(?![\w'!?])")
+_IMPORT = re.compile(r"import\s+([\w'!?.]+)(?=\s|\Z)")
 _HASH_COMMAND = re.compile(r"#([A-Za-z_][\w'!?]*)")
 _ATTRIBUTE_OPEN = re.compile(r"@\[|(?<![\w'!?.])attribute\s*\[")
 _ATTRIBUTE_TOKEN = re.compile(r"←|<-|↓|[\w'!?.]+|\S")
@@ -123,7 +128,11 @@ def screen(code: str, allowed_imports: Sequence[str] = ()) -> str | None:
 
 
 def _refused_import(text: str, roots: Sequence[str]) -> str | None:
-    for match in _IMPORT.finditer(text):
+    for word in _IMPORT_WORD.finditer(text):
+        match = _IMPORT.match(text, word.start())
+        if match is None:
+            seen = text[word.start() : word.start() + 40].splitlines()[0]
+            return f"`{seen}` (an import the screen cannot read: `import`, then a module's name)"
         module = match.group(1)
         if not any(module == root or module.startswith(f"{root}.") for root in roots):
             named = " and ".join([", ".join(roots[:-1]), roots[-1]])
