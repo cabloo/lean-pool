@@ -323,7 +323,10 @@ def test_on_refuses_where_the_probe_did_not_pass_and_clears_the_setting(fresh):
     had = fresh.recreated()
     result = control(fresh, "sandbox", "on")
     assert result.returncode == 1
-    assert "the installer has not seen this box make the sandbox" in result.stderr
+    assert (
+        "the workers stay without the sandbox: the sandbox is off on this box:"
+        " this kernel has no Landlock (Linux 5.13 or later)" in result.stderr
+    )
     assert "the join command with --refresh" in result.stderr
     assert "LEAN_SERVER_WORKER_SANDBOX" not in settings(fresh)
     assert OVERLAY not in overlays(fresh) and fresh.worker_program(LEAN) == NATIVE

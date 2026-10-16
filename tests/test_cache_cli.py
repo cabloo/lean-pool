@@ -164,17 +164,17 @@ def test_there_is_no_screened_key_by_default() -> None:
 
 def test_the_screened_key_is_read_from_a_file_or_the_environment(tmp_path: Path) -> None:
     key_file = tmp_path / "screened"
-    key_file.write_text("rental-key\n")
+    key_file.write_text("screened-key\n")
     from_flag = parse_settings(["--screened-api-key-file", str(key_file)], KEY_ENVIRONMENT)
-    assert from_flag.screened_api_key == "rental-key"
+    assert from_flag.screened_api_key == "screened-key"
     from_file_variable = parse_settings(
         [], {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY_FILE": str(key_file)}
     )
-    assert from_file_variable.screened_api_key == "rental-key"
+    assert from_file_variable.screened_api_key == "screened-key"
     from_variable = parse_settings(
-        [], {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "rental-key"}
+        [], {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
     )
-    assert from_variable.screened_api_key == "rental-key"
+    assert from_variable.screened_api_key == "screened-key"
 
 
 @pytest.mark.parametrize(
@@ -185,7 +185,7 @@ def test_the_screened_key_is_read_from_a_file_or_the_environment(tmp_path: Path)
             {
                 "LEANPOOL_CACHE_PIN": "p",
                 "LEANPOOL_CACHE_ALLOW_UNAUTHENTICATED": "1",
-                "LEANPOOL_CACHE_SCREENED_API_KEY": "rental-key",
+                "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key",
             },
             "needs the pool's own key",
         ),
@@ -197,7 +197,7 @@ def test_a_screened_key_that_cannot_work_is_refused_without_echoing_it(
 ) -> None:
     error = usage_error([], environment, capsys)
     assert message in error
-    assert "rental-key" not in error
+    assert "screened-key" not in error
     assert "two words" not in error
 
 
@@ -205,7 +205,7 @@ def test_a_screened_key_from_two_sources_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     key_file = tmp_path / "screened"
-    key_file.write_text("rental-key\n")
-    environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "rental-key"}
+    key_file.write_text("screened-key\n")
+    environment = {**KEY_ENVIRONMENT, "LEANPOOL_CACHE_SCREENED_API_KEY": "screened-key"}
     error = usage_error(["--screened-api-key-file", str(key_file)], environment, capsys)
     assert "not both" in error

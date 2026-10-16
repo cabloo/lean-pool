@@ -691,9 +691,15 @@ case "$verb" in
       echo "worker sandbox off: the workers start without it (the same answers; a check can reach the other checks of this server)"
     else
       sed -i '/^LEAN_SERVER_WORKER_SANDBOX=/d' "$ENV_FILE"
-      if [ "$(head -n 1 "$DIR/sandbox/state" 2>/dev/null | cut -d ' ' -f 1)" != on ] || [ ! -x "$DIR/sandbox/lean-worker" ]; then
-        log "sandbox on -> no probe of this box passed"
-        echo "kimina-ctl: the installer has not seen this box make the sandbox, so the workers stay without it. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) asks its image again" >&2
+      state=$(head -n 1 "$DIR/sandbox/state" 2>/dev/null || true)
+      if [ "${state%% *}" != on ] || [ ! -x "$DIR/sandbox/lean-worker" ]; then
+        case $state in
+          "off "*) why="the sandbox is off on this box: ${state#off }" ;;
+          on | "on "*) why="the sandbox's launcher is missing from $DIR/sandbox" ;;
+          *) why="no probe of this box's image has passed" ;;
+        esac
+        log "sandbox on -> refused: $why"
+        echo "kimina-ctl: the workers stay without the sandbox: $why. The setting no longer says off: the installer's next run here (on a box that joined a pool, the join command with --refresh) asks its image again" >&2
         exit 1
       fi
       set_overlay "$SANDBOX_OVERLAY" on

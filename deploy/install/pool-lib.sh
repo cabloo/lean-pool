@@ -543,7 +543,7 @@ worker_sandbox_off() {
 # install_worker_sandbox INSTANCE_DIR INSTANCE IMAGE : ask a container of IMAGE whether this box can sandbox
 # each worker, put the sandbox in the instance's directory, and write into its settings whether its workers
 # start in it (whether COMPOSE_FILE holds compose.worker-sandbox.yaml), BEFORE its container is (re)made.
-# Nothing here stops an install.
+# Only a missing make.sh stops the install; a probe that fails leaves the workers without the sandbox.
 install_worker_sandbox() {
   local dir=$1 instance=$2 image=$3 env=$1/kimina.env project said state reason hint
   WORKER_SANDBOX_INSTALLED=1

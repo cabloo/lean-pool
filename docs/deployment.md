@@ -268,14 +268,26 @@ only; without it, those of the whole server, until the container is made again.
 
 Kimina runs its workers in one container, as one user. The installer puts each worker in a
 [sandbox of its own](worker-sandbox.md), where this box's kernel and Docker allow it: a check
-then reaches no other worker, nor Kimina, nor the server's key. It asks a container of the
-box's own image first, and sends the server a real check after; where the check fails, the
-sandbox is taken away again, the server is made again without it and checked again. If it
-fails without the sandbox too, the sandbox was not the cause: it comes back, and the read-only
-root is taken away instead. The last lines of the install say which. `kimina-ctl [@NAME] status`
-has a `worker sandbox:` line, with how many of the running workers carry the sandbox's mark;
-`sandbox off` keeps it off through every later install, and `sandbox on` turns it back on
-where this box's probe passed.
+then cannot reach into another worker's pipes, memory or environment, nor Kimina's, nor read
+the server's key, and from Landlock 6 it cannot end another worker. The installer asks a
+container of the box's own image first, and sends the server a real check after. Where that
+check fails, it takes away one protection at a time:
+
+1. The sandbox. If the check then passes, the workers start without it until the installer's
+   next run.
+2. If the check fails without the sandbox too, the sandbox was not the cause. Where the root is
+   read-only, the sandbox comes back and the [read-only root](#a-read-only-root) is taken away
+   instead; if the check then passes, the server runs sandboxed and writable.
+3. If it fails that way too, the server is made with neither and checked once more: it runs
+   with neither if that passes, and the install fails if not.
+
+Where the root is not read-only, a server that fails with the sandbox and without it is left
+without it, and the install fails. The last lines of the install say which protections the
+server runs with; the next installer run tries both again. `kimina-ctl [@NAME] status` has a
+`worker sandbox:` line, with how many of the running workers carry the sandbox's mark.
+`sandbox off` keeps it off through every later install. `sandbox on` turns it back on where
+this box's last probe passed; elsewhere it says why, exits 1, and clears the `off` setting, so
+that the installer's next run asks the image again.
 
 ### Watching it
 

@@ -189,7 +189,7 @@ the cache's counters, and each certificate's last day
 | [The generated HAProxy configuration](docs/haproxy.md) | Pausing a server, the health check, failover, buffers, name resolution, timeouts, losing the cache, metrics for Prometheus. |
 | [Admission](docs/admission.md) | Testing a Lean server alone before it joins. |
 | [Compiled search for linarith](docs/compiled-search.md) | An optional step on each Lean server box that makes Lean itself faster on the proofs that take it longest, and changes no verdict. |
-| [The worker sandbox](docs/worker-sandbox.md) | An optional step on each Lean server box: every worker in a sandbox of its own, so the code a check runs cannot reach the server's other checks or its key. |
+| [The worker sandbox](docs/worker-sandbox.md) | An optional step on each Lean server box: every worker in a sandbox of its own, so the code a check runs cannot reach into the other workers' pipes or memory, nor read the server's key. |
 | [Configuration reference](docs/configuration.md) | Every flag and environment variable of the six commands. |
 | [What is tested, and what is not verified](docs/verification.md) | The test suite, the deployment's record, and the gaps. |
 | [Limitations](docs/limitations.md) | What the pool does not do. |

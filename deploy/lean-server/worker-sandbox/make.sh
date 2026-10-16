@@ -10,7 +10,7 @@
 # probe's container: by default a new name for each run. Run this on the box, as a user who may use
 # Docker, and again whenever the image, the kernel or Docker changes. It takes a few seconds. The
 # image must already be on the box: nothing is downloaded, and the image is not changed:
-#   1. One container of IMAGE, made as the server is (no network, no capabilities, no way to gain
+#   1. One container of IMAGE, hardened like the server (no network, no capabilities, no way to gain
 #      privileges, a read-only root, a /tmp in memory), says the path of its REPL and runs
 #      `sandbox.py --probe`, which makes the sandbox there and says which Landlock version it got.
 #      Its whole output is kept in sandbox.log.
@@ -81,7 +81,12 @@ off() {
   exit 1
 }
 
-docker image inspect "$image" > /dev/null 2>&1 || off "there is no image $image on this box"
+if ! inspected=$(docker image inspect "$image" 2>&1 > /dev/null); then
+  case $inspected in
+    *"No such image"*) off "there is no image $image on this box" ;;
+    *) off "Docker could not be asked about the image $image: $inspected" ;;
+  esac
+fi
 
 name=${name:-lean-sandbox-probe-$$-$RANDOM}
 cleanup() { docker rm -f "$name" > /dev/null 2>&1 || true; }

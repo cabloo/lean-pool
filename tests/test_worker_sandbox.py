@@ -141,6 +141,7 @@ def test_a_sibling_workers_pipe_is_refused(sandboxed_victim: subprocess.Popen[by
 def test_the_parents_environment_is_refused() -> None:
     """Kimina's place: the process that started the worker, holding the server's key."""
     path = f"/proc/{os.getpid()}/environ"
+    assert unsandboxed(*python(opens(path))).stdout == "opened\n"
     result = sandboxed(*python(opens(path)))
     assert "PermissionError" in result.stderr
 
@@ -197,6 +198,17 @@ def test_a_signal_to_another_worker_is_refused_from_landlock_6(
     if VERSION >= 6:
         assert "PermissionError" in result.stderr
         assert victim.poll() is None
+        # Without the sandbox, the same signal ends a second worker.
+        other = subprocess.Popen(["sleep", "60"], stdin=subprocess.PIPE)
+        try:
+            control = unsandboxed(
+                *python(f"import os; os.kill({other.pid}, {int(signal.SIGTERM)})")
+            )
+            assert control.returncode == 0, control.stderr
+            assert other.wait(timeout=10) == -signal.SIGTERM
+        finally:
+            other.kill()
+            other.wait()
     else:
         assert result.returncode == 0, result.stderr
         assert victim.wait(timeout=10) == -signal.SIGTERM

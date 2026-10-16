@@ -11,11 +11,12 @@ it starts:
   - every process outside its own domain through /proc and ptrace: another worker's pipes,
     memory and environment, and Kimina's own (every version);
   - creating, changing or removing files anywhere but /tmp, and writing any device but /dev/null;
-    reading is not limited (every version);
+    reading is not limited (every version), and changing a file's length by its path (truncate)
+    is refused from version 3;
   - TCP, both ways: a check cannot call the server's own API on its loopback (version 4);
   - signals and abstract Unix sockets to processes outside its domain (version 6).
 The program is started without the server's key: LEAN_SERVER_API_KEY and every variable whose
-name holds KEY, TOKEN, SECRET or PASSWORD are taken out of its environment, and
+name holds KEY, TOKEN, SECRET or PASSWORD, in any case, are taken out of its environment, and
 LEANPOOL_WORKER_SANDBOX=landlock-N is put in, which `kimina-ctl status` reads back.
 
 A worker that cannot be sandboxed is not started: this exits 126 and says why on its error output

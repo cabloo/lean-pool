@@ -11,7 +11,7 @@ from support import API_KEY, AUTHORIZED, StartCache, StartLeanServer, check, che
 
 from leanpool.cache import CacheSettings
 
-SCREENED_KEY = "rental-key"
+SCREENED_KEY = "screened-key"
 SCREENED = {"Authorization": f"Bearer {SCREENED_KEY}"}
 PROOF = "theorem two : 1 + 1 = 2 := by rfl"
 RUNS_CODE = '#eval IO.println "hello"'

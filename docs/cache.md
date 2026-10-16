@@ -79,12 +79,18 @@ than its own: machines whose owner it does not know. Checking Lean code runs it
   and stored answers with checks sent with the pool's key. It is forwarded with the pool's key,
   so no Lean server holds the second one. `/status` takes the pool's key alone.
 - **The rules** (`leanpool/screen.py`) hold what a proof and its statement never need: `import`
-  only `Mathlib`, `Aesop` and their modules; no `#` command but `#print`, `#check`, `#reduce` and
-  `#synth`; none of the words that run a program or define a way to (`run_tac`, `elab`, `macro`,
-  `syntax`, `initialize`, `simproc`, `unsafe`, `implemented_by`, `extern`, `native_decide`, `IO`
-  and others); and attributes from a short list (`simp`, `norm_cast`, `ext`, `instance`, ...)
+  only `Mathlib`, `Aesop` and their modules; no `#` followed by a name but `#print`, `#check`,
+  `#reduce` and `#synth`, wherever it stands (so the notation `#s`, a finset's size, is refused
+  too: `s.card` passes); none of the words that run a program or define a way to (`run_tac`,
+  `elab`, `macro`, `syntax`, `initialize`, `simproc`, `unsafe`, `implemented_by`, `extern`,
+  `native_decide`, `IO` and others); and attributes from a short list (`simp`, `norm_cast`, `ext`, `instance`, ...)
   only, since an attribute can register code. The whole text is read, comments and strings
   included, each word as a whole word: a word in a comment costs one refused check.
+- **Where it is set:** by hand, for now. The pool's compose file and installers do not give the
+  cache a second key yet.
+- **While the cache is down** the proxy sends checks straight to the Lean servers
+  ([losing the cache](haproxy.md#losing-the-cache)), which know only the pool's key: a check sent
+  with the second key is then answered 401 by the Lean server, never checked unscreened.
 - **What it is not:** proof that a check runs no code. It is a list of words over a language
   whose files can define syntax, and a determined sender may get round it. Run the Lean servers
   so that what passes is held too: the installers put each worker in a

@@ -7,7 +7,9 @@ refuses the whole request if one file breaks them. The rules hold what a proof a
 never need:
 
 * ``import`` only ``Mathlib``, ``Aesop`` and their modules;
-* no command that starts with ``#`` but ``#print``, ``#check``, ``#reduce`` and ``#synth``;
+* no ``#`` followed by a name but ``#print``, ``#check``, ``#reduce`` and ``#synth``, wherever it
+  stands: a command is not told apart from notation, so ``#s`` (a finset's size) is refused too,
+  and ``s.card`` passes;
 * none of the words in ``REFUSED_WORDS``;
 * attributes (``@[...]``, ``attribute [...]``) naming only those in ``ALLOWED_ATTRIBUTES``.
 

@@ -93,8 +93,9 @@ cases.
   Mathlib, and run only where one is present;
 * the [worker sandbox](worker-sandbox.md), on the test machine's own kernel, outside Docker:
   each wall twice, the act allowed without the sandbox and refused under it (another worker's
-  pipes and environment through `/proc`, and its parent's; a file outside `/tmp`), TCP and
-  signals refused where the kernel's Landlock version has them and allowed where it does not;
+  pipes and environment through `/proc`, and its parent's; a file outside `/tmp`; TCP and
+  signals where the kernel's Landlock version has them, shown allowed where it does not), all
+  but another worker's memory, which Yama refuses without the sandbox too;
   the key taken out of the environment and the mark put in; that a worker that cannot be
   sandboxed is not started; and that the launcher starts the compiled search step's launcher
   where it can, and the image's REPL otherwise;
@@ -310,6 +311,9 @@ from the one stored, and their Lean time was 608 s off and 217 s on. The other t
 were switched over while a client kept the pool busy, and every answer was a success
 (2xx).
 
+**The screen, 15 October 2026.** Read once by hand against 575 real proofs, 489 published
+ones and 86 attempts by the deployment's model: it refused none.
+
 Not part of that deployment, and run once by hand against the demo's pool, whose Lean servers
 are stand-ins: Kimina's own Python client (`kimina-client` 0.2.1), unchanged but for the
 address. Its single and its batched requests were answered, and repeats came from the cache.
@@ -349,8 +353,8 @@ address. Its single and its batched requests were answered, and repeats came fro
   box the installers ask a container of that box's own image first, and send the server a
   real check after.
 * **The screen is a list of words**, not proof that a check runs no code
-  ([what it is not](cache.md#the-screened-key)). Of 575 real proofs, 489 published ones and 86
-  attempts by the deployment's model, it refused none.
+  ([what it is not](cache.md#the-screened-key)), and it refuses some notation a proof may use
+  (`#s` for a finset's size).
 * **What TLS costs** in CPU or throughput has not been measured, beyond the timers above.
 * **What a check costs the work beside it** was measured on three machines of one deployment
   and differed on each. Nothing here says what it is on yours: measure the box

@@ -31,6 +31,8 @@ deploy/lean-server/native/
 deploy/lean-server/native.work.*
 deploy/lean-server/native.log
 deploy/lean-server/native.built
+deploy/lean-server/sandbox/
+deploy/lean-server/sandbox.log
 *.key
 *.pem
 *.csr
